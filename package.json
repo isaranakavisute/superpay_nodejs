@@ -1,0 +1,41 @@
+{
+  "name": "superpayment",
+  "version": "0.1.0",
+  "private": true,
+  "description": "SuperPayment API service",
+  "type": "module",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "migrate": "node scripts/migrate.js up",
+    "migrate:status": "node scripts/migrate.js status",
+    "db:check": "node scripts/db-check.js",
+    "seed:dashboard": "node scripts/seed-dashboard.js",
+    "test": "LOG_SILENT=1 node --test --experimental-test-isolation=none \"test/**/*.test.js\"",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "test:writes": "TEST_ALLOW_WRITES=true npm test"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
+    "express": "^5.1.0",
+    "helmet": "^8.1.0",
+    "pg": "^8.16.3",
+    "pino": "^9.13.1",
+    "pino-http": "^10.5.0",
+    "zod": "^4.1.13"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.37.0",
+    "eslint": "^9.37.0",
+    "globals": "^16.4.0",
+    "pino-pretty": "^13.1.2",
+    "prettier": "^3.6.2"
+  }
+}

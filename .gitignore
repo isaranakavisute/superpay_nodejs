@@ -1,0 +1,17 @@
+node_modules/
+coverage/
+dist/
+build/
+
+# Secrets — .env holds live credentials; commit .env.example instead.
+.env
+.env.*
+!.env.example
+
+npm-debug.log*
+yarn-error.log*
+*.log
+
+.DS_Store
+.idea/
+.vscode/
