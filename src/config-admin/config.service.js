@@ -1,4 +1,5 @@
 import { createHmac, randomBytes } from 'node:crypto';
+import { DEFAULT_MERCHANT_PERMS, PERMISSION_CODES } from '../merchant-api/permission-catalog.js';
 import { z } from 'zod';
 import { query, withTransaction } from '../db/pool.js';
 import logger from '../logger.js';
@@ -26,7 +27,7 @@ export const SECTIONS = {
       loginSubtext: z.string().trim().max(240),
       logoScale: int(50, 200),
     }),
-    defaults: { siteName: 'SuperPay', tagline: 'Payment Console', loginHeadline: '', loginSubtext: '', logoScale: 100, logoAsset: null, faviconAsset: null },
+    defaults: { siteName: 'Option Pay', tagline: 'Payment Console', loginHeadline: '', loginSubtext: '', logoScale: 100, logoAsset: null, faviconAsset: null },
   },
   theme: {
     schema: z.object({ default: z.enum(THEMES), allowUser: z.boolean(), enabled: z.array(z.enum(THEMES)).max(THEMES.length) }),
@@ -82,6 +83,10 @@ export const SECTIONS = {
     schema: z.object({ enforce2fa: z.boolean(), ownerUserId: z.union([z.null(), z.coerce.number().int().positive()]) }),
     defaults: { enforce2fa: false, ownerUserId: null },
   },
+  merchantPerms: {
+    schema: z.object({ owner: z.array(z.enum(PERMISSION_CODES)).max(PERMISSION_CODES.length), staff: z.array(z.enum(PERMISSION_CODES)).max(PERMISSION_CODES.length), viewer: z.array(z.enum(PERMISSION_CODES)).max(PERMISSION_CODES.length) }),
+    defaults: DEFAULT_MERCHANT_PERMS,
+  },
   outbound: {
     schema: z.object({
       destinations: z.array(z.object({
@@ -136,8 +141,8 @@ export async function getAll() {
 
 /** Non-secret sections read on every page (sidebar, login, favicon, theme, 2FA rule, payout sound). */
 export async function getPublic() {
-  const [b, t, sec, snd] = await Promise.all([raw('brand'), raw('theme'), raw('security'), raw('sounds')]);
-  return { brand: b.value, theme: t.value, security: sec.value, sounds: snd.value };
+  const [b, t, sec, snd, mp] = await Promise.all([raw('brand'), raw('theme'), raw('security'), raw('sounds'), raw('merchantPerms')]);
+  return { brand: b.value, theme: t.value, security: sec.value, sounds: snd.value, merchantPerms: mp.value };
 }
 
 const audit = (client, actor, section, detail) =>
@@ -325,7 +330,7 @@ export function notifyPaymentApproved(payment) {
       const sig = createHmac('sha256', d.secret).update(`${t}.${body}`).digest('hex');
       let detail;
       try {
-        const r = await safePost(d.url, { body, headers: { 'content-type': 'application/json', 'x-signature': `t=${t},v1=${sig}`, 'user-agent': 'SuperPay-Outbound/1' } });
+        const r = await safePost(d.url, { body, headers: { 'content-type': 'application/json', 'x-signature': `t=${t},v1=${sig}`, 'user-agent': 'OptionPay-Outbound/1' } });
         detail = `${d.name}: HTTP ${r.status} (${r.ms} ms)`;
       } catch (err) {
         detail = `${d.name}: ล้มเหลว — ${err.message}`;

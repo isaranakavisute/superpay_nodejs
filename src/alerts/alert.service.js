@@ -100,7 +100,7 @@ export async function test(id, actor) {
     try {
       const r = await safePost(`https://api.telegram.org/bot${token}/sendMessage`, {
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ chat_id: chat, text: `✅ ทดสอบการแจ้งเตือนจาก SuperPay (${a.name})` }),
+        body: JSON.stringify({ chat_id: chat, text: `✅ ทดสอบการแจ้งเตือนจาก Option Pay (${a.name})` }),
       });
       const ok = r.status === 200 && /"ok":true/.test(r.body);
       const detail = ok ? 'ส่งสำเร็จ' : (r.body.match(/"description":"([^"]+)"/)?.[1] ?? `HTTP ${r.status}`);

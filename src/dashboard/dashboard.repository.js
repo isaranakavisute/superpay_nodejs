@@ -76,7 +76,7 @@ export async function recentPayments(from, to, limit) {
             p.created_at       AS "createdAt"
        FROM payments p
        LEFT JOIN merchants m ON m.id = p.merchant_id
-       JOIN banks b          ON b.code = p.payer_bank_code
+       LEFT JOIN banks b     ON b.code = p.payer_bank_code
        JOIN bank_accounts a  ON a.id = p.bank_account_id
        JOIN banks ab         ON ab.code = a.bank_code
       WHERE ${IN_WINDOW('p.created_at')}

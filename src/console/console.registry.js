@@ -19,7 +19,8 @@ export const RESOURCES = {
   payments: {
     from: `payments p
       LEFT JOIN merchants m     ON m.id = p.merchant_id
-      JOIN banks pb             ON pb.code = p.payer_bank_code
+      -- No payer bank yet on API / checkout orders until they are paid.
+      LEFT JOIN banks pb        ON pb.code = p.payer_bank_code
       JOIN bank_accounts a      ON a.id = p.bank_account_id
       JOIN banks ab             ON ab.code = a.bank_code`,
     columns: `p.ref, p.merchant_id AS "merchantId", m.name AS "merchantName",

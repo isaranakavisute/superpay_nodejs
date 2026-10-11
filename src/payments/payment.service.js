@@ -3,6 +3,7 @@ import { notifyPaymentApproved } from '../config-admin/config.service.js';
 import logger from '../logger.js';
 import { deliverPaymentEvent } from '../webhooks/webhook.service.js';
 import { BadRequestError, ConflictError, NotFoundError } from '../errors.js';
+import { findReusedSlip, isSampleSlip, SAMPLE_SLIP_MESSAGE, slipFingerprint } from '../shared/slip-fingerprint.js';
 
 /**
  * Operator actions on payments. Each runs in one transaction: lock the row,
@@ -183,12 +184,18 @@ export function assignMerchant(ref, actor, { merchantId, merchantOrderId }) {
 export function uploadSlip(ref, actor, { mime, data }) {
   const bytes = Buffer.from(data, 'base64');
   if (bytes.length > 5 * 1024 * 1024) throw new BadRequestError('Slip image must be 5 MB or smaller');
+  const fp = slipFingerprint(bytes, mime);
+  if (isSampleSlip(fp)) throw new BadRequestError(SAMPLE_SLIP_MESSAGE);
   return withTransaction(async (client) => {
     const p = await lock(client, ref);
+    // One transfer pays one order, admin uploads included.
+    const reusedOn = await findReusedSlip(client, p.id, fp);
+    if (reusedOn) throw new ConflictError(`สลิปนี้ถูกใช้แล้วกับรายการ ${reusedOn} — ใช้ซ้ำกับรายการอื่นไม่ได้`, { code: 'SLIP_ALREADY_USED', reusedOn });
     await client.query(
-      `INSERT INTO payment_slips (payment_id, mime, data, uploaded_by) VALUES ($1, $2, $3, $4)
-       ON CONFLICT (payment_id) DO UPDATE SET mime = EXCLUDED.mime, data = EXCLUDED.data, uploaded_by = EXCLUDED.uploaded_by, uploaded_at = now()`,
-      [p.id, mime, bytes, actor],
+      `INSERT INTO payment_slips (payment_id, mime, data, uploaded_by, image_sha256, qr_payload) VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (payment_id) DO UPDATE SET mime = EXCLUDED.mime, data = EXCLUDED.data, uploaded_by = EXCLUDED.uploaded_by, uploaded_at = now(),
+         image_sha256 = EXCLUDED.image_sha256, qr_payload = EXCLUDED.qr_payload, verify_result = NULL`,
+      [p.id, mime, bytes, actor, fp.sha256, fp.qr],
     );
     await client.query('UPDATE payments SET slip_received_at = coalesce(slip_received_at, now()) WHERE id = $1', [p.id]);
     await audit(client, actor, 'payment.slip', ref, 'แนบสลิป');

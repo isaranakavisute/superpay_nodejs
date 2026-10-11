@@ -24,6 +24,8 @@ COPY package.json ./
 COPY src ./src
 COPY scripts ./scripts
 COPY migrations ./migrations
+# OCR language data (Thai + English) for reading slips when no slip provider is connected.
+COPY assets ./assets
 
 # Run unprivileged; the node image already ships a non-root `node` user.
 USER node

@@ -6,7 +6,11 @@ import { internal as configOf, minBalanceFor } from '../config-admin/config.serv
 import { approveOne, emitPaymentEvent } from '../payments/payment.service.js';
 import { hashPassword, verifyPassword } from '../shared/password.js';
 import { normalizePromptPayId, promptPayPayload } from '../shared/promptpay.js';
-import { seal } from '../shared/secret-box.js';
+import { open as unseal, seal } from '../shared/secret-box.js';
+import { findReusedSlip, isSampleSlip, SAMPLE_SLIP_MESSAGE, slipFingerprint } from '../shared/slip-fingerprint.js';
+import { MERCHANT_PERMISSIONS } from './permission-catalog.js';
+import { matchSlip } from './slip-match.js';
+import { ocrCheckSlip } from './slip-ocr.js';
 import { verifySlip } from './slip-verify.js';
 
 /**
@@ -23,8 +27,8 @@ const sha = (v) => createHash('sha256').update(v).digest('hex');
 const round2 = (n) => Math.round(Number(n) * 100) / 100;
 const fmt = (n) => Number(n).toLocaleString('th-TH', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const actorOf = (m) => `api:${m.slug}`;
-const audit = (c, m, action, entity, ref, detail) =>
-  c.query(`INSERT INTO audit_logs (actor, action, entity, entity_ref, detail) VALUES ($1, $2, $3, $4, $5)`, [actorOf(m), action, entity, ref, detail]);
+const audit = (c, m, action, entity, ref, detail, actor = actorOf(m)) =>
+  c.query(`INSERT INTO audit_logs (actor, action, entity, entity_ref, detail) VALUES ($1, $2, $3, $4, $5)`, [actor, action, entity, ref, detail]);
 
 const STATUS = { pending: 'PENDING', approved: 'PAID', rejected: 'CANCELLED', refunded: 'REFUNDED', expired: 'EXPIRED' };
 const W_STATUS = { pending: 'PENDING', approved: 'APPROVED', rejected: 'REJECTED' };
@@ -84,6 +88,11 @@ export const loginSchema = z.object({
   username: z.string().trim().toLowerCase().max(60).optional(),
   password: z.string().min(1).max(200),
 }).refine((b) => b.email || b.username, 'ต้องส่ง email หรือ username');
+
+/** POST /auth/login: the shop user's secret key (Merchant Portal → ตั้งค่า), never a password. */
+export const apiLoginSchema = z.object({
+  secretKey: z.string({ error: 'ต้องส่ง secretKey' }).trim().min(20, 'secretKey ไม่ถูกต้อง').max(200),
+});
 
 // ---------- helpers ----------
 
@@ -225,7 +234,7 @@ async function payByToken(c, m, idOrRef) {
 
 // ---------- payments ----------
 
-export async function createPayment(m, b, { base, source = 'api', unique = true } = {}) {
+export async function createPayment(m, b, { base, source = 'api', unique = true, actor } = {}) {
   const [limits, slip] = await Promise.all([configOf('limits'), configOf('slip')]);
   if (Number(limits.minDeposit) > 0 && b.amount < Number(limits.minDeposit)) {
     throw new ApiError(400, 'PAYMENT_CONTRACT_POLICY_VIOLATION', `ยอดต่ำกว่ายอดฝากขั้นต่ำ ${fmt(limits.minDeposit)} บาท`, { error: 'below_min_amount', minAmount: Number(limits.minDeposit) });
@@ -252,50 +261,95 @@ export async function createPayment(m, b, { base, source = 'api', unique = true 
       [ref, m.id, b.orderId, md.memberName || '-', bank[0]?.code ?? null, md.senderAccountNumber ? `···${md.senderAccountNumber.slice(-4)}` : null, acct.id, amount, fee,
         round2(fee * 0.05), source, token, b.description ?? null, slip.orderTtlMinutes, b.metadata ? JSON.stringify(b.metadata) : null],
     );
-    await audit(c, m, 'payment.create', 'payment', ref, `สร้างออเดอร์ผ่าน API ยอด ${fmt(amount)} บาท (${b.orderId})`);
+    await audit(c, m, 'payment.create', 'payment', ref, `สร้างออเดอร์ผ่าน ${source === 'portal' ? 'Merchant Portal' : 'API'} ยอด ${fmt(amount)} บาท (${b.orderId})`, actor);
     return { success: true, transaction: present({ ...rows[0], promptpay_id: acct.promptpay_id }, base), selectedAccount: presentAccount(acct) };
   });
 }
 
 /** Store a slip, verify it with the configured provider, approve when it checks out. */
-async function attachAndVerify(m, p, { image, mime }, base) {
+/** A slip that was accepted or is waiting for review (a rejected one may be replaced). */
+async function hasAcceptedSlip(c, paymentId) {
+  const { rows } = await c.query(
+    `SELECT 1 FROM payment_slips WHERE payment_id = $1
+        AND coalesce(verify_result->>'decision', '') <> 'invalid' AND coalesce(verify_result->>'verified', '') <> 'false'`,
+    [paymentId],
+  );
+  return rows.length > 0;
+}
+async function lastSlipProblems(paymentId) {
+  const { rows } = await query(
+    `SELECT verify_result FROM payment_slips WHERE payment_id = $1 AND verify_result->>'decision' = 'invalid'`,
+    [paymentId],
+  );
+  const r = rows[0]?.verify_result;
+  if (!r) return null;
+  return Array.isArray(r.mismatches) && r.mismatches.length ? r.mismatches : [r.message ?? 'สลิปไม่ผ่านการตรวจ'];
+}
+const slipTaken = () => new ApiError(409, 'SLIP_ALREADY_UPLOADED', 'ได้รับสลิปของรายการนี้แล้ว — ส่งซ้ำไม่ได้ หากมีปัญหาโปรดติดต่อร้านค้า');
+
+/** `once`: refuse when an accepted / in-review slip is already attached (customer checkout page). */
+async function attachAndVerify(m, p, { image, mime }, base, { once = false } = {}) {
   const buf = Buffer.from(image, 'base64');
   if (buf.length < 100 || buf.length > 8 << 20) throw new ApiError(400, 'INVALID_SLIP', 'ไฟล์สลิปต้องเป็นรูปขนาดไม่เกิน 8 MB');
   if (!['pending', 'expired'].includes(p.status)) throw new ApiError(409, 'ORDER_NOT_PENDING', `ออเดอร์นี้สถานะ ${STATUS[p.status]} แล้ว`);
+  if (once && (await hasAcceptedSlip({ query }, p.id))) throw slipTaken();
+  const fp = slipFingerprint(buf, mime);
+  if (isSampleSlip(fp)) throw new ApiError(400, 'SAMPLE_SLIP', SAMPLE_SLIP_MESSAGE);
   const v = await verifySlip(buf, mime);
+  // No definite answer from a provider (none connected / down): read the slip image itself.
+  const ocr = v.verified === null ? await ocrCheckSlip(buf, p, v.cfg) : null;
+  const via = ocr ? 'ocr' : v.provider;
   return withTransaction(async (c) => {
     await c.query('SELECT 1 FROM payments WHERE id = $1 FOR UPDATE', [p.id]);
+    if (once && (await hasAcceptedSlip(c, p.id))) throw slipTaken();
+    // One transfer pays one order: the same slip (file or bank QR) already on another order is refused.
+    let reusedOn = await findReusedSlip(c, p.id, fp);
     let decision = 'review';
     let reason = v.message ?? null;
-    if (v.verified === false) { decision = 'invalid'; }
+    let mismatches = [];
+    if (v.verified === false) { decision = 'invalid'; mismatches = [reason]; }
     else if (v.verified) {
       const ageOk = !v.cfg.slipAgeCheck || !v.date || (v.cfg.slipMaxAgeHours === 0
         ? new Date(v.date).toLocaleDateString('en-CA', { timeZone: 'Asia/Bangkok' }) === new Date(p.created_at).toLocaleDateString('en-CA', { timeZone: 'Asia/Bangkok' })
         : Date.now() - new Date(v.date).getTime() <= v.cfg.slipMaxAgeHours * 3_600_000);
-      if (Math.abs(v.amount - Number(p.amount)) > 0.009) { decision = 'invalid'; reason = `ยอดในสลิป ${fmt(v.amount)} ไม่ตรงกับออเดอร์ ${fmt(p.amount)}`; }
-      else if (!ageOk) { decision = 'invalid'; reason = 'สลิปเก่าเกินกำหนด'; }
-      else if (v.transRef) {
-        const { rows } = await c.query('SELECT p.ref FROM payment_slips s JOIN payments p ON p.id = s.payment_id WHERE s.trans_ref = $1 AND s.payment_id <> $2', [v.transRef, p.id]);
-        if (rows[0]) { decision = 'invalid'; reason = `สลิปนี้ถูกใช้แล้วกับ ${rows[0].ref}`; await c.query('UPDATE payments SET slip_reused_ref = $2 WHERE id = $1', [p.id, rows[0].ref]); }
-        else decision = v.cfg.requireApproval ? 'review' : 'approve';
-      } else decision = v.cfg.requireApproval ? 'review' : 'approve';
-      if (decision === 'review' && v.cfg.requireApproval) reason = 'สลิปถูกต้อง — รอผู้ดูแลยืนยัน (ตั้งค่า "ต้องให้ผู้ดูแลยืนยันก่อน")';
+      // Amount, receiver account/bank, sender name and transfer time must all fit this order.
+      const { problems, unknown } = matchSlip(v, p);
+      if (!ageOk) problems.push(v.cfg.slipMaxAgeHours === 0 ? 'สลิปต้องเป็นการโอนวันเดียวกับที่สร้างรายการ' : `สลิปเก่าเกิน ${v.cfg.slipMaxAgeHours} ชั่วโมง — ใช้สลิปเก่าไม่ได้`);
+      if (problems.length) { decision = 'invalid'; mismatches = problems; reason = problems.join(' · '); }
+      else {
+        if (v.transRef) {
+          const { rows } = await c.query('SELECT p.ref FROM payment_slips s JOIN payments p ON p.id = s.payment_id WHERE s.trans_ref = $1 AND s.payment_id <> $2', [v.transRef, p.id]);
+          if (rows[0]) reusedOn ??= rows[0].ref;
+        }
+        if (unknown.length) { decision = 'review'; reason = `${unknown.join(' · ')} — รอผู้ดูแลตรวจ`; }
+        else if (v.cfg.requireApproval) { decision = 'review'; reason = 'สลิปถูกต้อง — รอผู้ดูแลยืนยัน (ตั้งค่า "ต้องให้ผู้ดูแลยืนยันก่อน")'; }
+        else decision = 'approve';
+      }
+    } else if (ocr) {
+      // Pixels can be edited: numbers that clearly differ reject; a match still needs the admin.
+      if (ocr.problems.length) { decision = 'invalid'; mismatches = ocr.problems; reason = ocr.problems.join(' · '); }
+      else reason = [ocr.matched.length ? `ตรงกับรายการ: ${ocr.matched.join(', ')}` : null, ...ocr.flags].filter(Boolean).join(' · ') + ' — อ่านจากภาพสลิป รอผู้ดูแลยืนยัน';
     }
+    // The other order's ref is kept for the admin (it may belong to another shop), not shown to the uploader.
+    if (reusedOn) { decision = 'invalid'; reason = 'สลิปนี้ถูกใช้กับรายการอื่นแล้ว — ใช้ซ้ำไม่ได้'; mismatches = [reason]; }
     await c.query(
-      `INSERT INTO payment_slips (payment_id, mime, data, uploaded_by, provider, trans_ref, verify_result) VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `INSERT INTO payment_slips (payment_id, mime, data, uploaded_by, provider, trans_ref, verify_result, image_sha256, qr_payload) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        ON CONFLICT (payment_id) DO UPDATE SET mime = EXCLUDED.mime, data = EXCLUDED.data, uploaded_by = EXCLUDED.uploaded_by, uploaded_at = now(),
-         provider = EXCLUDED.provider, trans_ref = EXCLUDED.trans_ref, verify_result = EXCLUDED.verify_result`,
-      [p.id, mime, buf, actorOf(m), v.provider, decision === 'approve' || decision === 'review' ? v.transRef ?? null : null, JSON.stringify({ verified: v.verified, amount: v.amount ?? null, date: v.date ?? null, message: reason })],
+         provider = EXCLUDED.provider, trans_ref = EXCLUDED.trans_ref, verify_result = EXCLUDED.verify_result,
+         image_sha256 = EXCLUDED.image_sha256, qr_payload = EXCLUDED.qr_payload`,
+      [p.id, mime, buf, actorOf(m), via, decision === 'approve' || decision === 'review' ? v.transRef ?? null : null,
+        JSON.stringify({ verified: v.verified, amount: v.amount ?? null, date: v.date ?? null, message: reason, decision, mismatches, ocr }), fp.sha256, fp.qr],
     );
-    await c.query('UPDATE payments SET slip_received_at = now(), review_note = coalesce($2, review_note) WHERE id = $1', [p.id, reason]);
+    await c.query('UPDATE payments SET slip_received_at = now(), review_note = coalesce($2, review_note), slip_reused_ref = $3 WHERE id = $1', [p.id, reason, reusedOn]);
     if (decision === 'approve') await approveOne(c, p.ref, 'system', `ตรวจสลิปผ่าน ${v.provider}`);
-    await audit(c, m, 'payment.slip', 'payment', p.ref, `แนบสลิป · ${v.provider}: ${decision === 'approve' ? 'ผ่าน — อนุมัติอัตโนมัติ' : reason ?? decision}`);
+    await audit(c, m, 'payment.slip', 'payment', p.ref, `แนบสลิป · ${via}: ${decision === 'approve' ? 'ผ่าน — อนุมัติอัตโนมัติ' : reason ?? decision}`);
     const { rows } = await c.query(`${PAY_SELECT} WHERE p.id = $1`, [p.id]);
     return {
       success: decision !== 'invalid',
       verified: decision === 'approve',
       result: decision === 'approve' ? 'PAID' : decision === 'invalid' ? 'INVALID_SLIP' : 'PENDING_REVIEW',
       message: decision === 'approve' ? 'ตรวจสลิปผ่าน — ออเดอร์ชำระแล้ว' : reason,
+      mismatches,
       transaction: present(rows[0], base),
     };
   });
@@ -341,7 +395,12 @@ export async function checkout(token, { base }) {
     merchant: { name: p.merchant_name },
     account: { bankCode: p.acct_bank, bankName: p.acct_bank_name, accountName: p.account_name, accountNumber: p.account_no, promptPayId: p.promptpay_id },
     qrPayload: p.status === 'pending' && t.status === 'PENDING' ? promptPayPayload(p.promptpay_id, p.amount) : null,
+    // What the slip must show (the payment page lists it).
+    customerName: p.customer_name && p.customer_name !== '-' ? p.customer_name : null,
     hasSlip: !!p.slip_received_at,
+    slipLocked: await hasAcceptedSlip({ query }, p.id),
+    // Why the last slip was refused, so the page can say what to fix.
+    slipProblems: p.slip_received_at ? await lastSlipProblems(p.id) : null,
   };
 }
 
@@ -351,8 +410,8 @@ export async function checkoutSlip(token, b, { base }) {
   await expireDue();
   const { rows } = await query(`${PAY_SELECT.replace('SELECT p.*', 'SELECT p.*, m.slug, m.id AS mid')} JOIN merchants m ON m.id = p.merchant_id WHERE p.checkout_token = $1`, [token]);
   if (!rows[0]) throw new ApiError(404, 'TRANSACTION_NOT_FOUND', 'ไม่พบรายการ');
-  const r = await attachAndVerify({ id: rows[0].mid, slug: `${rows[0].slug}:checkout` }, rows[0], b, base);
-  return { success: r.success, verified: r.verified, result: r.result, message: r.message, status: r.transaction.status };
+  const r = await attachAndVerify({ id: rows[0].mid, slug: `${rows[0].slug}:checkout` }, rows[0], b, base, { once: true });
+  return { success: r.success, verified: r.verified, result: r.result, message: r.message, mismatches: r.mismatches, status: r.transaction.status };
 }
 
 // ---------- transactions ----------
@@ -626,7 +685,12 @@ export async function dashboard(m) {
 
 // ---------- merchant login (issues an API key) ----------
 
-const PERMS = { owner: ['view_dashboard', 'view_transactions', 'create_payment', 'create_payout', 'manage_accounts', 'manage_webhooks'], staff: ['view_dashboard', 'view_transactions', 'create_payment'], viewer: ['view_dashboard', 'view_transactions'] };
+/** Permissions of a shop-user level, from Settings (console_config.merchantPerms). */
+export async function permsForTier(tier) {
+  const matrix = await configOf('merchantPerms');
+  return matrix[tier] ?? [];
+}
+export const permissionLabel = (code) => MERCHANT_PERMISSIONS.find((p) => p.code === code)?.label ?? code;
 
 /** Check a portal user's password (with lockout). Returns the user row joined with the shop. */
 export async function verifyPortalUser(b, ip) {
@@ -656,36 +720,169 @@ export async function verifyPortalUser(b, ip) {
   return u;
 }
 
+const SECRET_PREFIX = 'ms_live_';
+const loginFail = () => new ApiError(401, 'INVALID_SECRET_KEY', 'secretKey ไม่ถูกต้องหรือถูกยกเลิกแล้ว');
+
+/** Shop user (joined with the shop) for a secret key; 401 when unknown or revoked. */
+async function verifySecretKey(raw, ip) {
+  if (!raw.startsWith(SECRET_PREFIX)) throw loginFail();
+  const { rows } = await query(
+    `SELECT u.*, m.name AS merchant_name, m.slug, m.status AS merchant_status
+       FROM merchant_portal_users u JOIN merchants m ON m.id = u.merchant_id
+      WHERE u.secret_key_hash = $1`,
+    [sha(raw)],
+  );
+  const u = rows[0];
+  if (!u) {
+    await query(`INSERT INTO audit_logs (actor, action, entity, entity_ref, detail, ip) VALUES ('unknown', 'auth.merchant_login_failed', 'merchant', $1, 'secretKey ไม่ถูกต้อง', $2)`, [raw.slice(0, 12), ip ?? null]);
+    throw loginFail();
+  }
+  if (u.status !== 'active' || u.merchant_status !== 'active') throw new ApiError(403, 'ACCOUNT_DISABLED', 'บัญชีหรือร้านค้านี้ถูกปิดใช้งาน');
+  await query('UPDATE merchant_portal_users SET secret_key_last_used_at = now(), last_login_at = now() WHERE id = $1', [u.id]);
+  return u;
+}
+
 export async function login(b, ip) {
-  const u = await verifyPortalUser(b, ip);
+  const u = await verifySecretKey(b.secretKey, ip);
   return withTransaction(async (c) => {
-    // A fresh key every login; earlier login-issued keys are revoked (portal keys are untouched).
-    await c.query(`UPDATE merchant_api_keys SET status = 'revoked' WHERE merchant_id = $1 AND source = 'login' AND label = $2 AND status = 'active'`, [u.merchant_id, `login:${u.username}`]);
-    const raw = `sk_live_${randomBytes(32).toString('base64url')}`;
-    await c.query(`INSERT INTO merchant_api_keys (merchant_id, label, key_prefix, key_hash, created_by, source) VALUES ($1, $2, $3, $4, $5, 'login')`, [
-      u.merchant_id, `login:${u.username}`, `${raw.slice(0, 12)}…`, sha(raw), u.username,
-    ]);
-    await c.query(`INSERT INTO audit_logs (actor, action, entity, entity_ref, detail, ip) VALUES ($1, 'auth.merchant_login', 'merchant', $2, 'เข้าสู่ระบบผ่าน API — ออก key ใหม่', $3)`, [u.username, u.slug, ip ?? null]);
+    const raw = await issueLoginKey(c, u);
+    await c.query(`INSERT INTO audit_logs (actor, action, entity, entity_ref, detail, ip) VALUES ($1, 'auth.merchant_login', 'merchant', $2, 'เข้าสู่ระบบผ่าน API ด้วย secret key — ออก key ใหม่', $3)`, [u.username, u.slug, ip ?? null]);
     return {
       apiKey: raw,
       merchant: { id: String(u.merchant_id), username: u.username, email: u.email, businessName: u.merchant_name, status: 'ACTIVE' },
       role: 'MERCHANT',
       tier: u.tier,
-      permissions: PERMS[u.tier] ?? PERMS.viewer,
+      permissions: await permsForTier(u.tier),
     };
   });
 }
 
-/** Resolve an X-API-Key to its merchant (null when unknown, revoked or the shop is not active). */
+/**
+ * The user's API key (same as POST /auth/login returns): earlier login-issued keys
+ * are revoked (portal keys are untouched). Stored hashed for lookup and sealed for "ดู".
+ */
+export async function issueLoginKey(c, u) {
+  await revokeLoginKeys(c, u);
+  const raw = `sk_live_${randomBytes(32).toString('base64url')}`;
+  await c.query(`INSERT INTO merchant_api_keys (merchant_id, label, key_prefix, key_hash, created_by, source, portal_user_id, key_sealed) VALUES ($1, $2, $3, $4, $5, 'login', $6, $7)`, [
+    u.merchant_id, `login:${u.username}`, `${raw.slice(0, 12)}…`, sha(raw), u.username, u.id, seal(raw),
+  ]);
+  return raw;
+}
+
+const revokeLoginKeys = (c, u) => c.query(
+  `UPDATE merchant_api_keys SET status = 'revoked' WHERE merchant_id = $1 AND source = 'login' AND status = 'active' AND (portal_user_id = $3 OR label = $2)`,
+  [u.merchant_id, `login:${u.username}`, u.id],
+);
+
+async function portalUser(c, m, userId) {
+  const { rows } = await c.query('SELECT * FROM merchant_portal_users WHERE id = $1 AND merchant_id = $2', [userId, m.id]);
+  if (!rows[0]) throw new ApiError(404, 'USER_NOT_FOUND', 'ไม่พบผู้ใช้');
+  return rows[0];
+}
+
+/** The shop user's secret key status (never the key itself). */
+/** "ms_live_Qziz••••••••QDp4": first 12 + last 4 (prefix only for keys stored before encryption). */
+const maskKey = (sealed, prefix) => {
+  if (!sealed) return prefix;
+  const raw = unseal(sealed);
+  return `${raw.slice(0, 12)}••••••••${raw.slice(-4)}`;
+};
+
+/** The API key the user's latest /auth/login issued (still active), if any. */
+async function latestLoginKey(u) {
+  const { rows } = await query(
+    `SELECT key_prefix, key_sealed, created_at, last_used_at FROM merchant_api_keys
+      WHERE merchant_id = $1 AND portal_user_id = $2 AND source = 'login' AND status = 'active'
+      ORDER BY created_at DESC LIMIT 1`,
+    [u.merchant_id, u.id],
+  );
+  return rows[0] ?? null;
+}
+
+/** The shop user's secret key and latest login API key, masked (never in full here). */
+export async function secretKeyInfo(m, userId) {
+  const u = await portalUser({ query }, m, userId);
+  const k = await latestLoginKey(u);
+  return {
+    secretKey: u.secret_key_hash ? { masked: maskKey(u.secret_key_sealed, u.secret_key_prefix), revealable: !!u.secret_key_sealed, createdAt: u.secret_key_created_at, lastUsedAt: u.secret_key_last_used_at } : null,
+    apiKey: k ? { masked: maskKey(k.key_sealed, k.key_prefix), revealable: !!k.key_sealed, createdAt: k.created_at, lastUsedAt: k.last_used_at } : null,
+  };
+}
+
+export const revealSchema = z.object({ login: z.string().trim().toLowerCase().min(1).max(200), password: z.string().min(1).max(200) });
+
+/**
+ * Full secret key + latest login API key, only after the signed-in user re-enters
+ * their own login and password (wrong attempts count toward the usual lockout).
+ */
+export async function revealKeys(m, userId, b, ip) {
+  const who = await verifyPortalUser(b.login.includes('@') ? { email: b.login, password: b.password } : { username: b.login, password: b.password }, ip);
+  if (who.id !== userId || who.merchant_id !== m.id) throw new ApiError(403, 'NOT_YOUR_ACCOUNT', 'ใส่ชื่อผู้ใช้และรหัสผ่านของบัญชีที่กำลังเข้าสู่ระบบอยู่เท่านั้น');
+  const u = await portalUser({ query }, m, userId);
+  const k = await latestLoginKey(u);
+  await query(`INSERT INTO audit_logs (actor, action, entity, entity_ref, detail, ip) VALUES ($1, 'merchant.secret_key_view', 'merchant', $2, 'ดู secret key / API key แบบเต็ม (ยืนยันรหัสผ่านแล้ว)', $3)`, [u.username, m.slug, ip ?? null]);
+  return {
+    secretKey: u.secret_key_sealed ? unseal(u.secret_key_sealed) : null,
+    apiKey: k?.key_sealed ? unseal(k.key_sealed) : null,
+  };
+}
+
+/**
+ * Create or replace the shop user's secret key; returned once. Replacing it also
+ * revokes the API keys the old secret key logged in with.
+ */
+export const createSecretKey = (m, userId) => withTransaction(async (c) => {
+  const u = await portalUser(c, m, userId);
+  const raw = `${SECRET_PREFIX}${randomBytes(32).toString('base64url')}`;
+  const prefix = `${raw.slice(0, 12)}…`;
+  const { rows } = await c.query(
+    `UPDATE merchant_portal_users SET secret_key_hash = $2, secret_key_prefix = $3, secret_key_sealed = $4, secret_key_created_at = now(), secret_key_last_used_at = NULL
+      WHERE id = $1 RETURNING secret_key_created_at`,
+    [u.id, sha(raw), prefix, seal(raw)],
+  );
+  // Its API key comes with it (no need to call /auth/login first); the old one is revoked.
+  const apiKey = await issueLoginKey(c, u);
+  await c.query(`INSERT INTO audit_logs (actor, action, entity, entity_ref, detail) VALUES ($1, 'merchant.secret_key', 'merchant', $2, $3)`,
+    [u.username, m.slug, u.secret_key_hash ? 'สร้าง secret key ใหม่ + API key (ยกเลิกอันเดิม)' : 'สร้าง secret key + API key']);
+  return { secretKey: raw, apiKey, prefix, createdAt: rows[0].secret_key_created_at };
+});
+
+/** Remove the shop user's secret key and the API keys it logged in with. */
+export const revokeSecretKey = (m, userId) => withTransaction(async (c) => {
+  const u = await portalUser(c, m, userId);
+  await c.query('UPDATE merchant_portal_users SET secret_key_hash = NULL, secret_key_prefix = NULL, secret_key_sealed = NULL, secret_key_created_at = NULL, secret_key_last_used_at = NULL WHERE id = $1', [u.id]);
+  await revokeLoginKeys(c, u);
+  await c.query(`INSERT INTO audit_logs (actor, action, entity, entity_ref, detail) VALUES ($1, 'merchant.secret_key', 'merchant', $2, 'ยกเลิก secret key')`, [u.username, m.slug]);
+  return { success: true };
+});
+
+/**
+ * Resolve an X-API-Key to its merchant (null when unknown, revoked, the shop is
+ * not active, or the key's shop user is disabled). `keyTier` is the level of the
+ * shop user the key was issued to; null = shop-level key with full access.
+ */
 export async function merchantForKey(raw) {
   if (typeof raw !== 'string' || !raw.startsWith('sk_live_') || raw.length > 200) return null;
   const { rows } = await query(
     `UPDATE merchant_api_keys k SET last_used_at = now() FROM merchants m
       WHERE k.key_hash = $1 AND k.status = 'active' AND m.id = k.merchant_id
-      RETURNING m.*`,
+      RETURNING m.*, k.portal_user_id AS key_portal_user_id`,
     [sha(raw)],
   );
-  return rows[0]?.status === 'active' ? rows[0] : null;
+  const m = rows[0];
+  if (m?.status !== 'active') return null;
+  if (m.key_portal_user_id == null) return { ...m, keyTier: null, keyUser: null };
+  const { rows: u } = await query('SELECT username, tier, status FROM merchant_portal_users WHERE id = $1', [m.key_portal_user_id]);
+  if (u[0]?.status !== 'active') return null;
+  return { ...m, keyTier: u[0].tier, keyUser: u[0].username };
+}
+
+/** Throws 403 unless the key may use `perm` (shop-level keys may do everything). */
+export async function requirePermission(m, perm) {
+  if (!m.keyTier) return;
+  if ((await permsForTier(m.keyTier)).includes(perm)) return;
+  throw new ApiError(403, 'PERMISSION_DENIED', `ผู้ใช้ระดับ ${m.keyTier} ไม่มีสิทธิ์: ${permissionLabel(perm)}`, { required: perm, tier: m.keyTier });
 }
 
 export { hashPassword };

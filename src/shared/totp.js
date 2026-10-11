@@ -44,5 +44,5 @@ export function verify(secret, code, now = Date.now()) {
   return null;
 }
 
-export const otpauthUri = (secret, account, issuer = 'SuperPay Admin') =>
+export const otpauthUri = (secret, account, issuer = 'Option Pay Admin') =>
   `otpauth://totp/${encodeURIComponent(`${issuer}:${account}`)}?secret=${secret}&issuer=${encodeURIComponent(issuer)}&algorithm=SHA1&digits=6&period=${STEP}`;

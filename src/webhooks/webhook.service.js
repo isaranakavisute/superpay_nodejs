@@ -51,7 +51,7 @@ async function retryOne(id, actor, action = 'webhook.retry') {
   let ms = null;
   let error = null;
   try {
-    const r = await safePost(d.url, { body, headers: { 'content-type': 'application/json', 'user-agent': 'SuperPay-Webhook/1', ...(signature ? { 'x-signature': signature } : {}) } });
+    const r = await safePost(d.url, { body, headers: { 'content-type': 'application/json', 'user-agent': 'OptionPay-Webhook/1', ...(signature ? { 'x-signature': signature } : {}) } });
     ({ status, ms } = r);
     responseBody = r.body;
     if (status < 200 || status >= 300) error = `ปลายทางตอบ ${status}`;

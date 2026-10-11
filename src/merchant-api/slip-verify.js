@@ -9,6 +9,16 @@ import { BlockedUrlError, safeRequest } from '../shared/safe-fetch.js';
  */
 const EXT = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp' };
 
+/** Provider rejection codes -> what the customer should do about it. */
+function rejectText(name, msg) {
+  const m = String(msg ?? '').toLowerCase();
+  if (/qr|1007|1008/.test(m)) return 'ไม่พบ QR บนสลิป — ใช้ภาพสลิปเต็มจากแอปธนาคาร ห้ามครอปหรือแต่งภาพ';
+  if (/not.?found|1010|1011/.test(m)) return 'ไม่พบรายการโอนนี้ในระบบธนาคาร — สลิปอาจไม่ถูกต้อง หรือเพิ่งโอน ลองใหม่ในอีก 1–2 นาที';
+  if (/duplicate|1012/.test(m)) return 'สลิปนี้ถูกใช้ไปแล้ว — ใช้ซ้ำไม่ได้';
+  if (/image|file|1006/.test(m)) return 'ไฟล์ไม่ใช่รูปสลิปที่อ่านได้ — แนบภาพสลิปที่ชัดเจน';
+  return `${name}: ${msg ?? 'สลิปไม่ถูกต้อง'}`;
+}
+
 async function easyslip(cfg, buf, mime) {
   if (!cfg.easySlipApiKey) return { verified: null, message: 'ยังไม่ได้ตั้ง EasySlip API Key' };
   const form = new FormData();
@@ -17,7 +27,7 @@ async function easyslip(cfg, buf, mime) {
   const j = JSON.parse(r.body || '{}');
   if (r.status === 200 && j.data) return { verified: true, amount: Number(j.data.amount?.amount), transRef: j.data.transRef ?? null, date: j.data.date ?? null, raw: j.data };
   // 400 = the slip itself is bad (not a slip / not found); anything else is the provider's problem.
-  if (r.status === 400 || r.status === 404) return { verified: false, message: `EasySlip: ${j.message ?? 'สลิปไม่ถูกต้อง'}` };
+  if (r.status === 400 || r.status === 404) return { verified: false, message: rejectText('EasySlip', j.message) };
   return { verified: null, message: `EasySlip ตอบ HTTP ${r.status}: ${j.message ?? ''}`.trim() };
 }
 
@@ -28,7 +38,7 @@ async function slipok(cfg, buf, mime) {
   const r = await safeRequest(`https://api.slipok.com/api/line/apikey/${encodeURIComponent(cfg.slipOkBranchId)}`, { headers: { 'x-authorization': cfg.slipOkApiKey }, body: form });
   const j = JSON.parse(r.body || '{}');
   if (r.status === 200 && j.success && j.data) return { verified: true, amount: Number(j.data.amount), transRef: j.data.transRef ?? null, date: j.data.transTimestamp ?? j.data.transDate ?? null, raw: j.data };
-  if (r.status === 400) return { verified: false, message: `SlipOK: ${j.message ?? 'สลิปไม่ถูกต้อง'}` };
+  if (r.status === 400) return { verified: false, message: rejectText('SlipOK', `${j.code ?? ''} ${j.message ?? ''}`.trim()) };
   return { verified: null, message: `SlipOK ตอบ HTTP ${r.status}: ${j.message ?? ''}`.trim() };
 }
 
