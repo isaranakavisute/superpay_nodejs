@@ -134,16 +134,18 @@ export async function apiKeys(id) {
   return rows;
 }
 
-/** Returns the full key once; only its hash is stored. */
+/** Returns the full key and its signing secret once; the key is stored hashed, the secret sealed. */
 export function createKey(id, actor, { label }) {
   return withTransaction(async (client) => {
     const m = await lock(client, id);
-    const raw = `sk_live_${randomBytes(24).toString('base64url')}`;
-    await client.query(`INSERT INTO merchant_api_keys (merchant_id, label, key_prefix, key_hash, created_by) VALUES ($1, $2, $3, $4, $5)`, [
-      id, label, `${raw.slice(0, 14)}…`, sha(raw), actor,
+    const raw = `ak_live_${randomBytes(24).toString('base64url')}`;
+    // Shop-level keys sign their requests with their own secret (shown once, stored sealed).
+    const signingSecret = `ss_live_${randomBytes(32).toString('base64url')}`;
+    await client.query(`INSERT INTO merchant_api_keys (merchant_id, label, key_prefix, key_hash, created_by, signing_secret_sealed) VALUES ($1, $2, $3, $4, $5, $6)`, [
+      id, label, `${raw.slice(0, 14)}…`, sha(raw), actor, seal(signingSecret),
     ]);
-    await audit(client, actor, 'apikey.create', m.slug, `ออก API key "${label}"`);
-    return { key: raw };
+    await audit(client, actor, 'apikey.create', m.slug, `ออก API key "${label}" + signing secret`);
+    return { key: raw, signingSecret };
   });
 }
 

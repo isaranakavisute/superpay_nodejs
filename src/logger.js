@@ -12,7 +12,9 @@ export const logger = pino({
   level: config.logLevel,
   transport,
   redact: {
-    paths: ['req.headers.authorization', 'req.headers.cookie', '*.password'],
+    // Keys and signatures never reach the logs (x-console-key also derives the secret-box key).
+    paths: ['req.headers.authorization', 'req.headers.cookie', 'req.headers["x-console-key"]', 'req.headers["x-api-key"]',
+      'req.headers["x-signature"]', '*.password', '*.secretKey', '*.apiKey', '*.signingSecret'],
     censor: '[redacted]',
   },
 });

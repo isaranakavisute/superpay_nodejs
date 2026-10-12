@@ -54,7 +54,6 @@ export const createPaymentSchema = z.object({
 export const slipCreateSchema = createPaymentSchema.extend({ image: z.string().max(11_000_000).optional(), mime: z.string().max(20).optional() });
 export const slipVerifySchema = z.object({ orderId, image: z.string().min(10).max(11_000_000), mime: z.enum(['image/png', 'image/jpeg', 'image/webp']) });
 export const slipAttachSchema = z.object({ image: z.string().min(10).max(11_000_000), mime: z.enum(['image/png', 'image/jpeg', 'image/webp']) });
-export const collectSchema = createPaymentSchema.extend({ key: z.string().min(10).max(200) });
 export const listQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(200).default(50),
   offset: z.coerce.number().int().min(0).default(0),
@@ -720,7 +719,7 @@ export async function verifyPortalUser(b, ip) {
   return u;
 }
 
-const SECRET_PREFIX = 'ms_live_';
+const SECRET_PREFIX = 'sk_live_';
 const loginFail = () => new ApiError(401, 'INVALID_SECRET_KEY', 'secretKey ไม่ถูกต้องหรือถูกยกเลิกแล้ว');
 
 /** Shop user (joined with the shop) for a secret key; 401 when unknown or revoked. */
@@ -763,7 +762,7 @@ export async function login(b, ip) {
  */
 export async function issueLoginKey(c, u) {
   await revokeLoginKeys(c, u);
-  const raw = `sk_live_${randomBytes(32).toString('base64url')}`;
+  const raw = `ak_live_${randomBytes(32).toString('base64url')}`;
   await c.query(`INSERT INTO merchant_api_keys (merchant_id, label, key_prefix, key_hash, created_by, source, portal_user_id, key_sealed) VALUES ($1, $2, $3, $4, $5, 'login', $6, $7)`, [
     u.merchant_id, `login:${u.username}`, `${raw.slice(0, 12)}…`, sha(raw), u.username, u.id, seal(raw),
   ]);
@@ -863,19 +862,21 @@ export const revokeSecretKey = (m, userId) => withTransaction(async (c) => {
  * shop user the key was issued to; null = shop-level key with full access.
  */
 export async function merchantForKey(raw) {
-  if (typeof raw !== 'string' || !raw.startsWith('sk_live_') || raw.length > 200) return null;
+  if (typeof raw !== 'string' || !raw.startsWith('ak_live_') || raw.length > 200) return null;
   const { rows } = await query(
     `UPDATE merchant_api_keys k SET last_used_at = now() FROM merchants m
       WHERE k.key_hash = $1 AND k.status = 'active' AND m.id = k.merchant_id
-      RETURNING m.*, k.portal_user_id AS key_portal_user_id`,
+      RETURNING m.*, k.portal_user_id AS key_portal_user_id, k.signing_secret_sealed AS key_signing_sealed`,
     [sha(raw)],
   );
   const m = rows[0];
   if (m?.status !== 'active') return null;
-  if (m.key_portal_user_id == null) return { ...m, keyTier: null, keyUser: null };
-  const { rows: u } = await query('SELECT username, tier, status FROM merchant_portal_users WHERE id = $1', [m.key_portal_user_id]);
+  // The secret that signs this key's requests (never sent): the shop key's own, or its user's secret key.
+  const { key_signing_sealed: shopSecret, ...shop } = m;
+  if (m.key_portal_user_id == null) return { ...shop, keyTier: null, keyUser: null, signingSecret: shopSecret ? unseal(shopSecret) : null };
+  const { rows: u } = await query('SELECT username, tier, status, secret_key_sealed FROM merchant_portal_users WHERE id = $1', [m.key_portal_user_id]);
   if (u[0]?.status !== 'active') return null;
-  return { ...m, keyTier: u[0].tier, keyUser: u[0].username };
+  return { ...shop, keyTier: u[0].tier, keyUser: u[0].username, signingSecret: u[0].secret_key_sealed ? unseal(u[0].secret_key_sealed) : null };
 }
 
 /** Throws 403 unless the key may use `perm` (shop-level keys may do everything). */

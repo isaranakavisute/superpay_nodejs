@@ -1,5 +1,7 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import jpeg from 'jpeg-js';
+import { PNG } from 'pngjs';
 import { createWorker } from 'tesseract.js';
 import logger from '../logger.js';
 import { accountMatches } from './slip-match.js';
@@ -16,7 +18,9 @@ const LANG_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../
 let worker = null;
 function getWorker() {
   // One worker, loaded on first use (~5 s), then ~1 s per slip; calls are queued.
-  worker ??= createWorker(['tha', 'eng'], 1, { langPath: LANG_DIR, gzip: false, cacheMethod: 'none', logger: () => {} })
+  // errorHandler: tesseract.js otherwise throws job errors outside the promise, which would crash the server.
+  worker ??= createWorker(['tha', 'eng'], 1, { langPath: LANG_DIR, gzip: false, cacheMethod: 'none', logger: () => {},
+    errorHandler: (err) => logger.warn({ err: String(err?.message ?? err) }, 'slip OCR worker error') })
     .catch((err) => { worker = null; throw err; });
   return worker;
 }
@@ -159,7 +163,19 @@ export function compareOcr(s, order, cfg = {}) {
 }
 
 /** OCR + compare; null when the image can't be read at all (left for the admin). */
+/** Only images our own decoders accept go to OCR (a malformed file is left for the admin). */
+function decodable(buf) {
+  try {
+    if (buf[0] === 0x89 && buf[1] === 0x50) { PNG.sync.read(buf); return true; }
+    if (buf[0] === 0xff && buf[1] === 0xd8) { jpeg.decode(buf, { maxResolutionInMP: 40, maxMemoryUsageInMB: 256 }); return true; }
+    return buf.subarray(8, 12).toString('ascii') === 'WEBP';
+  } catch {
+    return false;
+  }
+}
+
 export async function ocrCheckSlip(buf, order, cfg) {
+  if (!decodable(buf)) return null;
   try {
     const text = await readSlipText(buf);
     const parsed = parseSlip(text);

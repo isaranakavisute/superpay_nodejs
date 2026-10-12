@@ -26,6 +26,7 @@ import usersAdminRouter from './routes/users-admin.routes.js';
 import profileRouter from './routes/profile.routes.js';
 import configAdminRouter from './routes/config-admin.routes.js';
 import v1Router from './routes/v1.routes.js';
+import telegramRouter from './routes/telegram.routes.js';
 import portalRouter from './routes/portal.routes.js';
 import accountsAdminRouter from './routes/accounts-admin.routes.js';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler.js';
@@ -40,10 +41,12 @@ export function createApp() {
   app.use(helmet());
   app.use(cors());
   // Slip uploads carry a base64 image; every other body stays small.
-  const smallJson = express.json({ limit: '1mb' });
-  const slipJson = express.json({ limit: '12mb' });
+  // rawBody: the exact bytes, for merchant API request signatures (merchant-api/request-signature.js).
+  const verify = (req, _res, buf) => { req.rawBody = buf; };
+  const smallJson = express.json({ limit: '1mb', verify });
+  const slipJson = express.json({ limit: '12mb', verify });
   // Settings uploads (logo/favicon up to 8 MB raw) arrive base64-encoded.
-  const assetJson = express.json({ limit: '12mb' });
+  const assetJson = express.json({ limit: '12mb', verify });
   app.use((req, res, next) => {
     if (req.method !== 'POST') return smallJson(req, res, next);
     if (/^\/api\/console\/config\/(assets\/|slip\/demo-verify$)/.test(req.path)) return assetJson(req, res, next);
@@ -91,6 +94,8 @@ export function createApp() {
   app.use('/api/products', productsRouter);
   // Merchant API: its own auth (X-API-Key), not the console key.
   app.use('/api/v1', v1Router);
+  // Telegram slip-check bot webhook (secret header checked inside).
+  app.use('/api/telegram', telegramRouter);
   // Admin-console API: only the console's server holds the key.
   app.use('/api/auth', requireConsoleKey, authRouter);
   app.use('/api/dashboard', requireConsoleKey, dashboardRouter);

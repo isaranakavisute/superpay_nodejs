@@ -16,7 +16,7 @@ const money = z.coerce.number().min(0).max(10_000_000);
 const int = (min, max) => z.coerce.number().int().min(min).max(max);
 const PROVIDERS = ['none', 'thunder', 'slipok', 'easyslip', 'slip2go'];
 export const THEMES = ['royal-gold', 'midnight'];
-const SECRET_FIELDS = { slip: ['thunderAccessToken', 'slipOkApiKey', 'easySlipApiKey', 'slip2goSecretKey'] };
+const SECRET_FIELDS = { slip: ['thunderAccessToken', 'slipOkApiKey', 'easySlipApiKey', 'slip2goSecretKey'], slipBot: ['botToken', 'webhookSecret'] };
 
 export const SECTIONS = {
   brand: {
@@ -77,6 +77,16 @@ export const SECTIONS = {
     },
   },
   quota: { schema: z.object({ threshold: int(0, 1_000_000) }), defaults: { threshold: 500, status: null } },
+  // Telegram slip-check bot: send a slip, get "valid slip" / the reason it isn't (telegram/slip-bot.service.js).
+  slipBot: {
+    schema: z.object({
+      enabled: z.boolean(),
+      botToken: z.string().max(200),
+      webhookSecret: z.string().max(200),
+      allowedChatIds: z.string().max(1000),   // comma-separated Telegram chat ids allowed to use the bot
+    }),
+    defaults: { enabled: false, botToken: '', webhookSecret: '', allowedChatIds: '' },
+  },
   balance: { schema: z.object({ minMerchantBalance: money }), defaults: { minMerchantBalance: 0 } },
   limits: { schema: z.object({ minDeposit: money, minWithdraw: money }), defaults: { minDeposit: 0, minWithdraw: 0 } },
   security: {

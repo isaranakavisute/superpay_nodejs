@@ -1,11 +1,14 @@
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { Router } from 'express';
+import config from '../config.js';
 import asyncHandler from '../middleware/asyncHandler.js';
 import { ApiError } from '../merchant-api/v1.service.js';
 import * as s from '../merchant-api/v1.service.js';
+import { verifyRequestSignature } from '../merchant-api/request-signature.js';
 
 /**
- * Merchant REST API v1 at /api/v1. Authenticated with `X-API-Key` except the
- * public checkout routes (token = secret), /collect (key in the body) and
+ * Merchant REST API v1 at /api/v1. Authenticated with `X-API-Key` + a request
+ * signature (X-Timestamp, X-Signature) except the public checkout routes (token = secret) and
  * /auth/login (secret key in the body). The Next app proxies /api/v1/* here and forwards the public
  * host, so URLs in responses point at the public site.
  */
@@ -32,15 +35,25 @@ function rateLimit(req, _res, next) {
   next();
 }
 
+// X-API-Key (ak_live_…) says who is calling; X-Timestamp + X-Signature prove it (request-signature.js).
 const requireKey = asyncHandler(async (req, _res, next) => {
   const m = await s.merchantForKey(req.get('x-api-key'));
-  if (!m) throw new ApiError(401, 'INVALID_API_KEY', 'X-API-Key ไม่ถูกต้อง ถูกเพิกถอน หรือร้านค้าไม่ได้เปิดใช้งาน');
+  if (!m) throw new ApiError(401, 'INVALID_API_KEY', 'X-API-Key ไม่ถูกต้อง ถูกเพิกถอน หรือร้านค้าไม่ได้เปิดใช้งาน (API key ต้องขึ้นต้นด้วย ak_live_)');
+  await verifyRequestSignature(req, m);
   req.merchant = m;
   next();
 });
 
 // ----- public -----
-v1Router.post('/auth/login', rateLimit, h((req) => {
+// /auth/login is internal-only (needs the console key, which only the Merchant Portal's server has).
+// Shops get their API key in Merchant Portal → ตั้งค่า, issued together with the secret key.
+const digest = (s) => createHash('sha256').update(String(s ?? '')).digest();
+function portalOnly(req, _res, next) {
+  if (config.consoleApiKey && timingSafeEqual(digest(req.get('x-console-key')), digest(config.consoleApiKey))) return next();
+  next(new ApiError(403, 'LOGIN_PORTAL_ONLY', 'เรียก /auth/login จากภายนอกไม่ได้ — รับ API key ได้ที่ Merchant Portal → ตั้งค่า → Secret key และ API key (สร้าง secret key แล้วได้ API key ทันที)'));
+}
+
+v1Router.post('/auth/login', portalOnly, rateLimit, h((req) => {
   // Passwords are not accepted on the API; shop users create a secret key in the Merchant Portal.
   if (req.body && typeof req.body === 'object' && 'password' in req.body && !('secretKey' in req.body)) {
     throw new ApiError(400, 'SECRET_KEY_REQUIRED', 'API ไม่รับรหัสผ่านแล้ว — ส่ง {"secretKey": "ms_live_..."} (สร้างได้ที่ Merchant Portal → ตั้งค่า → Secret key)');
@@ -49,13 +62,7 @@ v1Router.post('/auth/login', rateLimit, h((req) => {
 }));
 v1Router.get('/payment/checkout/:token', h((req) => s.checkout(String(req.params.token), { base: baseOf(req) })));
 v1Router.post('/payment/checkout/:token/slip', h((req) => s.checkoutSlip(String(req.params.token), s.slipAttachSchema.parse(req.body), { base: baseOf(req) })));
-v1Router.post('/collect', h(async (req) => {
-  const { key, ...body } = s.collectSchema.parse(req.body);
-  const m = await s.merchantForKey(key);
-  if (!m) throw new ApiError(401, 'INVALID_API_KEY', 'key ไม่ถูกต้อง');
-  await s.requirePermission(m, 'create_payment');
-  return s.createPayment(m, body, { base: baseOf(req), source: 'collect' });
-}));
+
 
 // ----- X-API-Key -----
 v1Router.use(requireKey);
@@ -64,6 +71,8 @@ const opts = (req) => ({ base: baseOf(req) });
 // Each endpoint names the permission it needs (Settings → สิทธิ์ผู้ใช้ร้านค้า); keys of a shop user are limited to their level.
 const can = (perm) => asyncHandler(async (req, _res, next) => { await s.requirePermission(req.merchant, perm); next(); });
 
+// /collect: same as /payment/create (older name), signed headers like every endpoint.
+v1Router.post('/collect', can('create_payment'), h((req) => s.createPayment(m(req), s.createPaymentSchema.parse(req.body), { ...opts(req), source: 'collect' })));
 v1Router.post('/payment/create', can('create_payment'), h((req) => s.createPayment(m(req), s.createPaymentSchema.parse(req.body), opts(req))));
 v1Router.post('/payment/slip/create', can('create_payment'), h((req) => s.createSlipPayment(m(req), s.slipCreateSchema.parse(req.body), opts(req))));
 v1Router.post('/payment/slip/verify', can('create_payment'), h((req) => s.verifyByOrder(m(req), s.slipVerifySchema.parse(req.body), opts(req))));
