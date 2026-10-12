@@ -2,6 +2,7 @@ import { createApp } from './app.js';
 import config from './config.js';
 import logger from './logger.js';
 import { closePool, healthCheck } from './db/pool.js';
+import { startScheduler, stopScheduler } from './telegram/announcement.service.js';
 
 const app = createApp();
 const server = app.listen(config.port, () => {
@@ -17,12 +18,16 @@ try {
   logger.error({ err }, 'database unreachable at startup');
 }
 
+// ประชาสัมพันธ์ posts only from production (local dev shares the database).
+if (config.isProduction) startScheduler();
+
 let shuttingDown = false;
 
 async function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   logger.info({ signal }, 'shutting down');
+  stopScheduler();
 
   const force = setTimeout(() => {
     logger.error('graceful shutdown timed out, forcing exit');

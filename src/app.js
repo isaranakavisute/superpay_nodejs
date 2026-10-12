@@ -27,6 +27,7 @@ import profileRouter from './routes/profile.routes.js';
 import configAdminRouter from './routes/config-admin.routes.js';
 import v1Router from './routes/v1.routes.js';
 import telegramRouter from './routes/telegram.routes.js';
+import supportBotAdminRouter from './routes/support-bot.routes.js';
 import portalRouter from './routes/portal.routes.js';
 import accountsAdminRouter from './routes/accounts-admin.routes.js';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler.js';
@@ -100,6 +101,7 @@ export function createApp() {
   app.use('/api/auth', requireConsoleKey, authRouter);
   app.use('/api/dashboard', requireConsoleKey, dashboardRouter);
   app.use('/api/console/payments', requireConsoleKey, paymentsAdminRouter);
+  app.use('/api/console/support-bot', requireConsoleKey, supportBotAdminRouter);
   app.use('/api/console/outflows', requireConsoleKey, outflowsAdminRouter);
   app.use('/api/console/withdrawals', requireConsoleKey, withdrawalsAdminRouter);
   app.use('/api/console/p2p', requireConsoleKey, p2pAdminRouter);

@@ -3,7 +3,8 @@ import { query } from '../db/pool.js';
 import { internal as configOf } from '../config-admin/config.service.js';
 import logger from '../logger.js';
 import { verifySlip } from '../merchant-api/slip-verify.js';
-import { isSampleSlip, slipFingerprint } from '../shared/slip-fingerprint.js';
+import { isSampleSlip, qrReason, slipFingerprint } from '../shared/slip-fingerprint.js';
+import { readSlipText } from '../merchant-api/slip-ocr.js';
 
 /**
  * @OptionPayBot: a user sends a slip image; the bot asks the slip provider (EasySlip)
@@ -107,7 +108,8 @@ export async function checkSlip(buf, mime) {
   const fp = slipFingerprint(buf, mime);
   if (isSampleSlip(fp)) return { result: 'invalid', reason: 'เป็นภาพตัวอย่างสลิปจาก Option Pay ไม่ใช่สลิปจริง', fp };
   const v = await verifySlip(buf, mime);
-  if (v.verified === false) return { result: 'invalid', reason: v.message ?? 'สลิปไม่ถูกต้อง', fp };
+  // "No QR" from the provider: say what the image actually has (a fake QR, or a QR that isn't a slip's).
+  if (v.verified === false) return { result: 'invalid', reason: (/QR/.test(v.message ?? '') && qrReason(fp)) || v.message || 'สลิปไม่ถูกต้อง', fp };
   if (v.verified !== true) return { result: 'unverified', reason: v.message ?? 'ผู้ให้บริการตรวจสลิปไม่ตอบ', fp };
   const dup = await seenBefore({ transRef: v.transRef, sha256: fp.sha256, qr: fp.qr });
   if (dup) return { result: 'invalid', reason: dup.reason, detail: dup.detail, fp, v };
@@ -130,6 +132,19 @@ function replyText(r) {
   return `⚠️ ตรวจสลิปไม่ได้ในขณะนี้ (ไม่ใช่ว่าสลิปไม่ถูกต้อง)\n\nสาเหตุ: ${r.reason}\nลองส่งใหม่อีกครั้งภายหลัง`;
 }
 
+// Words printed on Thai bank slips: a group photo whose QR can't be read still counts as a slip
+// (e.g. a fake slip) when its text has at least two of these.
+const SLIP_WORDS = [/โอนเงินสำเร็จ|เติมเงินสำเร็จ|ชำระเงินสำเร็จ|รายการสำเร็จ|ทำรายการสำเร็จ/, /จำนวนเงิน|จำนวน:/, /บาท|thb/i, /รหัสอ้างอิง|เลขที่รายการ|เลขอ้างอิง|ref/i,
+  /จาก|ไปยัง|ผู้รับ|ผู้โอน/, /ธนาคาร|scb|kbank|k\+|กสิกร|กรุงเทพ|กรุงไทย|กรุงศรี|ทหารไทย|ttb|ออมสิน|พร้อมเพย์|promptpay/i];
+async function looksLikeSlip(buf) {
+  try {
+    const text = (await readSlipText(buf)).replace(/\u0e4d\u0e32/g, 'ำ');
+    return SLIP_WORDS.filter((re) => re.test(text)).length >= 2;
+  } catch {
+    return false;
+  }
+}
+
 const HELP = 'ส่งรูปสลิปโอนเงินมาที่นี่ — บอทจะตรวจกับธนาคาร (EasySlip) แล้วตอบว่า valid slip หรือ invalid slip พร้อมเหตุผล\n\nแนะนำ: ส่งแบบ “ไฟล์” (File) จะชัดกว่าส่งแบบรูปภาพที่ Telegram บีบอัด';
 
 /** Handle one Telegram update (called after the webhook has answered 200). */
@@ -139,6 +154,11 @@ export async function handleUpdate(update) {
   const cfg = await configOf('slipBot');
   if (!cfg.enabled || !cfg.botToken) return;
   const chatId = String(msg.chat.id);
+  // In groups the bot stays quiet: only slip images (or /start, /help) get an answer; chatting is left alone.
+  const inGroup = msg.chat.type === 'group' || msg.chat.type === 'supergroup';
+  const command = /^\/(start|help)(@\w+)?\b/i.test(msg.text ?? '');
+  const img = imageOf(msg);
+  if (inGroup && !img && !command) return;
   const send = (text) => tg(cfg.botToken, 'sendMessage', { chat_id: msg.chat.id, text, reply_to_message_id: msg.message_id }).catch(() => {});
   const allowed = cfg.allowedChatIds.split(',').map((x) => x.trim()).filter(Boolean);
   if (!allowed.includes(chatId)) {
@@ -147,12 +167,14 @@ export async function handleUpdate(update) {
     await send(`บอทนี้ยังไม่ได้เปิดให้แชทนี้ใช้งาน\nchat id: ${chatId}\nแจ้งผู้ดูแลระบบ Option Pay เพื่อเพิ่ม chat id นี้`);
     return;
   }
-  const img = imageOf(msg);
   if (!img) { await send(HELP); return; }
   if (img.size && img.size > MAX_BYTES) { await send('❌ invalid slip\n\nเหตุผล: ไฟล์ใหญ่เกิน 8 MB'); return; }
   let r;
   try {
     const buf = await download(cfg.botToken, img.fileId);
+    // Group photos without a readable QR code are ordinary pictures — ignored (no reply, no EasySlip quota) —
+    // unless the caption says it is a slip or the printed text looks like one (OCR, no quota).
+    if (inGroup && !slipFingerprint(buf, img.mime).qr && !/สลิป|slip/i.test(msg.caption ?? '') && !(await looksLikeSlip(buf))) return;
     r = await checkSlip(buf, img.mime);
   } catch (err) {
     logger.warn({ err: err.message }, 'slip bot: check failed');

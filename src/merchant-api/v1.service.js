@@ -7,7 +7,7 @@ import { approveOne, emitPaymentEvent } from '../payments/payment.service.js';
 import { hashPassword, verifyPassword } from '../shared/password.js';
 import { normalizePromptPayId, promptPayPayload } from '../shared/promptpay.js';
 import { open as unseal, seal } from '../shared/secret-box.js';
-import { findReusedSlip, isSampleSlip, SAMPLE_SLIP_MESSAGE, slipFingerprint } from '../shared/slip-fingerprint.js';
+import { findReusedSlip, isSampleSlip, qrReason, SAMPLE_SLIP_MESSAGE, slipFingerprint } from '../shared/slip-fingerprint.js';
 import { MERCHANT_PERMISSIONS } from './permission-catalog.js';
 import { matchSlip } from './slip-match.js';
 import { ocrCheckSlip } from './slip-ocr.js';
@@ -306,7 +306,11 @@ async function attachAndVerify(m, p, { image, mime }, base, { once = false } = {
     let decision = 'review';
     let reason = v.message ?? null;
     let mismatches = [];
-    if (v.verified === false) { decision = 'invalid'; mismatches = [reason]; }
+    if (v.verified === false) {
+      decision = 'invalid';
+      if (/QR/.test(reason ?? '') && qrReason(fp)) reason = qrReason(fp);
+      mismatches = [reason];
+    }
     else if (v.verified) {
       const ageOk = !v.cfg.slipAgeCheck || !v.date || (v.cfg.slipMaxAgeHours === 0
         ? new Date(v.date).toLocaleDateString('en-CA', { timeZone: 'Asia/Bangkok' }) === new Date(p.created_at).toLocaleDateString('en-CA', { timeZone: 'Asia/Bangkok' })
