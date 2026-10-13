@@ -3,6 +3,7 @@ import { internal as configOf, notifyPaymentApproved } from '../config-admin/con
 import { emitPaymentEvent } from '../payments/payment.service.js';
 import { query, withTransaction } from '../db/pool.js';
 import { BadRequestError, ConflictError, NotFoundError } from '../errors.js';
+import { syncPaymentSplits } from '../merchants/tree.js';
 
 export const idParamSchema = z.object({ id: z.coerce.number().int().positive() });
 export const matchBodySchema = z.object({ paymentRef: z.string().regex(/^TXN\d{1,12}$/) });
@@ -101,9 +102,9 @@ export function createAndMatch(id, actor, { merchantId, bankAccountId, customerN
     const ref = `TXN${Number(last[0].n) + 1}`;
     await client.query(
       `INSERT INTO payments (ref, merchant_id, customer_name, payer_bank_code, bank_account_id, amount, fee, commission, status, reviewed_by, completed_at)
-       VALUES ($1, $2, $3, (SELECT bank_code FROM bank_accounts WHERE id = $4), $4, $5, $6, round($6 * 0.05, 2), 'approved', $7, now())`,
+       VALUES ($1, $2, $3, (SELECT bank_code FROM bank_accounts WHERE id = $4), $4, $5, $6, round($6 * 0.05, 2), 'approved', $7, now()) RETURNING id`,
       [ref, merchantId, customerName, bankAccountId, e.amount, fee, actor],
-    );
+    ).then((r) => syncPaymentSplits(client, r.rows[0].id));
     await client.query(`UPDATE inbound_events SET status = 'manual', payment_ref = $2, decided_by = $3, recheck_at = NULL, note = NULL WHERE id = $1`, [id, ref, actor]);
     await audit(client, actor, 'event.create_match', ref, `สร้าง ${ref} จาก event #${id} ยอด ${fmt(e.amount)} บาท`);
     return { ref };

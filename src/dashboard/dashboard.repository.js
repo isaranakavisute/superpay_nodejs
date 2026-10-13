@@ -1,4 +1,5 @@
 import { query } from '../db/pool.js';
+import { COMMISSION_SQL } from '../shared/balance-sql.js';
 
 // Tables from migrations/002_create_payment_tables.sql. Read-only here.
 // Window params are nullable: `$n::timestamptz IS NULL` means "unbounded".
@@ -124,7 +125,7 @@ export async function merchantStats(from, to) {
         WHERE status = 'approved' AND ${IN_WINDOW('created_at')}
         GROUP BY merchant_id
      ), win_out AS (
-       SELECT merchant_id, sum(amount) AS total, count(*)::int AS n
+       SELECT merchant_id, sum(amount) AS total, sum(fee) AS fee, count(*)::int AS n
          FROM outflows
         WHERE status = 'approved' AND ${IN_WINDOW('created_at')}
         GROUP BY merchant_id
@@ -132,7 +133,7 @@ export async function merchantStats(from, to) {
        SELECT merchant_id, sum(amount - fee) AS net FROM payments
         WHERE status = 'approved' GROUP BY merchant_id
      ), live_out AS (
-       SELECT merchant_id, sum(amount) AS total FROM outflows
+       SELECT merchant_id, sum(amount + fee) AS total FROM outflows
         WHERE status = 'approved' GROUP BY merchant_id
      ), pending AS (
        SELECT merchant_id, count(*)::int AS n FROM payments
@@ -143,6 +144,8 @@ export async function merchantStats(from, to) {
             m.slug,
             m.fee_percent                                     AS "feePercent",
             m.fee_flat                                        AS "feeFlat",
+            m.out_fee_percent                                 AS "outFeePercent",
+            m.out_fee_flat                                    AS "outFeeFlat",
             m.status,
             m.kyc_status                                      AS "kycStatus",
             m.min_balance                                     AS "minBalance",
@@ -152,7 +155,13 @@ export async function merchantStats(from, to) {
             coalesce(wi.fee, 0)                               AS "feeTotal",
             coalesce(wo.total, 0)                             AS "withdrawTotal",
             coalesce(wo.n, 0)                                 AS "withdrawCount",
-            m.opening_balance + coalesce(li.net, 0) - coalesce(lo.total, 0) + coalesce(adj.total, 0) AS "currentBalance",
+            coalesce(wo.fee, 0)                               AS "outFeeTotal",
+            m.opening_balance + coalesce(li.net, 0) - coalesce(lo.total, 0) + coalesce(adj.total, 0) + ${COMMISSION_SQL} AS "currentBalance",
+            ${COMMISSION_SQL}                                 AS "commissionEarned",
+            m.parent_id                                       AS "parentId",
+            m.path,
+            cardinality(m.path)                               AS depth,
+            m.allow_sub_merchants                             AS "allowSubMerchants",
             coalesce(adj.total, 0)                            AS "creditAdjustments",
             (SELECT count(*)::int FROM merchant_api_keys k WHERE k.merchant_id = m.id AND k.status = 'active') AS "apiKeysActive",
             (SELECT count(*)::int FROM merchant_api_keys k WHERE k.merchant_id = m.id) AS "apiKeysTotal",

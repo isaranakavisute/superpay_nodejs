@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { withTransaction } from '../db/pool.js';
 import { ConflictError, NotFoundError } from '../errors.js';
+import { moveWithdrawalSplits } from '../merchants/tree.js';
 
 export const refParamSchema = z.object({ ref: z.string().regex(/^P2P\d{1,12}$/, 'invalid P2P ref') });
 
@@ -35,11 +36,12 @@ export function settle(ref, actor) {
       await client.query('LOCK TABLE outflows IN SHARE ROW EXCLUSIVE MODE');
       const { rows } = await client.query(`SELECT coalesce(max(substring(ref from 4)::bigint), 40100) AS n FROM outflows WHERE ref ~ '^OUT[0-9]+$'`);
       const { rows: out } = await client.query(
-        `INSERT INTO outflows (ref, merchant_id, category, bank_account_id, receiver_name, receiver_bank_code, receiver_account, amount, status, source, description, completed_at)
-         VALUES ($1, $2, 'transfer', NULL, $3, $4, $5, $6, 'approved', 'p2p', $7, now()) RETURNING id`,
-        [`OUT${Number(rows[0].n) + 1}`, wd[0].merchant_id, wd[0].receiver_name, wd[0].receiver_bank_code, wd[0].receiver_account, wd[0].amount, `P2P ${ref} — ลูกค้า ${x.payment_ref} โอนตรงให้ผู้ถอน`],
+        `INSERT INTO outflows (ref, merchant_id, category, bank_account_id, receiver_name, receiver_bank_code, receiver_account, amount, status, source, description, completed_at, fee)
+         VALUES ($1, $2, 'transfer', NULL, $3, $4, $5, $6, 'approved', 'p2p', $7, now(), $8) RETURNING id`,
+        [`OUT${Number(rows[0].n) + 1}`, wd[0].merchant_id, wd[0].receiver_name, wd[0].receiver_bank_code, wd[0].receiver_account, wd[0].amount, `P2P ${ref} — ลูกค้า ${x.payment_ref} โอนตรงให้ผู้ถอน`, wd[0].fee ?? 0],
       );
       outflowId = out[0].id;
+      await moveWithdrawalSplits(client, wd[0].id, outflowId);
     } else {
       await client.query(`UPDATE outflows SET status = 'approved', completed_at = now() WHERE id = $1 AND status = 'pending'`, [outflowId]);
     }

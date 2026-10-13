@@ -57,6 +57,7 @@ export const SECTIONS = {
       slipMaxAgeHours: int(0, 720),
       uniqueAmount: z.boolean(),
       uniqueAmountMaxSatang: int(0, 99),
+      uniqueAmountCooldownMinutes: int(0, 1440).default(60),   // shared accounts: an amount isn't reused for this long
       orderTtlMinutes: int(0, 10080),
       intentPurgeDays: int(0, 365),
       smsStrictAllChannels: z.boolean(),
@@ -71,7 +72,7 @@ export const SECTIONS = {
     defaults: {
       provider: 'none', thunderAccessToken: '', slipOkApiKey: '', slipOkBranchId: '', easySlipApiKey: '', slip2goApiUrl: '', slip2goSecretKey: '',
       fallbackProvider: '', failoverAfter: 3, failoverMinutes: 5, failoverTrustNotFound: false, autoMatchAmount: true, autoMatchTimeWindow: 24,
-      requireApproval: false, slipAgeCheck: true, slipMaxAgeHours: 6, uniqueAmount: false, uniqueAmountMaxSatang: 99, orderTtlMinutes: 15,
+      requireApproval: false, slipAgeCheck: true, slipMaxAgeHours: 6, uniqueAmount: false, uniqueAmountMaxSatang: 99, uniqueAmountCooldownMinutes: 60, orderTtlMinutes: 15,
       intentPurgeDays: 7, smsStrictAllChannels: false, centralReceiving: true, centralDistribution: 'auto', centralFixedAccountId: '',
       p2pMatching: false, p2pRepoolGraceMinutes: 5, p2pStaleAfterMinutes: 30, p2pAutoPayout: false,
     },

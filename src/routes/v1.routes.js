@@ -5,6 +5,8 @@ import asyncHandler from '../middleware/asyncHandler.js';
 import { ApiError } from '../merchant-api/v1.service.js';
 import * as s from '../merchant-api/v1.service.js';
 import { verifyRequestSignature } from '../merchant-api/request-signature.js';
+import { z } from 'zod';
+import * as subs from '../merchants/sub-merchant.service.js';
 
 /**
  * Merchant REST API v1 at /api/v1. Authenticated with `X-API-Key` + a request
@@ -40,7 +42,8 @@ const requireKey = asyncHandler(async (req, _res, next) => {
   const m = await s.merchantForKey(req.get('x-api-key'));
   if (!m) throw new ApiError(401, 'INVALID_API_KEY', 'X-API-Key ไม่ถูกต้อง ถูกเพิกถอน หรือร้านค้าไม่ได้เปิดใช้งาน (API key ต้องขึ้นต้นด้วย ak_live_)');
   await verifyRequestSignature(req, m);
-  req.merchant = m;
+  // A parent shop's key may act for a shop below it (any depth).
+  req.merchant = req.get('x-sub-merchant') ? await s.actAsSubMerchant(m, req.get('x-sub-merchant')) : m;
   next();
 });
 
@@ -103,5 +106,15 @@ v1Router.get('/balance', can('view_dashboard'), h((req) => s.balance(m(req))));
 v1Router.get('/balance/line-summary', can('view_dashboard'), h((req) => s.lineSummary(m(req))));
 v1Router.get('/profile', can('view_dashboard'), h((req) => s.profile(m(req))));
 v1Router.get('/dashboard', can('view_dashboard'), h((req) => s.dashboard(m(req))));
+
+// Sub-merchants: shops under this shop (any depth). Reading needs view_dashboard; creating / changing needs manage_sub_merchants.
+const subId = (req) => z.coerce.number().int().positive().parse(req.params.id);
+const apiActor = (req) => `api:${m(req).slug}${m(req).keyUser ? `/${m(req).keyUser}` : ''}`;
+v1Router.get('/sub-merchants', can('view_dashboard'), h((req) => subs.apiList(m(req))));
+v1Router.get('/sub-merchants/overview', can('view_dashboard'), h((req) => subs.apiOverview(m(req), subs.networkQuerySchema.parse(req.query))));
+v1Router.get('/sub-merchants/:id', can('view_dashboard'), h((req) => subs.apiOne(m(req), subId(req), subs.networkQuerySchema.parse(req.query).days)));
+v1Router.post('/sub-merchants', can('manage_sub_merchants'), h(async (req) => ({ success: true, ...(await subs.createSub(m(req).id, apiActor(req), subs.createSubSchema.parse(req.body))), status: 'PENDING' })));
+v1Router.post('/sub-merchants/:id', can('manage_sub_merchants'), h((req) => subs.updateSub(m(req).id, subId(req), apiActor(req), subs.updateSubSchema.parse(req.body))));
+v1Router.post('/sub-merchants/:id/owner-password', can('manage_sub_merchants'), h((req) => subs.resetOwnerPassword(m(req).id, subId(req), apiActor(req), subs.resetOwnerSchema.parse(req.body))));
 
 export default v1Router;

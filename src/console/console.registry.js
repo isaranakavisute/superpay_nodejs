@@ -1,3 +1,5 @@
+import { BALANCE_SQL } from '../shared/balance-sql.js';
+
 /**
  * Read-only list resources for the admin console: GET /api/console/:resource.
  *
@@ -65,7 +67,7 @@ export const RESOURCES = {
     columns: `o.ref, o.merchant_id AS "merchantId", m.name AS "merchantName", o.category,
       o.bank_account_id AS "bankAccountId", a.label AS "fromAccount", a.bank_code AS "fromBankCode", a.account_name AS "fromAccountName",
       o.receiver_name AS "receiverName", o.receiver_bank_code AS "receiverBankCode", rb.name AS "receiverBankName",
-      o.receiver_account AS "receiverAccount", o.amount, o.currency, o.status, o.created_at AS "createdAt",
+      o.receiver_account AS "receiverAccount", o.amount, o.fee, o.currency, o.status, o.created_at AS "createdAt",
       o.source, o.description, o.review_note AS "reviewNote", o.completed_at AS "completedAt",
       EXISTS (SELECT 1 FROM outflow_slips s WHERE s.outflow_id = o.id) AS "hasSlipImage"`,
     order: 'o.created_at DESC, o.id DESC',
@@ -90,13 +92,10 @@ export const RESOURCES = {
         SELECT x.status, x.ref, x.amount FROM p2p_matches x WHERE x.withdrawal_ref = w.ref
          ORDER BY (x.status IN ('reserved', 'disputed')) DESC, x.matched_at DESC LIMIT 1) px ON true
       LEFT JOIN LATERAL (
-        SELECT m.opening_balance
-             + coalesce((SELECT sum(amount - fee) FROM payments WHERE merchant_id = m.id AND status = 'approved'), 0)
-             - coalesce((SELECT sum(amount) FROM outflows WHERE merchant_id = m.id AND status = 'approved'), 0)
-             + coalesce((SELECT sum(amount) FROM merchant_credit_adjustments WHERE merchant_id = m.id), 0) AS balance) bal ON true`,
+        SELECT ${BALANCE_SQL} AS balance) bal ON true`,
     columns: `w.ref, w.merchant_id AS "merchantId", m.name AS "merchantName", w.merchant_ref AS "merchantRef",
       w.receiver_name AS "receiverName", w.receiver_bank_code AS "receiverBankCode", b.name AS "receiverBankName",
-      w.receiver_account AS "receiverAccount", w.amount, w.note, w.status, w.approved_by AS "approvedBy",
+      w.receiver_account AS "receiverAccount", w.amount, w.fee, w.note, w.status, w.approved_by AS "approvedBy",
       w.reject_reason AS "rejectReason", o.ref AS "outflowRef", o.status AS "outflowStatus",
       EXISTS (SELECT 1 FROM outflow_slips s WHERE s.outflow_id = o.id) AS "hasSlipImage",
       px.status AS "p2pStatus", px.ref AS "p2pRef", bal.balance AS "merchantBalance", m.min_balance AS "merchantMinBalance",
@@ -137,7 +136,12 @@ export const RESOURCES = {
       a.account_no AS "accountNo", a.account_type AS "accountType", a.status,
       pin.n AS "inCount", pin.total AS "receivedTotal", pin.last_at AS "lastPaymentAt",
       pout.n AS "outCount", pout.total AS "sentTotal", (a.balance_at_reset + pin.total - pout.total) AS balance, a.balance_at_reset AS "balanceAtReset",
-      a.counters_reset_at AS "countersResetAt", a.created_at AS "createdAt", a.promptpay_id AS "promptpayId", a.merchant_id AS "merchantId"`,
+      a.counters_reset_at AS "countersResetAt", a.created_at AS "createdAt", a.promptpay_id AS "promptpayId", a.merchant_id AS "merchantId",
+      (SELECT coalesce(array_agg(l.merchant_id ORDER BY l.merchant_id), '{}') FROM bank_account_merchants l WHERE l.bank_account_id = a.id) AS "merchantIds",
+      (SELECT coalesce(json_agg(x ORDER BY x.total DESC), '[]') FROM (
+         SELECT p.merchant_id AS "merchantId", count(*)::int AS n, sum(p.amount) AS total FROM payments p
+          WHERE p.bank_account_id = a.id AND p.status = 'approved' AND (a.counters_reset_at IS NULL OR p.created_at >= a.counters_reset_at)
+          GROUP BY p.merchant_id) x) AS "byShop"`,
     order: 'a.id',
     search: ['a.label', 'a.account_name', 'a.account_no', 'a.bank_code', 'b.name'],
     status: 'a.account_type',

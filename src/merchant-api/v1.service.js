@@ -10,8 +10,12 @@ import { open as unseal, seal } from '../shared/secret-box.js';
 import { findReusedSlip, isSampleSlip, qrReason, SAMPLE_SLIP_MESSAGE, slipFingerprint } from '../shared/slip-fingerprint.js';
 import { MERCHANT_PERMISSIONS } from './permission-catalog.js';
 import { matchSlip } from './slip-match.js';
+import { outFeeFor } from '../shared/out-fee.js';
 import { ocrCheckSlip } from './slip-ocr.js';
 import { verifySlip } from './slip-verify.js';
+import { BALANCE_SQL } from '../shared/balance-sql.js';
+import { effectiveStatus, syncPaymentSplits, writeSplits } from '../merchants/tree.js';
+import { amountRule, linkCount, refuseUnlinkWithPending, syncPrimaryShop, uniqueAmount } from '../shared/account-links.js';
 
 /**
  * Merchant REST API v1. Every function gets the authenticated merchant row
@@ -101,12 +105,9 @@ const expireDue = (c = { query }) => c.query(`UPDATE payments SET status = 'expi
 async function balances(c, m) {
   const { rows } = await c.query(
     `SELECT m.min_balance,
-            m.opening_balance
-            + coalesce((SELECT sum(amount - fee) FROM payments WHERE merchant_id = m.id AND status = 'approved'), 0)
-            - coalesce((SELECT sum(amount) FROM outflows WHERE merchant_id = m.id AND status = 'approved'), 0)
-            + coalesce((SELECT sum(amount) FROM merchant_credit_adjustments WHERE merchant_id = m.id), 0) AS balance,
-            coalesce((SELECT sum(amount) FROM outflows WHERE merchant_id = m.id AND status = 'pending'), 0)
-            + coalesce((SELECT sum(amount) FROM withdrawal_requests WHERE merchant_id = m.id AND status = 'pending'), 0) AS reserved
+            ${BALANCE_SQL} AS balance,
+            coalesce((SELECT sum(amount + fee) FROM outflows WHERE merchant_id = m.id AND status = 'pending'), 0)
+            + coalesce((SELECT sum(amount + fee) FROM withdrawal_requests WHERE merchant_id = m.id AND status = 'pending'), 0) AS reserved
        FROM merchants m WHERE m.id = $1`,
     [m.id],
   );
@@ -115,16 +116,18 @@ async function balances(c, m) {
   return { balance: round2(r.balance), reserved: round2(r.reserved), available: round2(Number(r.balance) - Number(r.reserved)), minBalance: min };
 }
 
-/** Money leaving the shop: per-transaction minimum, then balance and minimum balance. */
-async function checkCanPay(c, m, amount) {
+/** Money leaving the shop: per-transaction minimum, then balance and minimum balance (amount + outgoing fee). */
+async function checkCanPay(c, m, amount, fee = 0) {
   const limits = await configOf('limits');
   if (Number(limits.minWithdraw) > 0 && amount < Number(limits.minWithdraw)) {
     throw new ApiError(400, 'below_min_amount', `ยอดต่ำกว่ายอดถอนขั้นต่ำ ${fmt(limits.minWithdraw)} บาท`, { minAmount: Number(limits.minWithdraw) });
   }
   await c.query('SELECT 1 FROM merchants WHERE id = $1 FOR UPDATE', [m.id]); // serialise a shop's payouts
   const b = await balances(c, m);
-  if (amount > b.available) throw new ApiError(400, 'INSUFFICIENT_BALANCE', `ยอดที่ใช้ได้ไม่พอ (ใช้ได้ ${fmt(b.available)} บาท)`, { available: b.available });
-  if (b.minBalance > 0 && b.available - amount < b.minBalance) {
+  const debit = round2(amount + fee);
+  const withFee = fee > 0 ? ` — ต้องใช้ ${fmt(debit)} บาท รวมค่าธรรมเนียม ${fmt(fee)} บาท` : '';
+  if (debit > b.available) throw new ApiError(400, 'INSUFFICIENT_BALANCE', `ยอดที่ใช้ได้ไม่พอ (ใช้ได้ ${fmt(b.available)} บาท${withFee})`, { available: b.available, fee, totalDebit: debit });
+  if (b.minBalance > 0 && b.available - debit < b.minBalance) {
     throw new ApiError(400, 'below_min_balance', `ถอนแล้วจะเหลือต่ำกว่ายอดคงเหลือขั้นต่ำ ${fmt(b.minBalance)} บาท`, { minBalance: b.minBalance, available: b.available });
   }
 }
@@ -140,30 +143,44 @@ const ACCOUNT_COLS = `a.id, a.bank_code, b.name AS bank_name, a.account_name, a.
 /** Receiving account for a new order: the shop's own accounts first, else the central pool per Settings. */
 async function pickAccount(c, m, requested) {
   const slip = await configOf('slip');
+  // Accounts linked to this shop (an account may be shared by several shops).
   const { rows: own } = await c.query(
     `SELECT ${ACCOUNT_COLS} FROM bank_accounts a JOIN banks b ON b.code = a.bank_code
-      WHERE a.merchant_id = $1 AND a.status = 'active' AND a.account_type <> 'send' ORDER BY a.id`,
+       JOIN bank_account_merchants l ON l.bank_account_id = a.id AND l.merchant_id = $1
+      WHERE a.status = 'active' AND a.account_type <> 'send' ORDER BY a.id`,
     [m.id],
   );
-  const { rows: central } = slip.centralReceiving
+  // A sub-merchant without its own receiving account uses its nearest parent shop's accounts (the money lands in
+  // the parent's account; the order and its balance belong to the sub-merchant) — before the platform's central ones.
+  const { rows: inherited } = !own.length && m.path?.length
+    ? await c.query(
+      `WITH near AS (SELECT l.merchant_id FROM bank_account_merchants l JOIN bank_accounts x ON x.id = l.bank_account_id
+                      WHERE l.merchant_id = ANY ($1::int[]) AND x.status = 'active' AND x.account_type <> 'send'
+                      ORDER BY array_position($1::int[], l.merchant_id) DESC LIMIT 1)
+       SELECT ${ACCOUNT_COLS} FROM bank_accounts a JOIN banks b ON b.code = a.bank_code
+         JOIN bank_account_merchants l ON l.bank_account_id = a.id AND l.merchant_id = (SELECT merchant_id FROM near)
+        WHERE a.status = 'active' AND a.account_type <> 'send' ORDER BY a.id`, [m.path])
+    : { rows: [] };
+  const { rows: central } = slip.centralReceiving && !inherited.length
     ? await c.query(`SELECT ${ACCOUNT_COLS} FROM bank_accounts a JOIN banks b ON b.code = a.bank_code
-                      WHERE a.merchant_id IS NULL AND a.status = 'active' AND a.account_type <> 'send' ORDER BY a.id`)
+                      WHERE NOT EXISTS (SELECT 1 FROM bank_account_merchants l WHERE l.bank_account_id = a.id)
+                        AND a.status = 'active' AND a.account_type <> 'send' ORDER BY a.id`)
     : { rows: [] };
   if (requested) {
-    const hit = [...own, ...central].find((a) => a.id === requested);
+    const hit = [...own, ...inherited, ...central].find((a) => a.id === requested);
     if (!hit) throw new ApiError(400, 'INVALID_BANK_ACCOUNT', `บัญชี ${requested} ใช้รับเงินให้ร้านนี้ไม่ได้`);
     return hit;
   }
-  const pool = own.length ? own : central;
+  const pool = own.length ? own : inherited.length ? inherited : central;
   if (!pool.length) throw new ApiError(400, 'NO_PAYMENT_ACCOUNT', 'ร้านนี้ยังไม่มีบัญชีรับเงินที่ใช้งานได้');
   if (pool.length === 1) return pool[0];
-  if (!own.length && slip.centralDistribution === 'fixed' && slip.centralFixedAccountId) {
+  if (pool === central && slip.centralDistribution === 'fixed' && slip.centralFixedAccountId) {
     const fixed = pool.find((a) => a.id === Number(slip.centralFixedAccountId));
     if (fixed) return fixed;
   }
-  if (!own.length && slip.centralDistribution === 'random') return pool[Math.floor(Math.random() * pool.length)];
+  if (pool === central && slip.centralDistribution === 'random') return pool[Math.floor(Math.random() * pool.length)];
   // auto = least received today, count = fewest orders today (Bangkok day).
-  const metric = !own.length && slip.centralDistribution === 'count' ? 'count(*)' : "coalesce(sum(amount) FILTER (WHERE status = 'approved'), 0)";
+  const metric = pool === central && slip.centralDistribution === 'count' ? 'count(*)' : "coalesce(sum(amount) FILTER (WHERE status = 'approved'), 0)";
   const { rows } = await c.query(
     `SELECT bank_account_id AS id, ${metric} AS v FROM payments
       WHERE bank_account_id = ANY ($1) AND created_at >= date_trunc('day', now() AT TIME ZONE 'Asia/Bangkok') AT TIME ZONE 'Asia/Bangkok'
@@ -175,19 +192,6 @@ async function pickAccount(c, m, requested) {
 }
 
 /** "Unique amount": add the smallest free satang so two equal pending orders on one account never collide. */
-async function uniqueAmount(c, accountId, amount, maxSatang) {
-  await c.query('SELECT 1 FROM bank_accounts WHERE id = $1 FOR UPDATE', [accountId]);
-  const { rows } = await c.query(
-    `SELECT amount FROM payments WHERE bank_account_id = $1 AND status = 'pending' AND amount >= $2 AND amount <= $3`,
-    [accountId, amount, round2(amount + maxSatang / 100)],
-  );
-  const taken = new Set(rows.map((r) => Math.round(Number(r.amount) * 100)));
-  for (let s = 0; s <= maxSatang; s++) {
-    const cents = Math.round(amount * 100) + s;
-    if (!taken.has(cents)) return cents / 100;
-  }
-  throw new ApiError(400, 'DUPLICATE_PENDING_AMOUNT', 'มีออเดอร์ยอดนี้รอชำระเต็มทุกช่องสตางค์แล้ว — ลองใหม่อีกครั้ง');
-}
 
 function present(p, base) {
   const status = p.status === 'pending' && p.expires_at && new Date(p.expires_at) < new Date() ? 'EXPIRED' : STATUS[p.status];
@@ -243,7 +247,9 @@ export async function createPayment(m, b, { base, source = 'api', unique = true,
     const { rows: dup } = await c.query('SELECT ref FROM payments WHERE merchant_id = $1 AND merchant_order_id = $2', [m.id, b.orderId]);
     if (dup[0]) throw new ApiError(409, 'DUPLICATE_ORDER_ID', `orderId ${b.orderId} ถูกใช้แล้ว`, { ref: dup[0].ref });
     const acct = await pickAccount(c, m, b.bankAccountId);
-    const amount = unique && slip.uniqueAmount ? await uniqueAmount(c, acct.id, b.amount, slip.uniqueAmountMaxSatang) : b.amount;
+    // Unique satang: per setting, and always on a shared account (the amount is what tells its shops' orders apart).
+    const rule = await amountRule(c, acct.id, slip);
+    const amount = unique && rule.unique ? await uniqueAmount(c, acct.id, b.amount, rule.maxSatang, rule.cooldown) : b.amount;
     const fee = round2((amount * Number(m.fee_percent)) / 100 + Number(m.fee_flat));
     const md = b.metadata ?? {};
     const { rows: bank } = md.senderBankCode ? await c.query('SELECT code FROM banks WHERE code = $1', [md.senderBankCode]) : { rows: [] };
@@ -260,6 +266,7 @@ export async function createPayment(m, b, { base, source = 'api', unique = true,
       [ref, m.id, b.orderId, md.memberName || '-', bank[0]?.code ?? null, md.senderAccountNumber ? `···${md.senderAccountNumber.slice(-4)}` : null, acct.id, amount, fee,
         round2(fee * 0.05), source, token, b.description ?? null, slip.orderTtlMinutes, b.metadata ? JSON.stringify(b.metadata) : null],
     );
+    await syncPaymentSplits(c, rows[0].id);
     await audit(c, m, 'payment.create', 'payment', ref, `สร้างออเดอร์ผ่าน ${source === 'portal' ? 'Merchant Portal' : 'API'} ยอด ${fmt(amount)} บาท (${b.orderId})`, actor);
     return { success: true, transaction: present({ ...rows[0], promptpay_id: acct.promptpay_id }, base), selectedAccount: presentAccount(acct) };
   });
@@ -466,7 +473,7 @@ export function cancel(m, id, { base }) {
 // ---------- payouts (outflows created by the shop) ----------
 
 const presentPayout = (o) => ({
-  id: o.ref, merchantRef: o.merchant_ref, amount: Number(o.amount), status: O_STATUS[o.status], bankCode: o.receiver_bank_code,
+  id: o.ref, merchantRef: o.merchant_ref, amount: Number(o.amount), fee: Number(o.fee), totalDebit: round2(Number(o.amount) + Number(o.fee)), status: O_STATUS[o.status], bankCode: o.receiver_bank_code,
   accountNumber: o.receiver_account, accountName: o.receiver_name, description: o.description, createdAt: o.created_at, completedAt: o.completed_at,
   failureReason: o.status === 'rejected' ? o.review_note : null,
 });
@@ -481,16 +488,18 @@ async function payoutOne(c, m, b, idem) {
     if (rows[0]) throw new ApiError(409, 'DUPLICATE_MERCHANT_REF', `merchantRef ${b.merchantRef} ถูกใช้แล้ว (${rows[0].ref})`);
   }
   await requireBank(c, b.bankCode);
-  await checkCanPay(c, m, b.amount);
+  const fee = outFeeFor(m, b.amount);
+  await checkCanPay(c, m, b.amount, fee);
   await c.query('LOCK TABLE outflows IN SHARE ROW EXCLUSIVE MODE');
   const { rows: last } = await c.query(`SELECT coalesce(max(substring(ref from 4)::bigint), 40100) AS n FROM outflows WHERE ref ~ '^OUT[0-9]+$'`);
   const ref = `OUT${Number(last[0].n) + 1}`;
   const { rows } = await c.query(
-    `INSERT INTO outflows (ref, merchant_id, category, receiver_name, receiver_bank_code, receiver_account, amount, status, source, description, merchant_ref, idempotency_key)
-     VALUES ($1, $2, 'transfer', $3, $4, $5, $6, 'pending', 'api', $7, $8, $9) RETURNING *`,
-    [ref, m.id, b.accountName, b.bankCode, b.accountNumber, b.amount, b.description ?? `Payout ผ่าน API${b.merchantRef ? ` (${b.merchantRef})` : ''}`, b.merchantRef ?? null, idem ?? null],
+    `INSERT INTO outflows (ref, merchant_id, category, receiver_name, receiver_bank_code, receiver_account, amount, status, source, description, merchant_ref, idempotency_key, fee)
+     VALUES ($1, $2, 'transfer', $3, $4, $5, $6, 'pending', 'api', $7, $8, $9, $10) RETURNING *`,
+    [ref, m.id, b.accountName, b.bankCode, b.accountNumber, b.amount, b.description ?? `Payout ผ่าน API${b.merchantRef ? ` (${b.merchantRef})` : ''}`, b.merchantRef ?? null, idem ?? null, fee],
   );
-  await audit(c, m, 'outflow.create', 'outflow', ref, `Payout ผ่าน API ${fmt(b.amount)} บาท → ${b.bankCode} ···${b.accountNumber.slice(-4)}`);
+  await writeSplits(c, 'outflow', rows[0].id, m.id, b.amount, 'out');
+  await audit(c, m, 'outflow.create', 'outflow', ref, `Payout ผ่าน API ${fmt(b.amount)} บาท${fee ? ` + ค่าธรรมเนียม ${fmt(fee)} บาท` : ''} → ${b.bankCode} ···${b.accountNumber.slice(-4)}`);
   return { payout: presentPayout(rows[0]) };
 }
 
@@ -528,7 +537,7 @@ export async function payouts(m, q) {
 // ---------- withdrawal requests ----------
 
 const presentWdr = (w) => ({
-  requestRef: w.ref, merchantRef: w.merchant_ref, amount: Number(w.amount), status: W_STATUS[w.status], bankCode: w.receiver_bank_code,
+  requestRef: w.ref, merchantRef: w.merchant_ref, amount: Number(w.amount), fee: Number(w.fee), totalDebit: round2(Number(w.amount) + Number(w.fee)), status: W_STATUS[w.status], bankCode: w.receiver_bank_code,
   accountNumber: w.receiver_account, accountName: w.receiver_name, note: w.note, rejectReason: w.reject_reason, createdAt: w.created_at, decidedAt: w.decided_at,
 });
 
@@ -539,16 +548,18 @@ export function createWithdrawal(m, b) {
       if (rows[0]) throw new ApiError(409, 'DUPLICATE_MERCHANT_REF', `merchantRef ${b.merchantRef} ถูกใช้แล้ว (${rows[0].ref})`);
     }
     await requireBank(c, b.bankCode);
-    await checkCanPay(c, m, b.amount);
+    const fee = outFeeFor(m, b.amount);
+    await checkCanPay(c, m, b.amount, fee);
     await c.query('LOCK TABLE withdrawal_requests IN SHARE ROW EXCLUSIVE MODE');
     const { rows: last } = await c.query(`SELECT coalesce(max(substring(ref from 4)::bigint), 90000) AS n FROM withdrawal_requests WHERE ref ~ '^WDR[0-9]+$'`);
     const ref = `WDR${Number(last[0].n) + 1}`;
     const { rows } = await c.query(
-      `INSERT INTO withdrawal_requests (ref, merchant_id, receiver_name, receiver_bank_code, receiver_account, amount, note, status, merchant_ref)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8) RETURNING *`,
-      [ref, m.id, b.accountName, b.bankCode, b.accountNumber, b.amount, b.note ?? null, b.merchantRef ?? null],
+      `INSERT INTO withdrawal_requests (ref, merchant_id, receiver_name, receiver_bank_code, receiver_account, amount, note, status, merchant_ref, fee)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9) RETURNING *`,
+      [ref, m.id, b.accountName, b.bankCode, b.accountNumber, b.amount, b.note ?? null, b.merchantRef ?? null, fee],
     );
-    await audit(c, m, 'withdrawal.create', 'withdrawal', ref, `คำขอถอนผ่าน API ${fmt(b.amount)} บาท`);
+    await writeSplits(c, 'withdrawal', rows[0].id, m.id, b.amount, 'out');
+    await audit(c, m, 'withdrawal.create', 'withdrawal', ref, `คำขอถอนผ่าน API ${fmt(b.amount)} บาท${fee ? ` + ค่าธรรมเนียม ${fmt(fee)} บาท` : ''}`);
     return { success: true, request: presentWdr(rows[0]) };
   });
 }
@@ -575,14 +586,19 @@ export async function withdrawal(m, ref) {
 export async function accounts(m) {
   const slip = await configOf('slip');
   const { rows } = await query(
-    `SELECT ${ACCOUNT_COLS}, a.status FROM bank_accounts a JOIN banks b ON b.code = a.bank_code WHERE a.merchant_id = $1 ORDER BY a.id`,
+    `SELECT ${ACCOUNT_COLS}, a.status, (SELECT count(*) FROM bank_account_merchants x WHERE x.bank_account_id = a.id) > 1 AS shared
+       FROM bank_accounts a JOIN banks b ON b.code = a.bank_code
+       JOIN bank_account_merchants l ON l.bank_account_id = a.id AND l.merchant_id = $1 ORDER BY a.id`,
     [m.id],
   );
   return {
     success: true,
-    data: rows.map((a) => ({ ...presentAccount(a), status: a.status.toUpperCase() })),
+    // shared = also used by other shops (which ones is not shown)
+    data: rows.map((a) => ({ ...presentAccount(a), status: a.status.toUpperCase(), shared: a.shared })),
     centralReceiving: slip.centralReceiving,
-    note: rows.some((a) => a.status === 'active') ? null : slip.centralReceiving ? 'ยังไม่มีบัญชีของร้าน — ออเดอร์จะใช้บัญชีกลางของระบบ' : 'ยังไม่มีบัญชีรับเงิน — สร้างออเดอร์ไม่ได้จนกว่าจะเพิ่มบัญชี',
+    note: rows.some((a) => a.status === 'active') ? null
+      : m.path?.length ? 'ยังไม่มีบัญชีของร้าน — ออเดอร์จะใช้บัญชีรับเงินของร้านแม่ (ยอดยังเป็นของร้านนี้)'
+        : slip.centralReceiving ? 'ยังไม่มีบัญชีของร้าน — ออเดอร์จะใช้บัญชีกลางของระบบ' : 'ยังไม่มีบัญชีรับเงิน — สร้างออเดอร์ไม่ได้จนกว่าจะเพิ่มบัญชี',
   };
 }
 
@@ -597,11 +613,24 @@ export function addAccount(m, b) {
     const code = b.bankCode ?? 'KBANK';
     await requireBank(c, code);
     const digits = b.accountNumber ?? pp;
+    // The same account already in the system: this shop's own → returned as is; another shop's or central → only the
+    // admin can share it (Admin → บัญชีธนาคาร → ผูกกับร้าน).
+    const { rows: same } = await c.query(
+      `SELECT a.id, EXISTS (SELECT 1 FROM bank_account_merchants l WHERE l.bank_account_id = a.id AND l.merchant_id = $3) AS mine
+         FROM bank_accounts a WHERE a.bank_code = $1 AND (a.account_no = $2 OR a.promptpay_id = $2) ORDER BY a.id LIMIT 1`,
+      [code, digits, m.id],
+    );
+    if (same[0] && !same[0].mine) throw new ApiError(409, 'ACCOUNT_EXISTS', 'บัญชีนี้มีอยู่ในระบบแล้ว — ติดต่อผู้ดูแลระบบเพื่อผูกบัญชีนี้กับร้านของคุณ (ใช้บัญชีร่วมกันได้)');
+    if (same[0]) {
+      const { rows: a } = await c.query(`SELECT ${ACCOUNT_COLS}, a.status FROM bank_accounts a JOIN banks b ON b.code = a.bank_code WHERE a.id = $1`, [same[0].id]);
+      return { success: true, account: { ...presentAccount(a[0]), status: a[0].status.toUpperCase() } };
+    }
     const { rows } = await c.query(
       `INSERT INTO bank_accounts (label, bank_code, account_type, status, account_name, account_no, promptpay_id, merchant_id)
        VALUES ($1, $2, 'receive', 'active', $3, $4, $5, $6) RETURNING id`,
       [`${code} ···${digits.slice(-4)}`, code, b.accountName ?? m.name, b.accountNumber ?? null, pp, m.id],
     );
+    await c.query('INSERT INTO bank_account_merchants (bank_account_id, merchant_id, linked_by) VALUES ($1, $2, $3)', [rows[0].id, m.id, `api:${m.slug}`]);
     await audit(c, m, 'account.create', 'account', String(rows[0].id), `ร้านเพิ่มบัญชีรับเงินผ่าน API (${b.type})`);
     const { rows: a } = await c.query(`SELECT ${ACCOUNT_COLS}, a.status FROM bank_accounts a JOIN banks b ON b.code = a.bank_code WHERE a.id = $1`, [rows[0].id]);
     return { success: true, account: { ...presentAccount(a[0]), status: 'ACTIVE' } };
@@ -610,8 +639,18 @@ export function addAccount(m, b) {
 
 export function removeAccount(m, id) {
   return withTransaction(async (c) => {
-    const { rows } = await c.query(`UPDATE bank_accounts SET status = 'inactive' WHERE id = $1 AND merchant_id = $2 RETURNING id`, [id, m.id]);
-    if (!rows[0]) throw new ApiError(404, 'ACCOUNT_NOT_FOUND', 'ไม่พบบัญชีของร้านนี้');
+    const { rows: link } = await c.query('SELECT 1 FROM bank_account_merchants WHERE bank_account_id = $1 AND merchant_id = $2', [id, m.id]);
+    if (!link[0]) throw new ApiError(404, 'ACCOUNT_NOT_FOUND', 'ไม่พบบัญชีของร้านนี้');
+    await c.query('SELECT 1 FROM bank_accounts WHERE id = $1 FOR UPDATE', [id]);
+    // Shared with other shops: only this shop leaves it (never while its orders there still wait for payment).
+    if ((await linkCount(c, id)) > 1) {
+      await refuseUnlinkWithPending(c, id, [m.id]);
+      await c.query('DELETE FROM bank_account_merchants WHERE bank_account_id = $1 AND merchant_id = $2', [id, m.id]);
+      await syncPrimaryShop(c, id);
+      await audit(c, m, 'account.unlink', 'account', String(id), 'ร้านเลิกใช้บัญชีรับเงินที่ใช้ร่วม (บัญชียังใช้งานกับร้านอื่น)');
+      return { success: true, unlinked: true };
+    }
+    await c.query(`UPDATE bank_accounts SET status = 'inactive' WHERE id = $1`, [id]);
     await audit(c, m, 'account.disable', 'account', String(id), 'ร้านลบบัญชีรับเงินผ่าน API (inactive)');
     return { success: true };
   });
@@ -652,17 +691,40 @@ export async function balance(m) {
   };
 }
 
+/** The shop's line: itself + every sub-merchant below it (any depth), with balances. */
 export async function lineSummary(m) {
-  const b = await balances({ query }, m);
-  // This system has no parent/child shop hierarchy: the line is the shop itself.
-  return { success: true, parent: { id: String(m.id), name: m.name, balance: b.balance }, children: [], total: b.balance, currency: 'THB' };
+  const { rows } = await query(
+    `SELECT m.id, m.name, m.slug, m.parent_id, cardinality(m.path) - $2 AS depth, m.status, ${BALANCE_SQL} AS balance
+       FROM merchants m WHERE m.id = $1 OR $1 = ANY (m.path) ORDER BY m.path || m.id`,
+    [m.id, (m.path ?? []).length],
+  );
+  const [self, ...below] = rows;
+  const total = round2(rows.reduce((t, r) => t + Number(r.balance), 0));
+  return {
+    success: true,
+    parent: { id: String(self.id), name: self.name, balance: round2(self.balance) },
+    children: below.map((r) => ({ id: String(r.id), name: r.name, slug: r.slug, parentId: String(r.parent_id), depth: r.depth, status: r.status.toUpperCase(), balance: round2(r.balance) })),
+    total, currency: 'THB',
+  };
+}
+
+/** X-Sub-Merchant: a parent shop's key acting for a shop below it (same key, same signature, that shop's data). */
+export async function actAsSubMerchant(m, raw) {
+  const id = Number(raw);
+  if (!Number.isInteger(id) || id <= 0) throw new ApiError(400, 'INVALID_SUB_MERCHANT', 'X-Sub-Merchant ต้องเป็น id ของร้านย่อย (ตัวเลข)');
+  if (id === Number(m.id)) return m;
+  const { rows } = await query('SELECT * FROM merchants WHERE id = $1 AND $2 = ANY (path)', [id, m.id]);
+  if (!rows[0]) throw new ApiError(403, 'SUB_MERCHANT_NOT_FOUND', `ร้าน ${id} ไม่ได้อยู่ใต้ร้านของ API key นี้`);
+  if ((await effectiveStatus({ query }, id)) !== 'active') throw new ApiError(403, 'SUB_MERCHANT_NOT_ACTIVE', `ร้านย่อย ${rows[0].name} ยังรออนุมัติหรือถูกระงับ`);
+  return { ...rows[0], keyTier: m.keyTier, keyUser: m.keyUser, signingSecret: m.signingSecret, actingParentId: m.id };
 }
 
 export const profile = (m) => ({
   success: true,
   merchant: {
     id: String(m.id), name: m.name, slug: m.slug, status: m.status.toUpperCase(), kycStatus: m.kyc_status,
-    feePercent: Number(m.fee_percent), feeFlat: Number(m.fee_flat), contactEmail: m.contact_email, contactPhone: m.contact_phone, createdAt: m.created_at,
+    feePercent: Number(m.fee_percent), feeFlat: Number(m.fee_flat), outFeePercent: Number(m.out_fee_percent), outFeeFlat: Number(m.out_fee_flat),
+    parentId: m.parent_id == null ? null : String(m.parent_id), allowSubMerchants: m.allow_sub_merchants, minBalance: Number(m.min_balance), contactEmail: m.contact_email, contactPhone: m.contact_phone, createdAt: m.created_at,
   },
 });
 
@@ -725,7 +787,8 @@ export async function verifyPortalUser(b, ip) {
     await query(`INSERT INTO audit_logs (actor, action, entity, entity_ref, detail, ip) VALUES ($1, 'auth.merchant_login_failed', 'merchant', $2, 'รหัสผ่านไม่ถูกต้อง', $3)`, [u.username, u.slug, ip ?? null]);
     throw fail;
   }
-  if (u.status !== 'active' || u.merchant_status !== 'active') throw new ApiError(403, 'ACCOUNT_DISABLED', 'บัญชีหรือร้านค้านี้ถูกปิดใช้งาน');
+  // A shop waiting for approval may sign in (and see that it waits); a suspended shop — or one under a suspended shop — may not.
+  if (u.status !== 'active' || (await effectiveStatus({ query }, u.merchant_id)) === 'suspended') throw new ApiError(403, 'ACCOUNT_DISABLED', 'บัญชีหรือร้านค้านี้ถูกปิดใช้งาน');
   await query('UPDATE merchant_portal_users SET failed_logins = 0, locked_until = NULL, last_login_at = now() WHERE id = $1', [u.id]);
   return u;
 }
@@ -747,7 +810,7 @@ async function verifySecretKey(raw, ip) {
     await query(`INSERT INTO audit_logs (actor, action, entity, entity_ref, detail, ip) VALUES ('unknown', 'auth.merchant_login_failed', 'merchant', $1, 'secretKey ไม่ถูกต้อง', $2)`, [raw.slice(0, 12), ip ?? null]);
     throw loginFail();
   }
-  if (u.status !== 'active' || u.merchant_status !== 'active') throw new ApiError(403, 'ACCOUNT_DISABLED', 'บัญชีหรือร้านค้านี้ถูกปิดใช้งาน');
+  if (u.status !== 'active' || (await effectiveStatus({ query }, u.merchant_id)) !== 'active') throw new ApiError(403, 'ACCOUNT_DISABLED', 'บัญชีหรือร้านค้านี้ถูกปิดใช้งาน หรือยังรอผู้ดูแลระบบอนุมัติ');
   await query('UPDATE merchant_portal_users SET secret_key_last_used_at = now(), last_login_at = now() WHERE id = $1', [u.id]);
   return u;
 }
@@ -881,7 +944,7 @@ export async function merchantForKey(raw) {
     [sha(raw)],
   );
   const m = rows[0];
-  if (m?.status !== 'active') return null;
+  if (m?.status !== 'active' || (await effectiveStatus({ query }, m.id)) !== 'active') return null;
   // The secret that signs this key's requests (never sent): the shop key's own, or its user's secret key.
   const { key_signing_sealed: shopSecret, ...shop } = m;
   if (m.key_portal_user_id == null) return { ...shop, keyTier: null, keyUser: null, signingSecret: shopSecret ? unseal(shopSecret) : null };
@@ -906,7 +969,7 @@ export async function changePortalPassword(m, userId, b) {
   const { rows } = await query('SELECT id, username, password_hash FROM merchant_portal_users WHERE id = $1 AND merchant_id = $2', [userId, m.id]);
   if (!rows[0]) throw new ApiError(404, 'USER_NOT_FOUND', 'ไม่พบผู้ใช้');
   if (!(await verifyPassword(b.current, rows[0].password_hash))) throw new ApiError(400, 'INVALID_PASSWORD', 'รหัสผ่านปัจจุบันไม่ถูกต้อง');
-  await query('UPDATE merchant_portal_users SET password_hash = $2 WHERE id = $1', [userId, await hashPassword(b.next)]);
+  await query('UPDATE merchant_portal_users SET password_hash = $2, must_change_password = false WHERE id = $1', [userId, await hashPassword(b.next)]);
   await query(`INSERT INTO audit_logs (actor, action, entity, entity_ref, detail) VALUES ($1, 'merchant.portal_password', 'merchant', $2, 'เปลี่ยนรหัสผ่าน portal')`, [rows[0].username, m.slug]);
   return { success: true };
 }

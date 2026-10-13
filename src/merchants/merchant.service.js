@@ -4,6 +4,8 @@ import { z } from 'zod';
 import { query, withTransaction } from '../db/pool.js';
 import { BadRequestError, ConflictError, NotFoundError } from '../errors.js';
 import { seal } from '../shared/secret-box.js';
+import { BALANCE_SQL } from '../shared/balance-sql.js';
+import { MAX_DEPTH, checkRatesAgainstChildren, checkRatesAgainstParent, inSubtree } from './tree.js';
 
 const money = z.coerce.number().min(0).max(100_000_000).multipleOf(0.01);
 export const idParamSchema = z.object({ id: z.coerce.number().int().positive() });
@@ -13,8 +15,12 @@ const fields = {
   name: z.string().trim().min(1).max(120),
   feePercent: z.coerce.number().min(0).max(100).multipleOf(0.01),
   feeFlat: money,
+  outFeePercent: z.coerce.number().min(0).max(100).multipleOf(0.01).default(0),   // ค่าธรรมเนียมเงินออก, on top of withdrawals / payouts
+  outFeeFlat: money.default(0),
   minBalance: money,
-  status: z.enum(['active', 'suspended']),
+  status: z.enum(['active', 'suspended', 'pending']),   // pending = sub-merchant waiting for approval
+  allowSubMerchants: z.boolean().optional(),                               // not sent = unchanged (on for new shops)
+  parentId: z.coerce.number().int().positive().nullable().optional(),       // ร้านแม่: null = top level, not sent = unchanged
   kycStatus: z.enum(['pending', 'verified', 'rejected']),
   contactEmail: z.string().trim().email().max(200).optional().or(z.literal('')),
   contactPhone: z.string().trim().max(40).optional(),
@@ -50,25 +56,35 @@ async function lock(client, id) {
   return rows[0];
 }
 
-/** Live balance: opening + approved (amount − fee) − approved outflows + credit adjustments. */
+/** Live balance: opening + approved (amount − fee) − approved outflows (amount + fee) + credit adjustments. */
 async function balanceOf(client, id) {
   const { rows } = await client.query(
-    `SELECT m.opening_balance
-          + coalesce((SELECT sum(amount - fee) FROM payments WHERE merchant_id = m.id AND status = 'approved'), 0)
-          - coalesce((SELECT sum(amount) FROM outflows WHERE merchant_id = m.id AND status = 'approved'), 0)
-          + coalesce((SELECT sum(amount) FROM merchant_credit_adjustments WHERE merchant_id = m.id), 0) AS balance
+    `SELECT ${BALANCE_SQL} AS balance
        FROM merchants m WHERE m.id = $1`,
     [id],
   );
   return Number(rows[0].balance);
 }
 
+/** The new parent of a shop (rates and depth checked), or null for top level. */
+async function parentFor(client, parentId, b) {
+  if (parentId == null) return null;
+  const { rows } = await client.query('SELECT * FROM merchants WHERE id = $1', [parentId]);
+  if (!rows[0]) throw new BadRequestError('ไม่พบร้านแม่ที่เลือก');
+  checkRatesAgainstParent(rows[0], b, (msg) => new BadRequestError(msg));
+  return rows[0];
+}
+
 export function create(actor, b) {
   return withTransaction(async (client) => {
+    const parent = await parentFor(client, b.parentId ?? null, b);
+    if (parent && (parent.path ?? []).length + 1 > MAX_DEPTH) throw new BadRequestError(`ร้านย่อยลึกได้สูงสุด ${MAX_DEPTH} ชั้น`);
     const { rows } = await client.query(
-      `INSERT INTO merchants (name, slug, fee_percent, fee_flat, min_balance, opening_balance, status, kyc_status, contact_email, contact_phone)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, nullif($9, ''), nullif($10, '')) RETURNING id`,
-      [b.name, b.slug, b.feePercent, b.feeFlat, b.minBalance, b.openingBalance, b.status, b.kycStatus, b.contactEmail ?? '', b.contactPhone ?? ''],
+      `INSERT INTO merchants (name, slug, fee_percent, fee_flat, min_balance, opening_balance, status, kyc_status, contact_email, contact_phone, out_fee_percent, out_fee_flat,
+                              allow_sub_merchants, parent_id, path, approved_at, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, nullif($9, ''), nullif($10, ''), $11, $12, $13, $14, $15, CASE WHEN $7 = 'active' THEN now() END, $16) RETURNING id`,
+      [b.name, b.slug, b.feePercent, b.feeFlat, b.minBalance, b.openingBalance, b.status, b.kycStatus, b.contactEmail ?? '', b.contactPhone ?? '', b.outFeePercent, b.outFeeFlat,
+        b.allowSubMerchants ?? true, parent?.id ?? null, parent ? [...(parent.path ?? []), parent.id] : [], actor ?? 'console'],
     );
     await audit(client, actor, 'merchant.create', b.slug, `เพิ่มร้าน ${b.name}`);
     return { id: rows[0].id };
@@ -78,12 +94,32 @@ export function create(actor, b) {
 export function update(id, actor, b) {
   return withTransaction(async (client) => {
     const m = await lock(client, id);
+    b = { ...b, parentId: b.parentId === undefined ? m.parent_id : b.parentId, allowSubMerchants: b.allowSubMerchants ?? m.allow_sub_merchants };
+    // Moving the shop (with everything under it) to another parent: never into its own subtree, within the depth limit.
+    if ((b.parentId ?? null) !== (m.parent_id ?? null)) {
+      if (b.parentId != null && (await inSubtree(client, id, b.parentId))) throw new BadRequestError('ย้ายไปอยู่ใต้ร้านของตัวเอง (หรือร้านย่อยของตัวเอง) ไม่ได้');
+      const parent = await parentFor(client, b.parentId, b);
+      const prefix = parent ? [...(parent.path ?? []), parent.id] : [];
+      // Levels below this shop (child = 1); the deepest shop must stay within MAX_DEPTH levels under a top-level shop.
+      const { rows: deep } = await client.query('SELECT coalesce(max(cardinality(path)) - $2, 0) AS below FROM merchants WHERE $1 = ANY (path)', [id, (m.path ?? []).length]);
+      if (prefix.length + Number(deep[0].below) > MAX_DEPTH) throw new BadRequestError(`ย้ายแล้วจะลึกเกิน ${MAX_DEPTH} ชั้น`);
+      await client.query('UPDATE merchants SET path = $2::int[] || path[$3:] WHERE id = $1 OR $1 = ANY (path)', [id, prefix, (m.path ?? []).length + 1]);
+      await client.query('UPDATE merchants SET parent_id = $2 WHERE id = $1', [id, parent?.id ?? null]);
+    } else if (m.parent_id != null) {
+      await parentFor(client, m.parent_id, b);
+    }
+    await checkRatesAgainstChildren(client, id, b, (msg) => new BadRequestError(msg));
     await client.query(
       `UPDATE merchants SET name = $2, fee_percent = $3, fee_flat = $4, min_balance = $5, status = $6, kyc_status = $7,
-              contact_email = nullif($8, ''), contact_phone = nullif($9, '') WHERE id = $1`,
-      [id, b.name, b.feePercent, b.feeFlat, b.minBalance, b.status, b.kycStatus, b.contactEmail ?? '', b.contactPhone ?? ''],
+              contact_email = nullif($8, ''), contact_phone = nullif($9, ''), out_fee_percent = $10, out_fee_flat = $11, allow_sub_merchants = $12,
+              approved_at = CASE WHEN $6 = 'active' THEN coalesce(approved_at, now()) ELSE approved_at END WHERE id = $1`,
+      [id, b.name, b.feePercent, b.feeFlat, b.minBalance, b.status, b.kycStatus, b.contactEmail ?? '', b.contactPhone ?? '', b.outFeePercent, b.outFeeFlat, b.allowSubMerchants],
     );
-    const changes = [m.status !== b.status && `สถานะ: ${m.status} → ${b.status}`, Number(m.fee_percent) !== b.feePercent && `ค่าธรรมเนียม ${m.fee_percent}% → ${b.feePercent}%`].filter(Boolean);
+    const changes = [m.status !== b.status && `สถานะ: ${m.status} → ${b.status}${m.status === 'pending' && b.status === 'active' ? ' (อนุมัติร้านย่อย)' : ''}`,
+      (b.parentId ?? null) !== (m.parent_id ?? null) && `ร้านแม่: ${m.parent_id ?? '—'} → ${b.parentId ?? '—'}`,
+      m.allow_sub_merchants !== b.allowSubMerchants && `สร้างร้านย่อย: ${b.allowSubMerchants ? 'อนุญาต' : 'ไม่อนุญาต'}`,
+      (Number(m.fee_percent) !== b.feePercent || Number(m.fee_flat) !== b.feeFlat) && `ค่าธรรมเนียมเงินเข้า ${Number(m.fee_percent)}% + ${fmt(m.fee_flat)} → ${b.feePercent}% + ${fmt(b.feeFlat)}`,
+      (Number(m.out_fee_percent) !== b.outFeePercent || Number(m.out_fee_flat) !== b.outFeeFlat) && `ค่าธรรมเนียมเงินออก ${Number(m.out_fee_percent)}% + ${fmt(m.out_fee_flat)} → ${b.outFeePercent}% + ${fmt(b.outFeeFlat)}`].filter(Boolean);
     await audit(client, actor, 'merchant.update', m.slug, changes.join(' · ') || 'แก้ไขข้อมูลร้าน');
   });
 }
@@ -91,6 +127,8 @@ export function update(id, actor, b) {
 export function remove(id, actor) {
   return withTransaction(async (client) => {
     const m = await lock(client, id);
+    const { rows: kids } = await client.query('SELECT count(*)::int AS n FROM merchants WHERE parent_id = $1', [id]);
+    if (kids[0].n > 0) throw new ConflictError(`${m.name} มีร้านย่อย ${kids[0].n} ร้าน — ย้ายหรือลบร้านย่อยก่อน`);
     const { rows } = await client.query(
       `SELECT (SELECT count(*) FROM payments WHERE merchant_id = $1) + (SELECT count(*) FROM outflows WHERE merchant_id = $1)
             + (SELECT count(*) FROM withdrawal_requests WHERE merchant_id = $1) AS n`,

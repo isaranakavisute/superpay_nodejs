@@ -1,9 +1,11 @@
 import { query, withTransaction } from '../db/pool.js';
-import { notifyPaymentApproved } from '../config-admin/config.service.js';
+import { internal as configOf, notifyPaymentApproved } from '../config-admin/config.service.js';
 import logger from '../logger.js';
 import { deliverPaymentEvent } from '../webhooks/webhook.service.js';
 import { BadRequestError, ConflictError, NotFoundError } from '../errors.js';
 import { findReusedSlip, isSampleSlip, SAMPLE_SLIP_MESSAGE, slipFingerprint } from '../shared/slip-fingerprint.js';
+import { syncPaymentSplits } from '../merchants/tree.js';
+import { amountRule, uniqueAmount } from '../shared/account-links.js';
 
 /**
  * Operator actions on payments. Each runs in one transaction: lock the row,
@@ -14,7 +16,7 @@ const fmt = (n) => Number(n).toLocaleString('th-TH', { minimumFractionDigits: 2,
 
 async function lock(client, ref) {
   const { rows } = await client.query(
-    `SELECT p.id, p.ref, p.status, p.amount, p.merchant_id, p.refunded_amount,
+    `SELECT p.id, p.ref, p.status, p.amount, p.merchant_id, p.refunded_amount, p.bank_account_id,
             m.fee_percent, m.fee_flat
        FROM payments p LEFT JOIN merchants m ON m.id = p.merchant_id
       WHERE p.ref = $1
@@ -95,8 +97,19 @@ export function editAmount(ref, actor, amount) {
   return withTransaction(async (client) => {
     const p = await lock(client, ref);
     requireStatus(p, ['pending', 'expired'], 'edit the amount of');
+    // On a shared account the amount must stay unique among its orders (pending or within the cool-down).
+    const rule = await amountRule(client, p.bank_account_id, await configOf('slip'));
+    if (rule.shared) {
+      const { rows: clash } = await client.query(
+        `SELECT ref FROM payments WHERE bank_account_id = $1 AND id <> $2 AND amount = $3
+            AND (status = 'pending' OR created_at > now() - make_interval(mins => $4::int)) LIMIT 1`,
+        [p.bank_account_id, p.id, amount, rule.cooldown],
+      );
+      if (clash[0]) throw new ConflictError(`บัญชีนี้ใช้ร่วมหลายร้าน และยอด ${fmt(amount)} บาทถูกใช้กับ ${clash[0].ref} แล้ว — ใช้ยอดที่ต่างกันอย่างน้อย 1 สตางค์`);
+    }
     const { fee, commission } = feeFor(p, amount);
     await client.query(`UPDATE payments SET amount = $2, fee = $3, commission = $4 WHERE id = $1`, [p.id, amount, fee, commission]);
+    await syncPaymentSplits(client, p.id);
     await audit(client, actor, 'payment.amount', ref, `แก้ยอด ${fmt(p.amount)} → ${fmt(amount)} บาท`);
   });
 }
@@ -146,6 +159,9 @@ export function create(actor, input) {
       if (rows[0].status !== 'active') throw new BadRequestError('Merchant is not active');
       merchant = rows[0];
     }
+    // A shared receiving account tells its shops' orders apart by amount: unique satang (+ cool-down) there.
+    const rule = await amountRule(client, input.bankAccountId, await configOf('slip'));
+    if (rule.shared) input = { ...input, amount: await uniqueAmount(client, input.bankAccountId, input.amount, rule.maxSatang, rule.cooldown) };
     const { fee, commission } = feeFor(merchant, input.amount);
     // Running number after the highest existing TXN ref; the row lock on the
     // table's newest ref keeps two creates from taking the same number.
@@ -154,9 +170,9 @@ export function create(actor, input) {
     const ref = `TXN${Number(last[0].n) + 1}`;
     await client.query(
       `INSERT INTO payments (ref, merchant_id, merchant_order_id, customer_name, payer_bank_code, bank_account_id, amount, fee, commission, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending')`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending') RETURNING id`,
       [ref, input.merchantId, input.merchantOrderId || null, input.customerName, input.payerBankCode, input.bankAccountId, input.amount, fee, commission],
-    );
+    ).then(async (r) => syncPaymentSplits(client, r.rows[0].id));
     await audit(client, actor, 'payment.create', ref, `สร้างรายการ ยอด ${fmt(input.amount)} บาท`);
     return { ref };
   });
@@ -177,6 +193,7 @@ export function assignMerchant(ref, actor, { merchantId, merchantOrderId }) {
       `UPDATE payments SET merchant_id = $2, merchant_order_id = coalesce(nullif($3, ''), merchant_order_id), fee = $4, commission = $5 WHERE id = $1`,
       [p.id, merchantId, merchantOrderId ?? null, fee, commission],
     );
+    await syncPaymentSplits(client, p.id);
     await audit(client, actor, 'payment.assign', ref, merchant.name ? `ระบุร้าน: ${merchant.name}` : 'ไม่ผูกร้าน (house)');
   });
 }
