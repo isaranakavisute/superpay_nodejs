@@ -82,6 +82,7 @@ const hasCustomer = (n) => !!n && n.trim() !== '-' && n.trim() !== '';
 export function matchSlip(v, order) {
   const problems = [];
   const unknown = [];
+  const warnings = [];   // shown and kept on the order, but neither reject nor hold the slip
   const slip = normalizeSlip(v.provider, v.raw);
 
   // 1. Amount — to the satang.
@@ -112,12 +113,14 @@ export function matchSlip(v, order) {
     }
   }
 
-  // 4. Sender — the customer named on the order (when the shop entered one).
+  // 4. Sender — the customer named on the order (when the shop entered one). Someone else may pay
+  // for the customer (husband for wife…), so a different name is only a warning: the money still reached
+  // this order's account, in full, after it was created — and the slip can't pay another order.
   if (hasCustomer(order.customer_name)) {
     const bySender = nameMatches(slip?.senderNames ?? [], order.customer_name);
-    if (bySender === false) problems.push(`ชื่อผู้โอนในสลิป (${slip.senderNames[0]}) ไม่ตรงกับชื่อลูกค้าของรายการ (${order.customer_name}) — ต้องโอนจากบัญชีของลูกค้าที่ระบุ`);
-    else if (bySender === null) unknown.push('อ่านชื่อผู้โอนในสลิปไม่ได้');
+    if (bySender === false) warnings.push(`ชื่อผู้โอนในสลิป (${slip.senderNames[0]}) ไม่ตรงกับชื่อลูกค้า (${order.customer_name}) — อาจโอนแทนกัน`);
+    else if (bySender === null) warnings.push('อ่านชื่อผู้โอนในสลิปไม่ได้ — ยืนยันผู้โอนไม่ได้');
   }
 
-  return { problems, unknown };
+  return { problems, unknown, warnings };
 }

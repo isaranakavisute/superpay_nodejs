@@ -22,6 +22,5 @@ supportBotAdminRouter.get('/announcements', h(async () => ({ announcements: awai
 supportBotAdminRouter.post('/announcements', h((req) => ann.createAnnouncement(req.actor, ann.announcementSchema.parse(req.body))));
 supportBotAdminRouter.post('/announcements/:id', h((req) => ann.updateAnnouncement(req.actor, id(req), ann.announcementSchema.parse(req.body))));
 supportBotAdminRouter.post('/announcements/:id/delete', h((req) => ann.deleteAnnouncement(req.actor, id(req))));
-supportBotAdminRouter.post('/announcements/:id/send-now', h((req) => ann.sendNow(req.actor, id(req))));
 
 export default supportBotAdminRouter;

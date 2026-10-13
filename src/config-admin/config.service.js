@@ -84,8 +84,10 @@ export const SECTIONS = {
       botToken: z.string().max(200),
       webhookSecret: z.string().max(200),
       allowedChatIds: z.string().max(1000),   // comma-separated Telegram chat ids allowed to use the bot
+      allGroups: z.boolean().default(true),     // every group the bot is added to may use it (no approval)
+      allowPrivate: z.boolean().default(true),  // anyone may use it in a private chat (no approval)
     }),
-    defaults: { enabled: false, botToken: '', webhookSecret: '', allowedChatIds: '' },
+    defaults: { enabled: false, botToken: '', webhookSecret: '', allowedChatIds: '', allGroups: true, allowPrivate: true },
   },
   // Telegram support bot: answers scripted questions in the group (telegram/support-bot.service.js).
   supportBot: {

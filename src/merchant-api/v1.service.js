@@ -306,6 +306,7 @@ async function attachAndVerify(m, p, { image, mime }, base, { once = false } = {
     let decision = 'review';
     let reason = v.message ?? null;
     let mismatches = [];
+    let warnings = [];
     if (v.verified === false) {
       decision = 'invalid';
       if (/QR/.test(reason ?? '') && qrReason(fp)) reason = qrReason(fp);
@@ -316,7 +317,9 @@ async function attachAndVerify(m, p, { image, mime }, base, { once = false } = {
         ? new Date(v.date).toLocaleDateString('en-CA', { timeZone: 'Asia/Bangkok' }) === new Date(p.created_at).toLocaleDateString('en-CA', { timeZone: 'Asia/Bangkok' })
         : Date.now() - new Date(v.date).getTime() <= v.cfg.slipMaxAgeHours * 3_600_000);
       // Amount, receiver account/bank, sender name and transfer time must all fit this order.
-      const { problems, unknown } = matchSlip(v, p);
+      const m2 = matchSlip(v, p);
+      const { problems, unknown } = m2;
+      warnings = m2.warnings;
       if (!ageOk) problems.push(v.cfg.slipMaxAgeHours === 0 ? 'สลิปต้องเป็นการโอนวันเดียวกับที่สร้างรายการ' : `สลิปเก่าเกิน ${v.cfg.slipMaxAgeHours} ชั่วโมง — ใช้สลิปเก่าไม่ได้`);
       if (problems.length) { decision = 'invalid'; mismatches = problems; reason = problems.join(' · '); }
       else {
@@ -327,6 +330,8 @@ async function attachAndVerify(m, p, { image, mime }, base, { once = false } = {
         if (unknown.length) { decision = 'review'; reason = `${unknown.join(' · ')} — รอผู้ดูแลตรวจ`; }
         else if (v.cfg.requireApproval) { decision = 'review'; reason = 'สลิปถูกต้อง — รอผู้ดูแลยืนยัน (ตั้งค่า "ต้องให้ผู้ดูแลยืนยันก่อน")'; }
         else decision = 'approve';
+        // e.g. paid by someone other than the customer: kept on the order for the shop to see.
+        if (warnings.length) reason = decision === 'approve' ? `ตรวจสลิปผ่าน · ⚠️ ${warnings.join(' · ')}` : `${reason} · ⚠️ ${warnings.join(' · ')}`;
       }
     } else if (ocr) {
       // Pixels can be edited: numbers that clearly differ reject; a match still needs the admin.
@@ -341,18 +346,20 @@ async function attachAndVerify(m, p, { image, mime }, base, { once = false } = {
          provider = EXCLUDED.provider, trans_ref = EXCLUDED.trans_ref, verify_result = EXCLUDED.verify_result,
          image_sha256 = EXCLUDED.image_sha256, qr_payload = EXCLUDED.qr_payload`,
       [p.id, mime, buf, actorOf(m), via, decision === 'approve' || decision === 'review' ? v.transRef ?? null : null,
-        JSON.stringify({ verified: v.verified, amount: v.amount ?? null, date: v.date ?? null, message: reason, decision, mismatches, ocr }), fp.sha256, fp.qr],
+        JSON.stringify({ verified: v.verified, amount: v.amount ?? null, date: v.date ?? null, message: reason, decision, mismatches, warnings, ocr }), fp.sha256, fp.qr],
     );
     await c.query('UPDATE payments SET slip_received_at = now(), review_note = coalesce($2, review_note), slip_reused_ref = $3 WHERE id = $1', [p.id, reason, reusedOn]);
-    if (decision === 'approve') await approveOne(c, p.ref, 'system', `ตรวจสลิปผ่าน ${v.provider}`);
-    await audit(c, m, 'payment.slip', 'payment', p.ref, `แนบสลิป · ${via}: ${decision === 'approve' ? 'ผ่าน — อนุมัติอัตโนมัติ' : reason ?? decision}`);
+    const warn = warnings.length ? ` · ⚠️ ${warnings.join(' · ')}` : '';
+    if (decision === 'approve') await approveOne(c, p.ref, 'system', `ตรวจสลิปผ่าน ${v.provider}${warn}`);
+    await audit(c, m, 'payment.slip', 'payment', p.ref, `แนบสลิป · ${via}: ${decision === 'approve' ? `ผ่าน — อนุมัติอัตโนมัติ${warn}` : reason ?? decision}`);
     const { rows } = await c.query(`${PAY_SELECT} WHERE p.id = $1`, [p.id]);
     return {
       success: decision !== 'invalid',
       verified: decision === 'approve',
       result: decision === 'approve' ? 'PAID' : decision === 'invalid' ? 'INVALID_SLIP' : 'PENDING_REVIEW',
-      message: decision === 'approve' ? 'ตรวจสลิปผ่าน — ออเดอร์ชำระแล้ว' : reason,
+      message: decision === 'approve' ? `ตรวจสลิปผ่าน — ออเดอร์ชำระแล้ว${warn}` : reason,
       mismatches,
+      warnings,
       transaction: present(rows[0], base),
     };
   });
