@@ -5,7 +5,9 @@ const REF = /^OUT\d{1,12}$/;
 export const CATEGORIES = ['refund', 'fee', 'expense', 'transfer', 'other', 'auto', 'commission'];
 
 export const refParamSchema = z.object({ ref: z.string().regex(REF, 'invalid outflow ref') });
-export const approveBodySchema = z.object({ bankAccountId: z.coerce.number().int().positive().optional() });
+// Approval needs no bank account: payouts are paid outside Option Pay and approved after inspection. The account it
+// was paid from (send / both) and the bank's transfer reference are optional, for the record.
+export const approveBodySchema = z.object({ bankAccountId: z.coerce.number().int().positive().optional(), note: z.string().trim().max(200).optional() });
 export const rejectBodySchema = z.object({ reason: z.string().trim().min(1).max(300) });
 export const updateBodySchema = z.object({
   category: z.enum(CATEGORIES),
@@ -14,7 +16,7 @@ export const updateBodySchema = z.object({
   description: z.string().trim().max(300).optional(),
 });
 export const bulkBodySchema = z.discriminatedUnion('action', [
-  z.object({ action: z.literal('approve'), refs: z.array(z.string().regex(REF)).min(1).max(200), bankAccountId: z.coerce.number().int().positive().optional() }),
+  z.object({ action: z.literal('approve'), refs: z.array(z.string().regex(REF)).min(1).max(200), bankAccountId: z.coerce.number().int().positive().optional(), note: z.string().trim().max(200).optional() }),
   z.object({ action: z.literal('reject'), refs: z.array(z.string().regex(REF)).min(1).max(200), reason: z.string().trim().min(1).max(300) }),
 ]);
 export const createBodySchema = z.object({

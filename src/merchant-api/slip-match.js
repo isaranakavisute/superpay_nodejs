@@ -7,7 +7,7 @@
  */
 
 // Thai interbank codes used by slip providers -> our bank codes.
-const BANK_BY_ID = { '002': 'BBL', '004': 'KBANK', '006': 'KTB', '011': 'TTB', '014': 'SCB', '025': 'BAY', '022': 'CIMB', '024': 'UOB', '030': 'GSB', '034': 'BAAC', '067': 'TISCO', '069': 'KKP', '073': 'LHB' };
+const BANK_BY_ID = { '002': 'BBL', '004': 'KBANK', '006': 'KTB', '011': 'TTB', '014': 'SCB', '017': 'CITI', '018': 'SMBC', '020': 'SCBT', '022': 'CIMB', '024': 'UOB', '025': 'BAY', '029': 'IOB', '030': 'GSB', '031': 'HSBC', '032': 'DB', '033': 'GHB', '034': 'BAAC', '039': 'MHCB', '052': 'BOC', '066': 'ISBT', '067': 'TISCO', '069': 'KKP', '070': 'ICBC', '071': 'TCRB', '073': 'LHBANK', '079': 'ANZ', '080': 'SMTB', '098': 'SMEB' };
 const bankCode = (bank) => {
   if (!bank) return null;
   const id = String(bank.id ?? bank).padStart(3, '0');
@@ -21,6 +21,8 @@ export function normalizeSlip(provider, raw) {
   if (provider === 'easyslip') {
     return {
       senderNames: names(raw.sender?.account?.name?.th, raw.sender?.account?.name?.en),
+      senderAccount: raw.sender?.account?.bank?.account ?? raw.sender?.account?.proxy?.account ?? null,
+      senderBank: bankCode(raw.sender?.bank),
       receiverNames: names(raw.receiver?.account?.name?.th, raw.receiver?.account?.name?.en),
       receiverAccount: raw.receiver?.account?.bank?.account ?? null,
       receiverProxy: raw.receiver?.account?.proxy?.account ?? null,
@@ -30,6 +32,8 @@ export function normalizeSlip(provider, raw) {
   if (provider === 'slipok') {
     return {
       senderNames: names(raw.sender?.displayName, raw.sender?.name),
+      senderAccount: raw.sender?.account?.value ?? null,
+      senderBank: bankCode(raw.sendingBank),
       receiverNames: names(raw.receiver?.displayName, raw.receiver?.name),
       receiverAccount: raw.receiver?.account?.value ?? null,
       receiverProxy: raw.receiver?.proxy?.value ?? null,
@@ -79,24 +83,40 @@ const at = (d) => new Date(d).toLocaleString('th-TH', { timeZone: 'Asia/Bangkok'
 const hasCustomer = (n) => !!n && n.trim() !== '-' && n.trim() !== '';
 
 /** `order`: payment row joined with its receiving account (PAY_SELECT). `v`: verifySlip() result. */
+export { hasCustomer };
+
 export function matchSlip(v, order) {
   const problems = [];
   const unknown = [];
   const warnings = [];   // shown and kept on the order, but neither reject nor hold the slip
+  let early = null;      // the "transfer before this order" problem (a carry-over may still accept it)
+  const checks = [];     // every check with its outcome, for the caller (PASS / FAIL / WARN / UNKNOWN / SKIPPED)
+  const check = (code, status, detail) => checks.push({ check: code, status, detail });
   const slip = normalizeSlip(v.provider, v.raw);
 
-  // 1. Amount — to the satang.
-  if (Math.abs(Number(v.amount) - Number(order.amount)) > 0.009) {
+  // 1. Amount — to the satang. When "ยอดไม่ซ้ำ" added satang, the amount the shop asked for (requested_amount) is
+  // accepted too: the customer paid what the shop showed, and the bank confirms it (the caller corrects the order).
+  const requested = order.requested_amount == null ? null : Number(order.requested_amount);
+  const paidRequested = requested != null && Math.abs(requested - Number(order.amount)) > 0.009 && Math.abs(Number(v.amount) - requested) <= 0.009;
+  if (paidRequested) {
+    check('AMOUNT', 'PASS', `ยอดในสลิป ${baht(v.amount)} ตรงกับยอดที่ร้านสั่ง (ระบบเติมสตางค์เป็น ${baht(order.amount)}) — ปรับยอดออเดอร์เป็นยอดที่ได้รับจริง`);
+  } else if (Math.abs(Number(v.amount) - Number(order.amount)) > 0.009) {
     problems.push(`ยอดเงินในสลิป ${baht(v.amount)} ไม่ตรงกับยอดที่ต้องชำระ ${baht(order.amount)} — ต้องโอนตรงยอดทุกสตางค์`);
-  }
+    check('AMOUNT', 'FAIL', `ยอดในสลิป ${baht(v.amount)} แต่ออเดอร์ต้องชำระ ${baht(order.amount)} (${Number(v.amount) > Number(order.amount) ? 'โอนเกิน' : 'โอนขาด'} ${baht(Math.abs(Number(v.amount) - Number(order.amount)))})`);
+  } else check('AMOUNT', 'PASS', `ยอดในสลิป ${baht(v.amount)} ตรงกับยอดออเดอร์`);
 
   // 2. Transfer time — not before the order existed (10 min clock tolerance).
   if (v.date && new Date(v.date).getTime() < new Date(order.created_at).getTime() - 10 * 60_000) {
-    problems.push(`สลิปทำรายการเมื่อ ${at(v.date)} ก่อนสร้างรายการนี้ (${at(order.created_at)}) — ใช้สลิปเก่าไม่ได้`);
-  }
+    early = `สลิปทำรายการเมื่อ ${at(v.date)} ก่อนสร้างรายการนี้ (${at(order.created_at)}) — ใช้สลิปเก่าไม่ได้`;
+    problems.push(early);
+    check('TRANSFER_TIME', 'FAIL', `โอนเมื่อ ${at(v.date)} — ก่อนสร้างออเดอร์ (${at(order.created_at)})`);
+  } else if (v.date) check('TRANSFER_TIME', 'PASS', `โอนเมื่อ ${at(v.date)} — หลังสร้างออเดอร์ (${at(order.created_at)})`);
+  else check('TRANSFER_TIME', 'UNKNOWN', 'สลิปไม่มีเวลาโอน');
 
   // 3. Receiver — this order's account (bank + number, or its PromptPay).
   const expectedAcct = `${order.acct_bank} ${order.account_no} (${order.account_name})`;
+  const shownTo = `${slip?.receiverBank ?? ''} ${slip?.receiverAccount ?? slip?.receiverProxy ?? ''}`.trim();
+  const before = problems.length + unknown.length;
   if (slip?.receiverBank && order.acct_bank && slip.receiverBank !== order.acct_bank) {
     problems.push(`โอนเข้าธนาคาร ${slip.receiverBank} แต่รายการนี้ต้องโอนเข้า ${expectedAcct}`);
   } else {
@@ -112,6 +132,9 @@ export function matchSlip(v, order) {
       else if (byName === null) unknown.push('อ่านบัญชีผู้รับในสลิปไม่ได้');
     }
   }
+  if (problems.length + unknown.length === before) check('RECEIVER_ACCOUNT', 'PASS', `โอนเข้า ${shownTo || 'บัญชี'} — ตรงกับบัญชีของออเดอร์ (${expectedAcct})`);
+  else if (unknown.length && problems.length + unknown.length === before + 1 && unknown.at(-1) === 'อ่านบัญชีผู้รับในสลิปไม่ได้') check('RECEIVER_ACCOUNT', 'UNKNOWN', 'สลิปไม่แสดงบัญชีผู้รับ — รอเจ้าหน้าที่ตรวจ');
+  else check('RECEIVER_ACCOUNT', 'FAIL', problems.at(-1));
 
   // 4. Sender — the customer named on the order (when the shop entered one). Someone else may pay
   // for the customer (husband for wife…), so a different name is only a warning: the money still reached
@@ -120,7 +143,9 @@ export function matchSlip(v, order) {
     const bySender = nameMatches(slip?.senderNames ?? [], order.customer_name);
     if (bySender === false) warnings.push(`ชื่อผู้โอนในสลิป (${slip.senderNames[0]}) ไม่ตรงกับชื่อลูกค้า (${order.customer_name}) — อาจโอนแทนกัน`);
     else if (bySender === null) warnings.push('อ่านชื่อผู้โอนในสลิปไม่ได้ — ยืนยันผู้โอนไม่ได้');
-  }
+    check('SENDER_NAME', bySender === true ? 'PASS' : 'WARN',
+      bySender === true ? `ผู้โอน ${slip.senderNames[0]} ตรงกับชื่อลูกค้า` : warnings.at(-1) + ' (ไม่ทำให้สลิปไม่ผ่าน)');
+  } else check('SENDER_NAME', 'SKIPPED', 'ออเดอร์ไม่ได้ระบุชื่อลูกค้า — ไม่ตรวจชื่อผู้โอน');
 
-  return { problems, unknown, warnings };
+  return { problems, unknown, warnings, early, checks, paidRequested };
 }

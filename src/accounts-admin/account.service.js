@@ -3,6 +3,7 @@ import { withTransaction } from '../db/pool.js';
 import { BadRequestError, ConflictError, NotFoundError } from '../errors.js';
 import { normalizePromptPayId } from '../shared/promptpay.js';
 import { refuseUnlinkWithPending, syncPrimaryShop } from '../shared/account-links.js';
+import { accountNumber } from '../shared/account-number.js';
 
 /**
  * Bank accounts page (/api/console/accounts-admin). "Reset" starts the
@@ -12,7 +13,7 @@ import { refuseUnlinkWithPending, syncPrimaryShop } from '../shared/account-link
 export const idParamSchema = z.object({ id: z.coerce.number().int().positive() });
 export const bodySchema = z.object({
   bankCode: z.string().trim().toUpperCase().max(10),
-  accountNo: z.string().trim().regex(/^\d{6,20}$/, 'เลขบัญชีต้องเป็นตัวเลข 6–20 หลัก'),
+  accountNo: accountNumber(),
   accountName: z.string().trim().min(1).max(120),
   accountType: z.enum(['receive', 'send', 'both']),
   promptpayId: z.string().trim().max(20).optional().or(z.literal('')),

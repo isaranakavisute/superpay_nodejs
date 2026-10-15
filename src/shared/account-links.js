@@ -2,9 +2,10 @@ import { AppError } from '../errors.js';
 
 /**
  * Receiving accounts shared by several shops (bank_account_merchants). A payment always belongs to one order
- * and one shop; on a shared account the order is found from the amount, so every amount there must be unique:
- * unique satang are forced on, and an amount is not handed to a new order for `cooldown` minutes after an
- * order with that amount was created (a late payment for an expired order can't land on another shop's order).
+ * and one shop: the slip is attached to that order, so sharing an account never changes the amount the shop asked
+ * for — satang are added only when "ยอดไม่ซ้ำ" is switched on in settings (customers pay round amounts; forced
+ * satang on a shared account made their slips fail). With it on, a shared account also keeps an amount away from
+ * new orders for `cooldown` minutes after an order with that amount was created.
  */
 export const DEFAULT_COOLDOWN_MIN = 60;
 
@@ -35,10 +36,10 @@ export async function amountRule(c, accountId, slip) {
   const shared = (await linkCount(c, accountId)) > 1;
   return {
     shared,
-    unique: !!slip.uniqueAmount || shared,
-    // unshared accounts keep the configured range exactly; a shared one needs room (0 → 99)
-    maxSatang: shared ? Number(slip.uniqueAmountMaxSatang) || 99 : Number(slip.uniqueAmountMaxSatang ?? 99),
-    cooldown: shared ? Number(slip.uniqueAmountCooldownMinutes ?? DEFAULT_COOLDOWN_MIN) : 0,
+    // Only the setting adds satang — never the account being shared.
+    unique: !!slip.uniqueAmount,
+    maxSatang: Number(slip.uniqueAmountMaxSatang ?? 99),
+    cooldown: slip.uniqueAmount && shared ? Number(slip.uniqueAmountCooldownMinutes ?? DEFAULT_COOLDOWN_MIN) : 0,
   };
 }
 

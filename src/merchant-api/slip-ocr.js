@@ -129,6 +129,8 @@ export function compareOcr(s, order, cfg = {}) {
 
   if (!s.amounts.length) flags.push('อ่านยอดเงินในสลิปไม่ได้');
   else if (s.amounts.some((n) => Math.abs(n - amount) < 0.005)) matched.push(`ยอด ${baht(amount)}`);
+  // The shop's amount before "ยอดไม่ซ้ำ" satang were added: not a mismatch (an admin confirms it — images are never approved).
+  else if (order.requested_amount != null && s.amounts.some((n) => Math.abs(n - Number(order.requested_amount)) < 0.005)) flags.push(`ยอดในสลิป ${baht(Number(order.requested_amount))} = ยอดที่ร้านสั่ง (ระบบเติมสตางค์เป็น ${baht(amount)})`);
   else problems.push(`ยอดเงินในสลิป ${baht(s.amounts[0])} ไม่ตรงกับยอดที่ต้องชำระ ${baht(amount)} — ต้องโอนตรงยอดทุกสตางค์`);
 
   const expectedAcct = `${order.acct_bank} ${order.account_no} (${order.account_name})`;

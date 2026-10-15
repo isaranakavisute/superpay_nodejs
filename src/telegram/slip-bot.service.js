@@ -4,11 +4,12 @@ import { internal as configOf } from '../config-admin/config.service.js';
 import logger from '../logger.js';
 import { verifySlip } from '../merchant-api/slip-verify.js';
 import { isSampleSlip, qrReason, slipFingerprint } from '../shared/slip-fingerprint.js';
-import { readSlipText } from '../merchant-api/slip-ocr.js';
 import { accountMatches, matchSlip, nameMatches, normalizeSlip } from '../merchant-api/slip-match.js';
+import { carryOverFrom } from '../merchant-api/slip-carry-over.js';
 
 /**
- * @OptionPayBot: a user sends a slip image; the bot asks the slip provider (EasySlip)
+ * @OptionPayBot: a user sends an image; the bot first asks whether to validate it as a slip (ใช่ / ไม่) —
+ * "ไม่" ends there until the next image. On "ใช่" it asks the slip provider (EasySlip)
  * whether it is a real transfer and replies "valid slip" or "invalid slip" with the reason.
  * A slip already used on an Option Pay order, or already checked here, is a duplicate.
  * Every group it is added to and every private chat may use it (slipBot.allGroups / allowPrivate, default on);
@@ -109,10 +110,26 @@ async function seenBefore({ transRef, sha256, qr }, excludePaymentId = null, rec
 
 const baht2 = (n) => `฿${Number(n).toLocaleString('th-TH', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 
-/** What the slip must match: an Option Pay order (typed answers are checked one by one in checkAnswer). */
-function compare(v, expect) {
-  const { problems, unknown, warnings } = matchSlip(v, expect.order);
-  return { problems, notes: [...unknown, ...warnings], matched: [`ยอด ${baht2(expect.order.amount)}`, `บัญชีปลายทาง ${expect.order.acct_bank} ${expect.order.account_no}`] };
+const STATUS_SHORT = { pending: 'ยังเปิดอยู่', expired: 'หมดอายุ', rejected: 'ยกเลิก' };
+
+/**
+ * What the slip must match: an Option Pay order (typed answers are checked one by one in checkAnswer).
+ * Same rules as the API: a transfer made before the order was created is still fine when it is the
+ * carry-over of the same customer's earlier unpaid order of the shop (see slip-carry-over.js) —
+ * e.g. ฿250 transferred for a ฿299 order, then a ฿250 order created and checked with that slip.
+ * The bot only reports; it does not cancel or approve anything.
+ */
+async function compare(v, expect) {
+  const { problems, unknown, warnings, early } = matchSlip(v, expect.order);
+  const notes = [...unknown, ...warnings];
+  let left = problems;
+  const carried = early && problems.length === 1 && problems[0] === early ? await carryOverFrom({ query }, expect.order, v) : null;
+  if (carried) {
+    left = [];
+    notes.unshift(`โอนก่อนสร้างรายการนี้ แต่เป็นเงินโอนของรายการก่อนหน้า ${carried.ref}${carried.merchant_order_id ? ` (${carried.merchant_order_id})` : ''} ยอด ${baht2(carried.amount)} `
+      + `ที่ยังไม่ได้ชำระ (${STATUS_SHORT[carried.status] ?? carried.status}) — ลูกค้าคนเดียวกัน บัญชีผู้รับเดียวกัน จึงใช้ชำระรายการนี้ได้`);
+  }
+  return { problems: left, notes, carried, matched: [`ยอด ${baht2(expect.order.amount)}`, `บัญชีปลายทาง ${expect.order.acct_bank} ${expect.order.account_no}`] };
 }
 
 /** One typed answer against the bank's reading of the slip → { problem } | { note } | { matched }. */
@@ -137,17 +154,17 @@ function checkAnswer(step, v, value) {
 
 /** Verify one slip image (against `expect` when given) → { result, reason, ... }. */
 export async function checkSlip(buf, mime, expect = null, { recheck = false } = {}) {
-  const fp = slipFingerprint(buf, mime);
+  const fp = await slipFingerprint(buf, mime);
   if (isSampleSlip(fp)) return { result: 'invalid', reason: 'เป็นภาพตัวอย่างสลิปจาก Option Pay ไม่ใช่สลิปจริง', fp };
   const v = await verifySlip(buf, mime);
   // "No QR" from the provider: say what the image actually has (a fake QR, or a QR that isn't a slip's).
   if (v.verified === false) return { result: 'invalid', reason: (/QR/.test(v.message ?? '') && qrReason(fp)) || v.message || 'สลิปไม่ถูกต้อง', fp };
   if (v.verified !== true) return { result: 'unverified', reason: v.message ?? 'ผู้ให้บริการตรวจสลิปไม่ตอบ', fp };
-  const cmp = expect ? compare(v, expect) : { problems: [], notes: [], matched: [] };
+  const cmp = expect ? await compare(v, expect) : { problems: [], notes: [], matched: [] };
   if (cmp.problems.length) return { result: 'invalid', reason: 'ข้อมูลในสลิปไม่ตรงกับที่ต้องชำระ', problems: cmp.problems, fp, v };
   const dup = await seenBefore({ transRef: v.transRef, sha256: fp.sha256, qr: fp.qr }, expect?.kind === 'order' ? expect.order.id : null, recheck);
   if (dup) return { result: 'invalid', reason: dup.reason, detail: dup.detail, fp, v };
-  return { result: 'valid', fp, v, matched: cmp.matched, notes: cmp.notes, order: expect?.kind === 'order' ? expect.order : null };
+  return { result: 'valid', fp, v, matched: cmp.matched, notes: cmp.notes, carried: cmp.carried ?? null, order: expect?.kind === 'order' ? expect.order : null };
 }
 
 function replyText(r) {
@@ -163,32 +180,21 @@ function replyText(r) {
       r.v.transRef ? `เลขอ้างอิง ${r.v.transRef}` : null,
       r.order ? `\nตรงกับรายการ ${r.order.ref}${r.order.merchant_order_id ? ` (เลขออเดอร์ ${r.order.merchant_order_id})` : ''}` : null,
       r.matched?.length ? `✔️ ตรงกับที่ระบุ: ${r.matched.join(' · ')}` : null,
-      r.notes?.length ? `⚠️ ${r.notes.join(' · ')}` : null].filter((x) => x !== null).join('\n');
+      r.carried ? `🔁 ${r.notes[0]}` : null,
+      r.notes?.length > (r.carried ? 1 : 0) ? `⚠️ ${r.notes.slice(r.carried ? 1 : 0).join(' · ')}` : null].filter((x) => x !== null).join('\n');
   }
   if (r.result === 'invalid') return `❌ invalid slip\n\nเหตุผล: ${r.reason}${r.problems?.length ? `\n${r.problems.map((x) => `• ${x}`).join('\n')}` : ''}${r.detail ? `\n\n${r.detail}` : ''}`;
   return `⚠️ ตรวจสลิปไม่ได้ในขณะนี้ (ไม่ใช่ว่าสลิปไม่ถูกต้อง)\n\nสาเหตุ: ${r.reason}\nลองส่งใหม่อีกครั้งภายหลัง`;
 }
 
-// Words printed on Thai bank slips: a group photo whose QR can't be read still counts as a slip
-// (e.g. a fake slip) when its text has at least two of these.
-const SLIP_WORDS = [/โอนเงินสำเร็จ|เติมเงินสำเร็จ|ชำระเงินสำเร็จ|รายการสำเร็จ|ทำรายการสำเร็จ/, /จำนวนเงิน|จำนวน:/, /บาท|thb/i, /รหัสอ้างอิง|เลขที่รายการ|เลขอ้างอิง|ref/i,
-  /จาก|ไปยัง|ผู้รับ|ผู้โอน/, /ธนาคาร|scb|kbank|k\+|กสิกร|กรุงเทพ|กรุงไทย|กรุงศรี|ทหารไทย|ttb|ออมสิน|พร้อมเพย์|promptpay/i];
-async function looksLikeSlip(buf) {
-  try {
-    const text = (await readSlipText(buf)).replace(/\u0e4d\u0e32/g, 'ำ');
-    return SLIP_WORDS.filter((re) => re.test(text)).length >= 2;
-  } catch {
-    return false;
-  }
-}
-
-const HELP = 'ส่งรูปสลิปโอนเงินมาที่นี่ — บอทจะถามรายการที่ต้องชำระ (เลขที่รายการ หรือ ยอด/บัญชีปลายทาง) แล้วตรวจกับธนาคาร (EasySlip) และตอบว่า valid slip หรือ invalid slip พร้อมเหตุผล\n\nแนะนำ: ส่งแบบ “ไฟล์” (File) จะชัดกว่าส่งแบบรูปภาพที่ Telegram บีบอัด';
+const HELP = 'ส่งรูปสลิปโอนเงินมาที่นี่ — บอทจะถามก่อนว่าต้องการตรวจสลิปหรือไม่ ถ้าตอบ “ใช่” จะถามรายการที่ต้องชำระ (เลขที่รายการ หรือ ยอด/บัญชีปลายทาง) แล้วตรวจกับธนาคาร (EasySlip) และตอบว่า valid slip หรือ invalid slip พร้อมเหตุผล\n\nแนะนำ: ส่งแบบ “ไฟล์” (File) จะชัดกว่าส่งแบบรูปภาพที่ Telegram บีบอัด';
 
 /** Handle one Telegram update (called after the webhook has answered 200). */
 // ---------- asking for the expected payment before verifying ----------
 
 const SESSION_MIN = 10;
 const ASK = {
+  confirm: 'ต้องการตรวจสลิป (slip validation) ภาพนี้หรือไม่? 🔍\nกด / พิมพ์ “ใช่” เพื่อตรวจ หรือ “ไม่” เพื่อไม่ตรวจ',
   ref: 'ก่อนตรวจสลิป กรุณาระบุรายการที่ต้องชำระ 🧾\n\nพิมพ์ “เลขที่รายการ” (ขึ้นต้นด้วย TXN) หรือ “เลขออเดอร์ของร้าน”\nถ้าไม่มี พิมพ์ “ไม่มี” แล้วบอทจะถามรายละเอียดทีละข้อ\n(พิมพ์ “ยกเลิก” เพื่อยกเลิก)',
   amount: 'ข้อ 1/4 — ยอดเงินที่ต้องโอนกี่บาท? (เช่น 3000 หรือ 1,250.50)',
   account: 'ข้อ 2/4 — เลขบัญชีปลายทาง หรือเบอร์พร้อมเพย์ ที่ต้องโอนเข้า?',
@@ -197,6 +203,11 @@ const ASK = {
   recheck: 'ต้องการตรวจสลิปนี้ใหม่หรือไม่?\nพิมพ์ “ใช่” เพื่อตรวจใหม่ หรือ “ไม่” เพื่อใช้ผลเดิม',
 };
 const NEXT = { amount: 'account', account: 'name', name: 'sender' };
+const YES = /^(ใช่|ตรวจ|ตรวจใหม่|ok|yes|y)$/i;
+const NO = /^(ไม่|ไม่ต้อง|ไม่ตรวจ|no|n)$/i;
+// ใช่ / ไม่ buttons under the question — only for the person who sent the image (selective: the reply targets their message).
+const YES_NO = { keyboard: [[{ text: 'ใช่' }, { text: 'ไม่' }]], one_time_keyboard: true, resize_keyboard: true, selective: true };
+const NO_KEYBOARD = { remove_keyboard: true, selective: true };
 
 const getSession = async (chatId, userId) => (await query(`SELECT * FROM telegram_slip_sessions WHERE chat_id = $1 AND user_id = $2 AND expires_at > now()`, [chatId, userId])).rows[0] ?? null;
 const saveSession = (chatId, userId, f) => query(
@@ -262,17 +273,42 @@ async function verifySession(cfg, chatId, userId, sess, expect, who) {
   return finish(chatId, userId, sess, await runCheck(cfg, sess, expect), who);
 }
 
-/** One answer in an open conversation. Returns the bot's reply. */
+/**
+ * "ใช่" to the first question: the slip-validation flow starts. A slip the bot has judged before gets that
+ * result and the re-check question; otherwise the questions about the expected payment begin.
+ */
+async function startValidation(cfg, chatId, userId, sess) {
+  try {
+    const fp = await slipFingerprint(await download(cfg.botToken, sess.file_id), sess.mime);
+    const prior = await priorResult(fp);
+    if (prior) {
+      await saveSession(chatId, userId, { ...sess, step: 'recheck', data: {} });
+      return { text: `${prior}\n\n${ASK.recheck}`, markup: YES_NO };
+    }
+  } catch (err) {
+    logger.warn({ err: err.message }, 'slip bot: download failed');
+  }
+  // Ask what the slip should match first; EasySlip is called only once the answers are in.
+  await saveSession(chatId, userId, { ...sess, step: 'ref', data: {} });
+  return ASK.ref;
+}
+
+/** One answer in an open conversation. Returns the bot's reply (text, or { text, markup }). */
 async function answer(cfg, chatId, userId, sess, text, who) {
   const t = text.trim();
   if (/^(ยกเลิก|cancel)$/i.test(t)) { await endSession(chatId, userId); return 'ยกเลิกการตรวจสลิปแล้ว'; }
   const data = sess.data ?? {};
   const again = (msg) => saveSession(chatId, userId, { ...sess, data }).then(() => msg);
   switch (sess.step) {
+    case 'confirm': {
+      if (NO.test(t)) { await endSession(chatId, userId); return 'รับทราบ — ไม่ตรวจสลิปภาพนี้\n(ส่งรูปใหม่เมื่อต้องการตรวจ)'; }
+      if (!YES.test(t)) return again(`กรุณาตอบ “ใช่” หรือ “ไม่”\n\n${ASK.confirm}`);
+      return startValidation(cfg, chatId, userId, sess);
+    }
     case 'recheck': {
-      if (/^(ใช่|ตรวจใหม่|yes|y)$/i.test(t)) { await saveSession(chatId, userId, { ...sess, step: 'ref', data: { recheck: true } }); return ASK.ref; }
-      if (/^(ไม่|ไม่ต้อง|no|n)$/i.test(t)) { await endSession(chatId, userId); return 'ไม่ตรวจซ้ำ — ใช้ผลการตรวจเดิม'; }
-      return again(`กรุณาพิมพ์ “ใช่” หรือ “ไม่”\n\n${ASK.recheck}`);
+      if (YES.test(t)) { await saveSession(chatId, userId, { ...sess, step: 'ref', data: { recheck: true } }); return ASK.ref; }
+      if (NO.test(t)) { await endSession(chatId, userId); return 'ไม่ตรวจซ้ำ — ใช้ผลการตรวจเดิม'; }
+      return again(`กรุณาตอบ “ใช่” หรือ “ไม่”\n\n${ASK.recheck}`);
     }
     case 'ref': {
       if (/^(ไม่มี|ไม่ทราบ|no|none|-)$/i.test(t)) {
@@ -340,7 +376,10 @@ export async function handleUpdate(update) {
   // A text from someone the bot is asking (amount, account…) is an answer — even in a group.
   const sess = !img && msg.text && userId ? await getSession(chatId, userId) : null;
   if (inGroup && !img && !command && !sess) return;
-  const send = (text) => tg(cfg.botToken, 'sendMessage', { chat_id: msg.chat.id, text, reply_to_message_id: msg.message_id }).catch(() => {});
+  const send = (reply, markup = NO_KEYBOARD) => {
+    const { text, markup: m } = typeof reply === 'string' ? { text: reply, markup } : reply;
+    return tg(cfg.botToken, 'sendMessage', { chat_id: msg.chat.id, text, reply_to_message_id: msg.message_id, reply_markup: m }).catch(() => {});
+  };
   const allowed = cfg.allowedChatIds.split(',').map((x) => x.trim()).filter(Boolean);
   if (!allowed.includes(chatId) && !(inGroup ? cfg.allGroups !== false : cfg.allowPrivate !== false)) {
     await query(`INSERT INTO audit_logs (actor, action, entity, entity_ref, detail) VALUES ('telegram', 'slipbot.denied', 'setting', $1, $2)`,
@@ -348,25 +387,17 @@ export async function handleUpdate(update) {
     await send(`บอทนี้ยังไม่ได้เปิดให้แชทนี้ใช้งาน\nchat id: ${chatId}\nแจ้งผู้ดูแลระบบ Option Pay เพื่อเพิ่ม chat id นี้`);
     return;
   }
-  if (sess) { await send(await answer(cfg, chatId, userId, sess, msg.text, who)); return; }
+  if (sess) {
+    // In a group, ordinary chat after posting a picture isn't an answer to "ตรวจสลิปไหม?" — no nagging; the question stays open.
+    if (inGroup && (sess.step === 'confirm' || sess.step === 'recheck') && !YES.test(msg.text.trim()) && !NO.test(msg.text.trim())) return;
+    const reply = await answer(cfg, chatId, userId, sess, msg.text, who);
+    const asksYesNo = typeof reply === 'string' && /“ใช่” หรือ “ไม่”/.test(reply);
+    await send(reply, asksYesNo ? YES_NO : NO_KEYBOARD);
+    return;
+  }
   if (!img) { await send(HELP); return; }
   if (img.size && img.size > MAX_BYTES) { await send('❌ invalid slip\n\nเหตุผล: ไฟล์ใหญ่เกิน 8 MB'); return; }
-  try {
-    const buf = await download(cfg.botToken, img.fileId);
-    const fp = slipFingerprint(buf, img.mime);
-    // Group photos without a readable QR code are ordinary pictures — ignored (no reply, no EasySlip quota) —
-    // unless the caption says it is a slip or the printed text looks like one (OCR, no quota).
-    if (inGroup && !fp.qr && !/สลิป|slip/i.test(msg.caption ?? '') && !(await looksLikeSlip(buf))) return;
-    const prior = await priorResult(fp);
-    if (prior) {
-      await saveSession(chatId, userId, { file_id: img.fileId, mime: img.mime, message_id: msg.message_id, step: 'recheck', data: {} });
-      await send(`${prior}\n\n${ASK.recheck}`);
-      return;
-    }
-  } catch (err) {
-    logger.warn({ err: err.message }, 'slip bot: download failed');
-  }
-  // Ask what the slip should match first; EasySlip is called only once the answers are in.
-  await saveSession(chatId, userId, { file_id: img.fileId, mime: img.mime, message_id: msg.message_id, step: 'ref', data: {} });
-  await send(ASK.ref);
+  // Every image: ask first whether to validate it as a slip (a new image replaces any open question).
+  await saveSession(chatId, userId, { file_id: img.fileId, mime: img.mime, message_id: msg.message_id, step: 'confirm', data: {} });
+  await send(ASK.confirm, YES_NO);
 }

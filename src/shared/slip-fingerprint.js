@@ -1,68 +1,41 @@
 import { createHash } from 'node:crypto';
-import jsQR from 'jsqr';
-import jpeg from 'jpeg-js';
-import { PNG } from 'pngjs';
+import { Worker } from 'node:worker_threads';
 import logger from '../logger.js';
+import { readQr } from './slip-qr.js';
 
-/**
- * Does the image contain QR finder patterns (the three corner squares, dark:light:dark:light:dark
- * = 1:1:3:1:1 across and down) even though it did not decode? Lets us tell "something that looks
- * like a QR but is not a real one" (typical of an edited / generated fake slip) from "no QR at all".
- */
-export function hasQrFinderPatterns(img) {
-  const { width: w, height: h, data } = img;
-  if (!w || !h) return false;
-  const lum = (x, y) => { const i = (y * w + x) * 4; return (data[i] * 299 + data[i + 1] * 587 + data[i + 2] * 114) / 1000; };
-  let sum = 0, n = 0;
-  for (let y = 0; y < h; y += 4) for (let x = 0; x < w; x += 4) { sum += lum(x, y); n++; }
-  const threshold = Math.min(sum / n, 160);
-  const dark = (x, y) => lum(x, y) < threshold;
-  const fits = (runs) => {
-    const total = runs.reduce((a, r) => a + r, 0);
-    if (total < 7) return false;
-    const m = total / 7, tol = m * 0.6;
-    return Math.abs(runs[0] - m) < tol && Math.abs(runs[1] - m) < tol && Math.abs(runs[2] - 3 * m) < 3 * tol && Math.abs(runs[3] - m) < tol && Math.abs(runs[4] - m) < tol;
+export { hasQrFinderPatterns } from './slip-qr.js';
+
+// Image decode + QR scan is pure JS (a few hundred ms on a phone screenshot): it runs in worker threads so a slip
+// upload doesn't stall every other request. Any worker problem falls back to reading the QR on this thread.
+const POOL = 2;
+const JOB_TIMEOUT_MS = 15_000;
+const workers = [];
+const pending = new Map();
+let nextId = 0, turn = 0;
+
+function spawn(slot) {
+  const w = new Worker(new URL('./slip-qr.worker.js', import.meta.url));
+  w.unref();
+  w.on('message', ({ id, ...out }) => { const job = pending.get(id); if (job) { pending.delete(id); clearTimeout(job.timer); job.done(out); } });
+  const drop = (err) => {
+    if (workers[slot] === w) workers[slot] = null;
+    for (const [id, job] of pending) if (job.worker === w) { pending.delete(id); clearTimeout(job.timer); job.done({ error: err?.message ?? 'worker exited' }); }
   };
-  // Column runs through (cx, cy): the same 1:1:3:1:1 must hold vertically.
-  const verticalFits = (cx, cy, size) => {
-    if (!dark(cx, cy)) return false;
-    const runs = [0, 0, 0, 0, 0];
-    let y = cy;
-    while (y >= 0 && dark(cx, y)) { runs[2]++; y--; }
-    for (const [k, want] of [[1, false], [0, true]]) while (y >= 0 && dark(cx, y) === want && runs[k] <= size) { runs[k]++; y--; }
-    y = cy + 1;
-    while (y < h && dark(cx, y)) { runs[2]++; y++; }
-    for (const [k, want] of [[3, false], [4, true]]) while (y < h && dark(cx, y) === want && runs[k] <= size) { runs[k]++; y++; }
-    return fits(runs);
-  };
-  const centers = [];
-  for (let y = 0; y < h; y += 2) {
-    const runs = [];
-    let cur = dark(0, y), len = 0, startX = 0;
-    const starts = [];
-    for (let x = 0; x <= w; x++) {
-      const d = x < w ? dark(x, y) : !cur;
-      if (d === cur) { len++; continue; }
-      runs.push({ dark: cur, len }); starts.push(startX);
-      cur = d; len = 1; startX = x;
-    }
-    for (let i = 0; i + 4 < runs.length; i++) {
-      if (!runs[i].dark) continue;
-      const five = runs.slice(i, i + 5).map((r) => r.len);
-      if (!fits(five)) continue;
-      const size = five.reduce((a, r) => a + r, 0);
-      const cx = Math.round(starts[i + 2] + runs[i + 2].len / 2);
-      if (verticalFits(cx, y, size)) centers.push({ x: cx, y, size });
-    }
-  }
-  // Group hits of the same square; a QR has three squares of about the same size.
-  const groups = [];
-  for (const c of centers) {
-    const g = groups.find((q) => Math.abs(q.x - c.x) < q.size / 2 && Math.abs(q.y - c.y) < q.size / 2);
-    if (g) g.hits++; else groups.push({ ...c, hits: 1 });
-  }
-  const squares = groups.filter((g) => g.hits >= 2);
-  return squares.some((a) => squares.filter((b) => b !== a && Math.abs(b.size - a.size) < a.size * 0.5).length >= 2);
+  w.on('error', drop);
+  w.on('exit', () => drop());
+  return (workers[slot] = w);
+}
+
+function readQrOffThread(buf, mime) {
+  const slot = turn++ % POOL;
+  const w = workers[slot] ?? spawn(slot);
+  const id = ++nextId;
+  return new Promise((done) => {
+    const timer = setTimeout(() => { pending.delete(id); w.terminate(); done({ error: 'timeout' }); }, JOB_TIMEOUT_MS);
+    pending.set(id, { worker: w, timer, done });
+    // A copy goes to the worker; the caller keeps its buffer (it is stored with the slip).
+    w.postMessage({ id, buf: new Uint8Array(buf), mime });
+  });
 }
 
 /**
@@ -72,19 +45,19 @@ export function hasQrFinderPatterns(img) {
  * The QR is best effort: null for WebP or when no QR is found. qrLike: the image has
  * QR corner squares that did not decode (see hasQrFinderPatterns).
  */
-export function slipFingerprint(buf, mime) {
+export async function slipFingerprint(buf, mime) {
   const sha256 = createHash('sha256').update(buf).digest('hex');
-  let qr = null, qrLike = false;
-  try {
-    const img = mime === 'image/png' ? PNG.sync.read(buf) : mime === 'image/jpeg' ? jpeg.decode(buf, { useTArray: true, maxResolutionInMP: 40, maxMemoryUsageInMB: 256 }) : null;
-    if (img) {
-      qr = jsQR(new Uint8ClampedArray(img.data.buffer, img.data.byteOffset, img.data.length), img.width, img.height)?.data?.trim() || null;
-      if (!qr) qrLike = hasQrFinderPatterns(img);
-    }
-  } catch (err) {
-    logger.debug({ err: err.message }, 'slip QR not readable');
+  if (mime !== 'image/png' && mime !== 'image/jpeg') return { sha256, qr: null, qrLike: false };
+  let out = await readQrOffThread(buf, mime);
+  if (out.error && out.error !== 'timeout') {
+    logger.warn({ err: out.error }, 'slip QR worker failed — reading on the main thread');
+    try { out = readQr(buf, mime); } catch (err) { out = { error: err.message }; }
   }
-  return { sha256, qr, qrLike };
+  if (out.error) {
+    logger.debug({ err: out.error }, 'slip QR not readable');
+    return { sha256, qr: null, qrLike: false };
+  }
+  return { sha256, qr: out.qr, qrLike: out.qrLike };
 }
 
 /** Bank slip-verification QRs (EMVCo-style "00xx000600000101…"), as opposed to any other QR. */

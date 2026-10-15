@@ -7,6 +7,7 @@ import * as s from '../merchant-api/v1.service.js';
 import { verifyRequestSignature } from '../merchant-api/request-signature.js';
 import { z } from 'zod';
 import * as subs from '../merchants/sub-merchant.service.js';
+import { timingOf } from '../shared/stopwatch.js';
 
 /**
  * Merchant REST API v1 at /api/v1. Authenticated with `X-API-Key` + a request
@@ -22,7 +23,13 @@ const baseOf = (req) => {
   return `${proto}://${host}`;
 };
 const ipOf = (req) => req.get('x-forwarded-for')?.split(',')[0].trim() || req.ip;
-const h = (fn) => asyncHandler(async (req, res) => res.json(await fn(req)));
+// Slip results carry per-step timings → Server-Timing header (the JSON body is unchanged).
+const h = (fn) => asyncHandler(async (req, res) => {
+  const out = await fn(req);
+  const time = timingOf(out);
+  if (time) res.set('Server-Timing', time.header);
+  res.json(out);
+});
 
 // Login: 10 attempts / minute / IP (in-memory; per process).
 const hits = new Map();

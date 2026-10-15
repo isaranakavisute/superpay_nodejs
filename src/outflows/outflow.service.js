@@ -29,14 +29,18 @@ async function requireBank(client, code) {
 const audit = (client, actor, action, ref, detail) =>
   client.query(`INSERT INTO audit_logs (actor, action, entity, entity_ref, detail) VALUES ($1, $2, 'outflow', $3, $4)`, [actor ?? 'console', action, ref, detail]);
 
-async function approveOne(client, ref, actor, bankAccountId) {
+/**
+ * The admin paid the recipient (outside Option Pay) and approves: the shop's balance is charged amount + fee.
+ * The account it was paid from is optional — when given it must be an active send / both account.
+ */
+async function approveOne(client, ref, actor, bankAccountId, note) {
   const o = await lock(client, ref);
   requireStatus(o, ['pending'], 'approve');
-  const account = bankAccountId ?? o.bank_account_id;
-  if (!account) throw new BadRequestError(`Choose the deducting account for ${ref} before approving`);
-  await requireSendAccount(client, account);
-  await client.query(`UPDATE outflows SET status = 'approved', bank_account_id = $2, completed_at = now() WHERE id = $1`, [o.id, account]);
-  await audit(client, actor, 'outflow.approve', ref, `โอนให้ ${o.receiver_name} ${fmt(o.amount)} บาท`);
+  const account = bankAccountId ?? o.bank_account_id ?? null;
+  if (account) await requireSendAccount(client, account);
+  await client.query(`UPDATE outflows SET status = 'approved', bank_account_id = $2, completed_at = now(), review_note = coalesce($3, review_note) WHERE id = $1`,
+    [o.id, account, note || null]);
+  await audit(client, actor, 'outflow.approve', ref, `โอนให้ ${o.receiver_name} ${fmt(o.amount)} บาท${account ? '' : ' (โอนนอกระบบ ไม่ระบุบัญชีที่หัก)'}${note ? ` · ${note}` : ''}`);
 }
 
 async function rejectOne(client, ref, actor, reason) {
@@ -46,15 +50,15 @@ async function rejectOne(client, ref, actor, reason) {
   await audit(client, actor, 'outflow.reject', ref, reason);
 }
 
-export const approve = (ref, actor, { bankAccountId }) => withTransaction((c) => approveOne(c, ref, actor, bankAccountId));
+export const approve = (ref, actor, { bankAccountId, note } = {}) => withTransaction((c) => approveOne(c, ref, actor, bankAccountId, note));
 export const reject = (ref, actor, reason) => withTransaction((c) => rejectOne(c, ref, actor, reason));
 
 /** All-or-nothing across the selection. */
-export function bulk(actor, { action, refs, reason, bankAccountId }) {
+export function bulk(actor, { action, refs, reason, bankAccountId, note }) {
   return withTransaction(async (client) => {
     const unique = [...new Set(refs)];
     for (const ref of unique) {
-      if (action === 'approve') await approveOne(client, ref, actor, bankAccountId);
+      if (action === 'approve') await approveOne(client, ref, actor, bankAccountId, note);
       else await rejectOne(client, ref, actor, reason);
     }
     return { count: unique.length };
