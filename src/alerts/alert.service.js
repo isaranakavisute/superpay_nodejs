@@ -6,7 +6,7 @@ import { safePost } from '../shared/safe-fetch.js';
 
 export const ALERT_KINDS = [
   'withdrawal.pending', 'outflow.pending', 'double_credit.detected', 'low_balance',
-  'device.offline', 'channel.error', 'webhook.failed', 'slip.provider_down',
+  'device.offline', 'channel.error', 'webhook.failed', 'slip.provider_down', 'webhook.delivery',
 ];
 
 const bot = z.object({
@@ -16,6 +16,8 @@ const bot = z.object({
   botChannelId: z.coerce.number().int().positive().nullable(),
   botToken: z.string().trim().max(200).optional(),        // blank = keep current
   chatIds: z.string().trim().max(500),
+  mentions: z.string().trim().max(500).default(''),
+  merchantId: z.coerce.number().int().positive().nullable().default(null),   // only this shop + the shops under it
   events: z.array(z.enum(ALERT_KINDS)).max(ALERT_KINDS.length),
 });
 export const saveBodySchema = z.object({
@@ -34,7 +36,7 @@ const mask = (ids) => ids.split(',').map((x) => x.trim()).filter(Boolean).map((x
 export async function load() {
   const { rows: bots } = await query(
     `SELECT a.id, a.name, a.enabled, a.bot_channel_id AS "botChannelId", (a.bot_token_enc IS NOT NULL) AS "hasOwnToken",
-            a.chat_ids AS "chatIds", a.events, a.last_sent_at AS "lastSentAt", a.updated_at AS "updatedAt"
+            a.chat_ids AS "chatIds", a.mentions, a.merchant_id AS "merchantId", a.events, a.last_sent_at AS "lastSentAt", a.updated_at AS "updatedAt"
        FROM alert_channels a ORDER BY a.id`,
   );
   const { rows: s } = await query(`SELECT key, value FROM console_settings WHERE key LIKE 'alerts.%'`);
@@ -60,14 +62,14 @@ export function save(actor, { bots, deleted, thresholds }) {
       if (b.id) {
         const { rowCount } = await client.query(
           `UPDATE alert_channels SET name = $2, enabled = $3, status = $4, bot_channel_id = $5, bot_token_enc = coalesce($6, bot_token_enc),
-                  chat_ids = $7, chat_masked = $8, events = $9, updated_at = now() WHERE id = $1`,
-          [b.id, b.name, b.enabled, status, b.botChannelId, token, b.chatIds, mask(b.chatIds) || '—', b.events],
+                  chat_ids = $7, chat_masked = $8, events = $9, mentions = $10, merchant_id = $11, updated_at = now() WHERE id = $1`,
+          [b.id, b.name, b.enabled, status, b.botChannelId, token, b.chatIds, mask(b.chatIds) || '—', b.events, b.mentions, b.merchantId],
         );
         if (!rowCount) throw new NotFoundError(`Alert bot ${b.id} does not exist`);
       } else {
         await client.query(
-          `INSERT INTO alert_channels (name, enabled, status, bot_channel_id, bot_token_enc, chat_ids, chat_masked, events) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-          [b.name, b.enabled, status, b.botChannelId, token, b.chatIds, mask(b.chatIds) || '—', b.events],
+          `INSERT INTO alert_channels (name, enabled, status, bot_channel_id, bot_token_enc, chat_ids, chat_masked, events, mentions, merchant_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+          [b.name, b.enabled, status, b.botChannelId, token, b.chatIds, mask(b.chatIds) || '—', b.events, b.mentions, b.merchantId],
         );
       }
     }
@@ -114,4 +116,69 @@ export async function test(id, actor) {
     actor ?? 'console', a.name, results.map((r) => `${r.ok ? '✓' : '✗'} ${r.chat}`).join(' '),
   ]);
   return { results };
+}
+
+/**
+ * Sends `text` to every enabled alert bot subscribed to `kind` (แจ้งเตือน Telegram). A bot scoped to a shop
+ * (merchant_id) only gets alerts about that shop or a shop under it; `merchantId` null = system-wide alerts,
+ * which go to unscoped bots only. Each chat is tried 3 times; a chat that still fails is written to the audit log.
+ * Never throws; returns how many chats received it.
+ */
+export async function sendAlert(kind, text, { merchantId = null } = {}) {
+  let sent = 0;
+  try {
+    const { rows } = await query(
+      `SELECT a.id, a.name, a.chat_ids, a.mentions, a.bot_token_enc, c.secrets_enc->>'botToken' AS channel_token
+         FROM alert_channels a LEFT JOIN channels c ON c.id = a.bot_channel_id
+        WHERE a.enabled AND $1 = ANY (a.events)
+          AND (a.merchant_id IS NULL OR a.merchant_id IN (
+                WITH RECURSIVE up AS (
+                  SELECT id, parent_id, 0 AS depth FROM merchants WHERE id = $2::int
+                  UNION ALL SELECT m.id, m.parent_id, up.depth + 1 FROM up JOIN merchants m ON m.id = up.parent_id WHERE up.depth < 10)
+                SELECT id FROM up))`,
+      [kind, merchantId],
+    );
+    for (const a of rows) {
+      const sealed = a.bot_token_enc ?? a.channel_token;
+      if (!sealed) continue;
+      const token = open(sealed);
+      const tags = mentionHtml(a.mentions);
+      const html = `${tags ? `${tags}\n` : ''}${esc(text.slice(0, 3800))}`;
+      let ok = false;
+      for (const chat of a.chat_ids.split(',').map((x) => x.trim()).filter(Boolean)) {
+        let last = null;
+        for (let attempt = 1; attempt <= 3; attempt += 1) {
+          try {
+            const r = await safePost(`https://api.telegram.org/bot${token}/sendMessage`, {
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ chat_id: chat, text: html, parse_mode: 'HTML', disable_web_page_preview: true }),
+            });
+            if (r.status === 200) { last = null; ok = true; sent += 1; break; }
+            last = r.body.match(/"description":"([^"]+)"/)?.[1] ?? `HTTP ${r.status}`;
+            if (r.status >= 400 && r.status < 429) break;   // bad chat id / bot removed: retrying won't help
+          } catch (err) {
+            last = err?.cause?.code ?? err?.message ?? 'ส่งไม่ได้';
+          }
+          await new Promise((res) => setTimeout(res, attempt * 1500));
+        }
+        if (last) {
+          await query(`INSERT INTO audit_logs (actor, action, entity, entity_ref, detail) VALUES ('system', 'alerts.failed', 'setting', $1, $2)`,
+            [a.name, `ส่งแจ้งเตือน ${kind} ไม่สำเร็จ (chat ${chat}): ${last}`]).catch(() => {});
+        }
+      }
+      if (ok) await query('UPDATE alert_channels SET last_sent_at = now() WHERE id = $1', [a.id]);
+    }
+  } catch { /* alerts are best effort */ }
+  return sent;
+}
+
+const esc = (t) => String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+/** "@username" stays as text (Telegram links it); "Name:<id>" becomes a tag that notifies a user without a username. */
+export function mentionHtml(mentions) {
+  return String(mentions ?? '').split(',').map((m) => m.trim()).filter(Boolean).map((m) => {
+    const byId = /^(.+):(\d{3,15})$/.exec(m);
+    if (byId) return `<a href="tg://user?id=${byId[2]}">${esc(byId[1].trim())}</a>`;
+    return /^@[A-Za-z0-9_]{4,32}$/.test(m) ? m : esc(m);
+  }).join(' ');
 }

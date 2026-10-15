@@ -49,8 +49,12 @@ function feeFor(p, amount) {
 }
 
 /** Merchant webhooks for a committed payment change; never throws. */
-export const emitPaymentEvent = (client, ref, event) =>
-  client.afterCommit?.(() => deliverPaymentEvent(ref, event).catch((err) => logger.warn({ err, ref, event }, 'merchant webhook failed')));
+/** Payment webhook to the shop after the change commits (right away when not inside a transaction). */
+export const emitPaymentEvent = (client, ref, event) => {
+  const run = () => deliverPaymentEvent(ref, event).catch((err) => logger.warn({ err, ref, event }, 'merchant webhook failed'));
+  if (client?.afterCommit) client.afterCommit(run);
+  else void run();
+};
 
 export async function approveOne(client, ref, actor, note) {
   const p = await lock(client, ref);
@@ -90,6 +94,7 @@ export function refund(ref, actor, { amount, note }) {
       [p.id, value, note ?? null],
     );
     await audit(client, actor, 'payment.refund', ref, `คืนเงิน ${fmt(value)} บาท`);
+    emitPaymentEvent(client, ref, 'payment.refunded');
   });
 }
 

@@ -202,7 +202,7 @@ export async function webhook(id) {
     [id],
   );
   const { rows: deliveries } = await query(
-    `SELECT d.id, d.event, d.payment_ref AS "paymentRef", d.status_code AS "statusCode", d.attempts, d.response_ms AS "responseMs", d.error, d.delivered_at AS "deliveredAt"
+    `SELECT d.id, d.event, coalesce(d.payment_ref, d.outflow_ref) AS "paymentRef", d.status_code AS "statusCode", d.attempts, d.response_ms AS "responseMs", d.error, d.delivered_at AS "deliveredAt"
        FROM webhook_deliveries d JOIN webhook_endpoints e ON e.id = d.endpoint_id WHERE e.merchant_id = $1 ORDER BY d.delivered_at DESC LIMIT 20`,
     [id],
   );
@@ -214,7 +214,8 @@ export function setWebhook(id, actor, { url }) {
     const m = await lock(client, id);
     const { rowCount } = await client.query(`UPDATE webhook_endpoints SET url = $2, status = 'active' WHERE merchant_id = $1`, [id, url]);
     if (!rowCount) {
-      await client.query(`INSERT INTO webhook_endpoints (merchant_id, url, events) VALUES ($1, $2, ARRAY['payment.approved', 'payment.rejected', 'withdrawal.approved'])`, [id, url]);
+      // Every event starts off; the admin turns them on at ตั้งค่าการส่ง Webhook.
+      await client.query(`INSERT INTO webhook_endpoints (merchant_id, url, events) VALUES ($1, $2, '{}')`, [id, url]);
     }
     await audit(client, actor, 'merchant.webhook', m.slug, `ตั้ง webhook → ${url}`);
   });

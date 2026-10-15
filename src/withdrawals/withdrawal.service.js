@@ -4,6 +4,12 @@ import { withTransaction } from '../db/pool.js';
 import { ConflictError, NotFoundError } from '../errors.js';
 import { BALANCE_SQL } from '../shared/balance-sql.js';
 import { moveWithdrawalSplits } from '../merchants/tree.js';
+import logger from '../logger.js';
+import { deliverWithdrawalEvent } from '../webhooks/webhook.service.js';
+
+/** Withdrawal webhook to the shop once the change has committed. */
+const notify = (client, ref, event) =>
+  client.afterCommit?.(() => deliverWithdrawalEvent(ref, event).catch((err) => logger.warn({ err, ref, event }, 'withdrawal webhook failed')));
 
 export const refParamSchema = z.object({ ref: z.string().regex(/^WDR\d{1,12}$/, 'invalid withdrawal ref') });
 export const rejectBodySchema = z.object({ reason: z.string().trim().min(1).max(300) });
@@ -59,6 +65,7 @@ export function approve(ref, actor) {
     await client.query(`UPDATE withdrawal_requests SET status = 'approved', approved_by = $2, outflow_id = $3, decided_at = now() WHERE id = $1`, [w.id, actor, out[0].id]);
     await moveWithdrawalSplits(client, w.id, out[0].id);
     await audit(client, actor, 'withdrawal.approve', ref, `อนุมัติ ${fmt(w.amount)} บาท → ${outRef}`);
+    notify(client, ref, 'withdrawal.approved');
     return { outflowRef: outRef };
   });
 }
@@ -69,5 +76,6 @@ export function reject(ref, actor, reason) {
     await refuseIfReserved(client, ref);
     await client.query(`UPDATE withdrawal_requests SET status = 'rejected', approved_by = $2, reject_reason = $3, decided_at = now() WHERE id = $1`, [w.id, actor, reason]);
     await audit(client, actor, 'withdrawal.reject', ref, reason);
+    notify(client, ref, 'withdrawal.rejected');
   });
 }

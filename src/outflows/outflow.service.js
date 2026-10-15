@@ -1,12 +1,14 @@
 import { query, withTransaction } from '../db/pool.js';
 import { BadRequestError, ConflictError, NotFoundError } from '../errors.js';
+import logger from '../logger.js';
+import { deliverPayoutEvent, deliverWithdrawalEvent } from '../webhooks/webhook.service.js';
 
 /** Operator actions on outflows: lock → check transition → update → audit. */
 
 const fmt = (n) => Number(n).toLocaleString('th-TH', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
 async function lock(client, ref) {
-  const { rows } = await client.query('SELECT id, ref, status, amount, fee, bank_account_id, receiver_name, admin_done FROM outflows WHERE ref = $1 FOR UPDATE', [ref]);
+  const { rows } = await client.query('SELECT id, ref, status, amount, fee, bank_account_id, receiver_name, admin_done, source FROM outflows WHERE ref = $1 FOR UPDATE', [ref]);
   if (!rows[0]) throw new NotFoundError(`Outflow ${ref} does not exist`);
   return rows[0];
 }
@@ -41,6 +43,13 @@ async function approveOne(client, ref, actor, bankAccountId, note) {
   await client.query(`UPDATE outflows SET status = 'approved', bank_account_id = $2, completed_at = now(), review_note = coalesce($3, review_note),
                          admin_done = true, admin_done_at = now(), admin_done_by = $4 WHERE id = $1`,
     [o.id, account, note || null, actor ?? 'console']);
+  // Approving a pending payout means the team has transferred it: tell the shop's system (payout.completed).
+  if (o.source === 'api') notifyPayout(client, ref, 'payout.completed');
+  // Paying out a withdrawal request: the shop's system hears withdrawal.completed.
+  if (o.source === 'withdrawal') {
+    const { rows: wr } = await client.query('SELECT ref FROM withdrawal_requests WHERE outflow_id = $1', [o.id]);
+    if (wr[0]) client.afterCommit?.(() => deliverWithdrawalEvent(wr[0].ref, 'withdrawal.completed').catch((err) => logger.warn({ err, ref: wr[0].ref }, 'withdrawal webhook failed')));
+  }
   await audit(client, actor, 'outflow.approve', ref, `โอนให้ ${o.receiver_name} ${fmt(o.amount)} บาท${account ? '' : ' (โอนนอกระบบ ไม่ระบุบัญชีที่หัก)'}${note ? ` · ${note}` : ''}`);
 }
 
@@ -56,7 +65,13 @@ async function rejectOne(client, ref, actor, reason) {
   await client.query(`UPDATE outflows SET status = 'rejected', review_note = $2, completed_at = now(), admin_done = true, admin_done_at = now(), admin_done_by = $3 WHERE id = $1`, [o.id, reason, actor ?? 'console']);
   await audit(client, actor, 'outflow.reject', ref,
     autoApproved ? `ปฏิเสธรายการที่อนุมัติอัตโนมัติ — ${reason} (คืนยอด ${fmt(Number(o.amount) + Number(o.fee ?? 0))} บาทให้ร้าน)` : reason);
+  // The shop's system created it through POST /payout/create: tell it (payout.failed webhook) once committed.
+  if (o.source === 'api') notifyPayout(client, ref, 'payout.failed');
 }
+
+/** Payout webhook to the shop's system (prismapays etc.), sent once the change has committed. */
+const notifyPayout = (client, ref, event) =>
+  client.afterCommit?.(() => deliverPayoutEvent(ref, event).catch((err) => logger.warn({ err, ref, event }, 'payout webhook failed')));
 
 export const approve = (ref, actor, { bankAccountId, note } = {}) => withTransaction((c) => approveOne(c, ref, actor, bankAccountId, note));
 
@@ -65,6 +80,8 @@ export const setAdminDone = (ref, actor, done) => withTransaction(async (client)
   const o = await lock(client, ref);
   await client.query(`UPDATE outflows SET admin_done = $2, admin_done_at = CASE WHEN $2 THEN now() END, admin_done_by = CASE WHEN $2 THEN $3 END WHERE id = $1`,
     [o.id, done, actor ?? 'console']);
+  // no → yes on an approved API payout: the team has made the transfer — the shop sees ถอนสำเร็จ and gets payout.completed.
+  if (done && !o.admin_done && o.status === 'approved' && o.source === 'api') notifyPayout(client, ref, 'payout.completed');
   await audit(client, actor, 'outflow.admin_done', ref, `admin ดำเนินการ: ${done ? 'yes' : 'no'} (${o.receiver_name} ${fmt(o.amount)} บาท)`);
 });
 export const reject = (ref, actor, reason) => withTransaction((c) => rejectOne(c, ref, actor, reason));

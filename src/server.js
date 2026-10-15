@@ -3,6 +3,7 @@ import config from './config.js';
 import logger from './logger.js';
 import { closePool, healthCheck } from './db/pool.js';
 import { startScheduler, stopScheduler } from './telegram/announcement.service.js';
+import { startWebhookRetries, stopWebhookRetries } from './webhooks/webhook.service.js';
 
 const app = createApp();
 const server = app.listen(config.port, () => {
@@ -20,6 +21,8 @@ try {
 
 // ประชาสัมพันธ์ posts only from production (local dev shares the database).
 if (config.isProduction) startScheduler();
+// Payout callbacks that failed are re-sent from production only (local dev shares the database).
+if (config.isProduction) startWebhookRetries(logger);
 
 let shuttingDown = false;
 
@@ -28,6 +31,7 @@ async function shutdown(signal) {
   shuttingDown = true;
   logger.info({ signal }, 'shutting down');
   stopScheduler();
+  stopWebhookRetries();
 
   const force = setTimeout(() => {
     logger.error('graceful shutdown timed out, forcing exit');

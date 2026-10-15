@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
+import { EVENT_CODES } from '../webhooks/events.js';
 import { z } from 'zod';
 import { query, withTransaction } from '../db/pool.js';
 import { AppError } from '../errors.js';
@@ -88,7 +89,7 @@ export const accountSchema = z.object({
 });
 export const webhookSchema = z.object({
   url: z.string().trim().url().max(500).refine((u) => u.startsWith('https://'), 'webhook URL ต้องเป็น https://'),
-  events: z.array(z.enum(['payment.approved', 'payment.rejected', 'withdrawal.approved'])).min(1).max(3).default(['payment.approved', 'payment.rejected']),
+  events: z.array(z.enum(EVENT_CODES)).min(1).max(EVENT_CODES.length).default(['payment.approved', 'payment.rejected']),
 });
 export const loginSchema = z.object({
   email: z.string().trim().toLowerCase().max(200).optional(),
@@ -104,7 +105,11 @@ export const apiLoginSchema = z.object({
 // ---------- helpers ----------
 
 /** Pending orders past their expiry become expired (lazy, on every read/write). */
-const expireDue = (c = { query }) => c.query(`UPDATE payments SET status = 'expired' WHERE status = 'pending' AND expires_at IS NOT NULL AND expires_at < now()`);
+const expireDue = async (c = { query }) => {
+  const r = await c.query(`UPDATE payments SET status = 'expired' WHERE status = 'pending' AND expires_at IS NOT NULL AND expires_at < now() RETURNING ref`);
+  for (const { ref } of r.rows) emitPaymentEvent(c, ref, 'payment.expired');
+  return r;
+};
 
 async function balances(c, m) {
   const { rows } = await c.query(

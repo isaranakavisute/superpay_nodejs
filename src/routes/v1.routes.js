@@ -9,6 +9,7 @@ import { z } from 'zod';
 import * as subs from '../merchants/sub-merchant.service.js';
 import { timingOf } from '../shared/stopwatch.js';
 import * as report from '../merchant-api/validation-report.js';
+import { requestLog } from '../merchant-api/request-log.js';
 
 /**
  * Merchant REST API v1 at /api/v1. Authenticated with `X-API-Key` + a request
@@ -17,6 +18,8 @@ import * as report from '../merchant-api/validation-report.js';
  * host, so URLs in responses point at the public site.
  */
 export const v1Router = Router();
+// Every call is recorded (after the response) — console: บันทึกการเรียก API.
+v1Router.use(requestLog);
 
 const baseOf = (req) => {
   const host = req.get('x-forwarded-host') ?? req.get('host');

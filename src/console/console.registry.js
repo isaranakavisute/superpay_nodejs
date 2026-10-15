@@ -191,6 +191,26 @@ export const RESOURCES = {
     filters: { entity: 'l.entity', actor: 'l.actor', family: `split_part(l.action, '.', 1)` },
   },
 
+  apiLogs: {
+    from: `api_request_logs r
+      LEFT JOIN merchants m ON m.id = r.merchant_id
+      LEFT JOIN merchants km ON km.id = r.key_merchant_id`,
+    columns: `r.id, r.created_at AS "createdAt", r.merchant_id AS "merchantId", m.name AS "merchantName",
+      r.key_merchant_id AS "keyMerchantId", km.name AS "keyMerchantName", r.key_prefix AS "keyPrefix", r.key_user AS "keyUser",
+      r.method, r.path, r.query, r.status, r.error_code AS "errorCode", r.duration_ms AS "durationMs", r.ip, r.user_agent AS "userAgent",
+      r.source, r.actor`,
+    order: 'r.created_at DESC, r.id DESC',
+    time: 'r.created_at',
+    search: ['r.path', 'r.query', 'r.key_prefix', 'r.ip', 'r.error_code', 'm.name', 'r.actor'],
+    status: `(CASE WHEN r.status < 300 THEN 'ok' WHEN r.status < 500 THEN 'client' ELSE 'server' END)`,
+    filters: {
+      merchantId: 'r.merchant_id::text',
+      method: 'r.method',
+      source: 'r.source',
+      result: `(CASE WHEN r.status < 300 THEN 'ok' WHEN r.status < 500 THEN 'client' ELSE 'server' END)`,
+    },
+  },
+
   channels: {
     // Secret values never leave the backend: only which secret fields are set.
     from: 'channels c',
@@ -246,13 +266,15 @@ export const RESOURCES = {
     from: `webhook_deliveries d
       JOIN webhook_endpoints e ON e.id = d.endpoint_id
       JOIN merchants m         ON m.id = e.merchant_id
-      LEFT JOIN payments p     ON p.ref = d.payment_ref`,
-    columns: `d.id, m.id AS "merchantId", m.name AS "merchantName", d.payment_ref AS "paymentRef", p.merchant_order_id AS "orderId",
+      LEFT JOIN payments p     ON p.ref = d.payment_ref
+      LEFT JOIN outflows o     ON o.ref = d.outflow_ref`,
+    columns: `d.id, m.id AS "merchantId", m.name AS "merchantName", coalesce(d.payment_ref, d.outflow_ref) AS "paymentRef",
+      coalesce(p.merchant_order_id, o.merchant_ref) AS "orderId",
       d.event, e.url, d.status_code AS "statusCode", d.attempts, d.response_ms AS "responseMs", d.error, d.state,
       d.payload, d.response_body AS "responseBody", d.signature, d.next_retry_at AS "nextRetryAt", d.delivered_at AS "deliveredAt"`,
     order: 'd.delivered_at DESC, d.id DESC',
     time: 'd.delivered_at',
-    search: ['d.payment_ref', 'm.name', 'e.url', 'p.merchant_order_id'],
+    search: ['d.payment_ref', 'd.outflow_ref', 'm.name', 'e.url', 'p.merchant_order_id', 'o.merchant_ref'],
     status: 'd.state',
     filters: { state: 'd.state', merchantId: 'm.id::text', event: 'd.event' },
   },

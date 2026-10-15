@@ -14,7 +14,7 @@ export const logger = pino({
   redact: {
     // Keys and signatures never reach the logs (x-console-key also derives the secret-box key).
     paths: ['req.headers.authorization', 'req.headers.cookie', 'req.headers["x-console-key"]', 'req.headers["x-api-key"]',
-      'req.headers["x-signature"]', '*.password', '*.secretKey', '*.apiKey', '*.signingSecret'],
+      'req.headers["x-signature"]', 'req.headers["x-telegram-bot-api-secret-token"]', '*.password', '*.secretKey', '*.apiKey', '*.signingSecret'],
     censor: '[redacted]',
   },
 });

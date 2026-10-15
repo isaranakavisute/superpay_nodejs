@@ -26,6 +26,7 @@ import usersAdminRouter from './routes/users-admin.routes.js';
 import profileRouter from './routes/profile.routes.js';
 import configAdminRouter from './routes/config-admin.routes.js';
 import v1Router from './routes/v1.routes.js';
+import { consoleActionLog } from './merchant-api/request-log.js';
 import telegramRouter from './routes/telegram.routes.js';
 import supportBotAdminRouter from './routes/support-bot.routes.js';
 import portalRouter from './routes/portal.routes.js';
@@ -94,6 +95,8 @@ export function createApp() {
   app.use('/api/users', usersRouter);
   app.use('/api/products', productsRouter);
   // Merchant API: its own auth (X-API-Key), not the console key.
+  // Admin actions through the console API are recorded alongside merchant API calls (บันทึกการเรียก API).
+  app.use('/api/console', consoleActionLog);
   app.use('/api/v1', v1Router);
   // Telegram slip-check bot webhook (secret header checked inside).
   app.use('/api/telegram', telegramRouter);

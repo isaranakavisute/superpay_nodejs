@@ -6,6 +6,7 @@ import logger from '../logger.js';
 import { BadRequestError, NotFoundError } from '../errors.js';
 import { open, seal } from '../shared/secret-box.js';
 import { BlockedUrlError, safeGet, safePost } from '../shared/safe-fetch.js';
+import { sendAlert } from '../alerts/alert.service.js';
 
 /**
  * The settings page: one typed jsonb document per section in console_config.
@@ -355,13 +356,25 @@ export function notifyPaymentApproved(payment) {
       const t = Math.floor(Date.now() / 1000);
       const sig = createHmac('sha256', d.secret).update(`${t}.${body}`).digest('hex');
       let detail;
+      let reply = null;
+      let ok = false;
       try {
         const r = await safePost(d.url, { body, headers: { 'content-type': 'application/json', 'x-signature': `t=${t},v1=${sig}`, 'user-agent': 'OptionPay-Outbound/1' } });
         detail = `${d.name}: HTTP ${r.status} (${r.ms} ms)`;
+        reply = r.body;
+        ok = r.status >= 200 && r.status < 300;
       } catch (err) {
         detail = `${d.name}: ล้มเหลว — ${err.message}`;
       }
       await query(`INSERT INTO audit_logs (actor, action, entity, entity_ref, detail) VALUES ('system', 'outbound.deliver', 'payment', $1, $2)`, [payment.ref, detail]);
+      // System-wide destination (ตั้งค่าระบบ → outbound): reported to unscoped alert bots.
+      await sendAlert('webhook.delivery', [
+        `📤 Outbound payment.approved — ${payment.ref}`,
+        ok ? `✅ ส่งถึงปลายทางแล้ว — ${detail}` : `❌ ส่งไม่สำเร็จ — ${detail}`,
+        `ปลายทาง: ${d.url}`,
+        `ข้อมูลที่ส่ง: ${body}`,
+        reply !== null ? `ปลายทางตอบ: ${String(reply).slice(0, 500) || '(ว่าง)'}` : null,
+      ].filter(Boolean).join('\n'));
     }));
   })().catch((err) => logger.warn({ err }, 'outbound webhook dispatch failed'));
 }
