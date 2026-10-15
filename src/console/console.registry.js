@@ -68,11 +68,12 @@ export const RESOURCES = {
       o.bank_account_id AS "bankAccountId", a.label AS "fromAccount", a.bank_code AS "fromBankCode", a.account_name AS "fromAccountName",
       o.receiver_name AS "receiverName", o.receiver_bank_code AS "receiverBankCode", rb.name AS "receiverBankName",
       o.receiver_account AS "receiverAccount", o.amount, o.fee, o.currency, o.status, o.created_at AS "createdAt",
-      o.source, o.description, o.review_note AS "reviewNote", o.completed_at AS "completedAt",
+      o.source, o.description, o.review_note AS "reviewNote", o.completed_at AS "completedAt", o.merchant_ref AS "merchantRef",
+      o.admin_done AS "adminDone", o.admin_done_at AS "adminDoneAt", o.admin_done_by AS "adminDoneBy",
       EXISTS (SELECT 1 FROM outflow_slips s WHERE s.outflow_id = o.id) AS "hasSlipImage"`,
     order: 'o.created_at DESC, o.id DESC',
     time: 'o.created_at',
-    search: ['o.ref', 'o.receiver_name', 'm.name', 'o.description'],
+    search: ['o.ref', 'o.receiver_name', 'm.name', 'o.description', 'o.merchant_ref', 'o.receiver_account'],
     status: 'o.status',
     amount: 'o.amount',
     filters: {
@@ -80,6 +81,7 @@ export const RESOURCES = {
       category: 'o.category',
       merchantId: 'o.merchant_id::text',
       account: `coalesce(o.bank_account_id::text, 'none')`,
+      adminDone: `(CASE WHEN o.admin_done THEN 'yes' ELSE 'no' END)`,
     },
   },
 

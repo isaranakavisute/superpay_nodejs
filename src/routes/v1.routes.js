@@ -8,6 +8,7 @@ import { verifyRequestSignature } from '../merchant-api/request-signature.js';
 import { z } from 'zod';
 import * as subs from '../merchants/sub-merchant.service.js';
 import { timingOf } from '../shared/stopwatch.js';
+import * as report from '../merchant-api/validation-report.js';
 
 /**
  * Merchant REST API v1 at /api/v1. Authenticated with `X-API-Key` + a request
@@ -86,6 +87,7 @@ v1Router.post('/collect', can('create_payment'), h((req) => s.createPayment(m(re
 v1Router.post('/payment/create', can('create_payment'), h((req) => s.createPayment(m(req), s.createPaymentSchema.parse(req.body), opts(req))));
 v1Router.post('/payment/slip/create', can('create_payment'), h((req) => s.createSlipPayment(m(req), s.slipCreateSchema.parse(req.body), opts(req))));
 v1Router.post('/payment/slip/verify', can('create_payment'), h((req) => s.verifyByOrder(m(req), s.slipVerifySchema.parse(req.body), opts(req))));
+v1Router.get('/payment/validation-report', can('view_transactions'), h((req) => report.validationReport(m(req), report.reportQuerySchema.parse(req.query))));
 v1Router.get('/payment/order/:orderId', can('view_transactions'), h((req) => s.byOrder(m(req), String(req.params.orderId), opts(req))));
 v1Router.get('/payment/accounts', can('manage_accounts'), h((req) => s.accounts(m(req))));
 v1Router.post('/payment/accounts', can('manage_accounts'), h((req) => s.addAccount(m(req), s.accountSchema.parse(req.body))));

@@ -36,7 +36,7 @@ export async function outflowStatusTotals(from, to) {
 export async function pendingCounts() {
   const { rows } = await query(
     `SELECT (SELECT count(*)::int FROM payments WHERE status = 'pending') AS payments,
-            (SELECT count(*)::int FROM outflows WHERE status = 'pending') AS outflows`,
+            (SELECT count(*)::int FROM outflows WHERE status = 'pending' OR (status = 'approved' AND NOT admin_done)) AS outflows`,
   );
   return rows[0];
 }
@@ -92,6 +92,7 @@ export async function recentOutflows(from, to, limit) {
   const { rows } = await query(
     `SELECT o.ref,
             o.merchant_id         AS "merchantId",
+            m.name                AS "merchantName",
             o.category,
             a.label               AS "fromAccount",
             o.receiver_name       AS "receiverName",
@@ -103,7 +104,8 @@ export async function recentOutflows(from, to, limit) {
             o.status,
             o.created_at          AS "createdAt"
        FROM outflows o
-       JOIN bank_accounts a ON a.id = o.bank_account_id
+       LEFT JOIN bank_accounts a ON a.id = o.bank_account_id   -- approval needs no account: keep those payouts too
+       LEFT JOIN merchants m ON m.id = o.merchant_id
        JOIN banks b         ON b.code = o.receiver_bank_code
       WHERE ${IN_WINDOW('o.created_at')}
       ORDER BY o.created_at DESC, o.id DESC
@@ -209,7 +211,7 @@ export async function dailyTrend(days, merchantId = null) {
 export async function queueCounts() {
   const { rows } = await query(
     `SELECT (SELECT count(*)::int FROM payments WHERE status = 'pending')            AS payments,
-            (SELECT count(*)::int FROM outflows WHERE status = 'pending')            AS outflows,
+            (SELECT count(*)::int FROM outflows WHERE status = 'pending' OR (status = 'approved' AND NOT admin_done))            AS outflows,
             (SELECT count(*)::int FROM withdrawal_requests WHERE status = 'pending') AS withdrawals,
             (SELECT count(*)::int FROM double_credits WHERE status = 'open')         AS "doubleCredits",
             (SELECT count(*)::int FROM inbound_events WHERE status = 'new')          AS events`,

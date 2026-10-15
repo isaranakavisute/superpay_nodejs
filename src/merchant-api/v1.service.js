@@ -633,12 +633,13 @@ async function payoutOne(c, m, b, idem) {
   const { rows: last } = await c.query(`SELECT coalesce(max(substring(ref from 4)::bigint), 40100) AS n FROM outflows WHERE ref ~ '^OUT[0-9]+$'`);
   const ref = `OUT${Number(last[0].n) + 1}`;
   const { rows } = await c.query(
-    `INSERT INTO outflows (ref, merchant_id, category, receiver_name, receiver_bank_code, receiver_account, amount, status, source, description, merchant_ref, idempotency_key, fee)
-     VALUES ($1, $2, 'transfer', $3, $4, $5, $6, 'pending', 'api', $7, $8, $9, $10) RETURNING *`,
+    // Approved at once: the shop's balance is charged now; the admin makes the bank transfer and ticks "admin ดำเนินการ".
+    `INSERT INTO outflows (ref, merchant_id, category, receiver_name, receiver_bank_code, receiver_account, amount, status, source, description, merchant_ref, idempotency_key, fee, completed_at)
+     VALUES ($1, $2, 'transfer', $3, $4, $5, $6, 'approved', 'api', $7, $8, $9, $10, now()) RETURNING *`,
     [ref, m.id, b.accountName, b.bankCode, b.accountNumber, b.amount, b.description ?? `Payout ผ่าน API${b.merchantRef ? ` (${b.merchantRef})` : ''}`, b.merchantRef ?? null, idem ?? null, fee],
   );
   await writeSplits(c, 'outflow', rows[0].id, m.id, b.amount, 'out');
-  await audit(c, m, 'outflow.create', 'outflow', ref, `Payout ผ่าน API ${fmt(b.amount)} บาท${fee ? ` + ค่าธรรมเนียม ${fmt(fee)} บาท` : ''} → ${b.bankCode} ···${b.accountNumber.slice(-4)}`);
+  await audit(c, m, 'outflow.create', 'outflow', ref, `Payout ผ่าน API ${fmt(b.amount)} บาท${fee ? ` + ค่าธรรมเนียม ${fmt(fee)} บาท` : ''} → ${b.bankCode} ···${b.accountNumber.slice(-4)} — อนุมัติอัตโนมัติ (รอ admin โอน)`);
   return { payout: presentPayout(rows[0]) };
 }
 

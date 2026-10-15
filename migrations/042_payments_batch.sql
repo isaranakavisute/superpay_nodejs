@@ -1,0 +1,3 @@
+-- An optional label grouping orders for reporting (e.g. a batch re-checked together): GET /payment/validation-report?batch=…
+ALTER TABLE payments ADD COLUMN batch text;
+CREATE INDEX payments_merchant_batch_idx ON payments (merchant_id, batch) WHERE batch IS NOT NULL;

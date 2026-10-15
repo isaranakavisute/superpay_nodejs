@@ -8,6 +8,7 @@ export const refParamSchema = z.object({ ref: z.string().regex(REF, 'invalid out
 // Approval needs no bank account: payouts are paid outside Option Pay and approved after inspection. The account it
 // was paid from (send / both) and the bank's transfer reference are optional, for the record.
 export const approveBodySchema = z.object({ bankAccountId: z.coerce.number().int().positive().optional(), note: z.string().trim().max(200).optional() });
+export const adminDoneBodySchema = z.object({ done: z.boolean() });
 export const rejectBodySchema = z.object({ reason: z.string().trim().min(1).max(300) });
 export const updateBodySchema = z.object({
   category: z.enum(CATEGORIES),
