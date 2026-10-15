@@ -6,7 +6,7 @@ import { BadRequestError, ConflictError, NotFoundError } from '../errors.js';
 const fmt = (n) => Number(n).toLocaleString('th-TH', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
 async function lock(client, ref) {
-  const { rows } = await client.query('SELECT id, ref, status, amount, bank_account_id, receiver_name FROM outflows WHERE ref = $1 FOR UPDATE', [ref]);
+  const { rows } = await client.query('SELECT id, ref, status, amount, fee, bank_account_id, receiver_name, admin_done FROM outflows WHERE ref = $1 FOR UPDATE', [ref]);
   if (!rows[0]) throw new NotFoundError(`Outflow ${ref} does not exist`);
   return rows[0];
 }
@@ -44,11 +44,18 @@ async function approveOne(client, ref, actor, bankAccountId, note) {
   await audit(client, actor, 'outflow.approve', ref, `โอนให้ ${o.receiver_name} ${fmt(o.amount)} บาท${account ? '' : ' (โอนนอกระบบ ไม่ระบุบัญชีที่หัก)'}${note ? ` · ${note}` : ''}`);
 }
 
+/**
+ * Reject a pending outflow — or an auto-approved payout the team has not transferred yet ("รอ admin ดำเนินการ":
+ * approved, admin_done = no). Rejecting returns amount + fee to the shop's balance (only approved outflows count).
+ * Once marked done (the money has been sent) it can no longer be rejected.
+ */
 async function rejectOne(client, ref, actor, reason) {
   const o = await lock(client, ref);
-  requireStatus(o, ['pending'], 'reject');
+  const autoApproved = o.status === 'approved' && !o.admin_done;
+  if (!autoApproved) requireStatus(o, ['pending'], 'reject');
   await client.query(`UPDATE outflows SET status = 'rejected', review_note = $2, completed_at = now(), admin_done = true, admin_done_at = now(), admin_done_by = $3 WHERE id = $1`, [o.id, reason, actor ?? 'console']);
-  await audit(client, actor, 'outflow.reject', ref, reason);
+  await audit(client, actor, 'outflow.reject', ref,
+    autoApproved ? `ปฏิเสธรายการที่อนุมัติอัตโนมัติ — ${reason} (คืนยอด ${fmt(Number(o.amount) + Number(o.fee ?? 0))} บาทให้ร้าน)` : reason);
 }
 
 export const approve = (ref, actor, { bankAccountId, note } = {}) => withTransaction((c) => approveOne(c, ref, actor, bankAccountId, note));
