@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import asyncHandler from '../middleware/asyncHandler.js';
 import * as s from '../merchants/merchant.service.js';
+import * as bd from '../merchants/breakdown.service.js';
 
 // Merchant management at /api/console/merchants (behind the console key).
 // GET /api/console/merchants itself stays on the generic console list.
@@ -15,6 +16,12 @@ merchantsAdminRouter.post('/:id/update', h((req) => s.update(id(req), req.actor,
 merchantsAdminRouter.delete('/:id', h((req) => s.remove(id(req), req.actor)));
 
 merchantsAdminRouter.get('/:id/credits', h(async (req) => s.credits(id(req))));
+// แดชบอร์ดร้านค้า: every transaction behind the gross → net and net → balance cards.
+merchantsAdminRouter.get('/:id/breakdown/payments', h(async (req) => bd.paymentsBreakdown(id(req), bd.windowQuerySchema.parse(req.query))));
+merchantsAdminRouter.get('/:id/breakdown/balance', h(async (req) => bd.balanceBreakdown(id(req))));
+merchantsAdminRouter.get('/:id/breakdown/tree', h(async (req) => bd.treeBreakdown(id(req), bd.windowQuerySchema.parse(req.query))));
+merchantsAdminRouter.get('/:id/breakdown/commission', h(async (req) => bd.commissionBreakdown(id(req), bd.windowQuerySchema.parse(req.query))));
+merchantsAdminRouter.post('/:id/rates', h(async (req) => s.setRates(id(req), req.actor, s.ratesBodySchema.parse(req.body))));
 merchantsAdminRouter.post('/:id/credits', h((req) => s.adjustCredit(id(req), req.actor, s.creditBodySchema.parse(req.body))));
 
 merchantsAdminRouter.get('/:id/api-keys', h(async (req) => ({ items: await s.apiKeys(id(req)) })));

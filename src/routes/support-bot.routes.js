@@ -18,7 +18,7 @@ supportBotAdminRouter.post('/test', h((req) => s.testMatch(z.object({ text: z.st
 supportBotAdminRouter.post('/settings', h((req) => cfg.save('supportBot', req.actor, req.body)));
 
 // ประชาสัมพันธ์ (announcements)
-supportBotAdminRouter.get('/announcements', h(async () => ({ announcements: await ann.listAnnouncements(), chats: await ann.listChats(), slots: ann.HOURLY_SLOTS })));
+supportBotAdminRouter.get('/announcements', h(async () => ({ announcements: await ann.listAnnouncements(), chats: await ann.listChats(), slots: ann.HOURLY_SLOTS, posting: await ann.postingStatus() })));
 supportBotAdminRouter.post('/announcements', h((req) => ann.createAnnouncement(req.actor, ann.announcementSchema.parse(req.body))));
 supportBotAdminRouter.post('/announcements/:id', h((req) => ann.updateAnnouncement(req.actor, id(req), ann.announcementSchema.parse(req.body))));
 supportBotAdminRouter.post('/announcements/:id/delete', h((req) => ann.deleteAnnouncement(req.actor, id(req))));

@@ -72,6 +72,7 @@ export const RESOURCES = {
       o.admin_done AS "adminDone", o.admin_done_at AS "adminDoneAt", o.admin_done_by AS "adminDoneBy",
       EXISTS (SELECT 1 FROM outflow_slips s WHERE s.outflow_id = o.id) AS "hasSlipImage"`,
     order: 'o.created_at DESC, o.id DESC',
+    sums: { fee: 'o.fee' },
     time: 'o.created_at',
     search: ['o.ref', 'o.receiver_name', 'm.name', 'o.description', 'o.merchant_ref', 'o.receiver_account'],
     status: 'o.status',

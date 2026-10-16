@@ -105,7 +105,8 @@ const tg = (token, method, body) => fetch(`https://api.telegram.org/bot${token}/
 export async function checkSecret(header) {
   const cfg = await configOf('supportBot');
   const a = Buffer.from(String(header ?? '')), b = Buffer.from(cfg.webhookSecret || '');
-  return cfg.enabled && b.length > 0 && a.length === b.length && timingSafeEqual(a, b);
+  // Not tied to the FAQ on/off switch: group joins / leaves must still be recorded for ประชาสัมพันธ์.
+  return b.length > 0 && a.length === b.length && timingSafeEqual(a, b);
 }
 
 export async function handleUpdate(update) {
@@ -116,6 +117,7 @@ export async function handleUpdate(update) {
   if (msg?.chat && msg.chat.type !== 'private') await recordChat(msg.chat, 'member').catch(() => {});
   if (!msg?.chat || msg.from?.is_bot) return;
   const cfg = await configOf('supportBot');
+  // FAQ answers only when บอทตอบคำถาม is switched on (ประชาสัมพันธ์ works either way).
   if (!cfg.enabled || !cfg.botToken) return;
   const text = (msg.text ?? msg.caption ?? '').trim();
   if (!text) return;   // photos, stickers, voice… are not questions

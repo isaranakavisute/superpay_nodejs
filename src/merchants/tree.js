@@ -22,11 +22,20 @@ export async function chainOf(c, merchantId) {
 const RATE = { in: ['fee_percent', 'fee_flat'], out: ['out_fee_percent', 'out_fee_flat'] };
 export const feeAt = (m, amount, dir = 'in') => round2((Number(amount) * Number(m[RATE[dir][0]])) / 100 + Number(m[RATE[dir][1]]));
 
-/** Shares of a fee along the chain: [{ merchantId | null (platform), amount }] summing to the shop's own fee. */
+const rateOf = (m, dir) => ({ pct: Number(m[RATE[dir][0]]), flat: Number(m[RATE[dir][1]]) });
+
+/**
+ * Shares of a fee along the chain: [{ merchantId | null (platform), amount, own, below }] summing to the shop's own fee.
+ * own / below = { fee, pct, flat } at this shop's rate and at the rate of the shop just below it (what the share is the difference of).
+ */
 export function splitFee(chain, amount, dir = 'in') {
   if (!chain.length) return [];
-  const out = [{ merchantId: null, amount: feeAt(chain[0], amount, dir) }];
-  for (let i = 0; i < chain.length - 1; i++) out.push({ merchantId: chain[i].id, amount: round2(feeAt(chain[i + 1], amount, dir) - feeAt(chain[i], amount, dir)) });
+  const at = (m) => ({ fee: feeAt(m, amount, dir), ...rateOf(m, dir) });
+  const out = [{ merchantId: null, amount: feeAt(chain[0], amount, dir), own: at(chain[0]), below: null }];
+  for (let i = 0; i < chain.length - 1; i++) {
+    const own = at(chain[i]); const below = { ...at(chain[i + 1]), merchantId: chain[i + 1].id };
+    out.push({ merchantId: chain[i].id, amount: round2(below.fee - own.fee), own, below });
+  }
   return out.filter((s) => s.amount !== 0);
 }
 
@@ -36,7 +45,11 @@ export async function writeSplits(c, kind, sourceId, merchantId, amount, dir) {
   if (merchantId == null) return;
   const chain = await chainOf(c, merchantId);
   for (const s of splitFee(chain, amount, dir)) {
-    await c.query('INSERT INTO fee_splits (source_kind, source_id, from_merchant_id, merchant_id, amount) VALUES ($1, $2, $3, $4, $5)', [kind, sourceId, merchantId, s.merchantId, s.amount]);
+    await c.query(
+      `INSERT INTO fee_splits (source_kind, source_id, from_merchant_id, merchant_id, amount, below_merchant_id, below_fee, below_pct, below_flat, own_fee, own_pct, own_flat)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+      [kind, sourceId, merchantId, s.merchantId, s.amount, s.below?.merchantId ?? null, s.below?.fee ?? null, s.below?.pct ?? null, s.below?.flat ?? null, s.own.fee, s.own.pct, s.own.flat],
+    );
   }
 }
 

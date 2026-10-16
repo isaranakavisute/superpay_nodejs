@@ -15,7 +15,7 @@ import { cancelSlipSiblings, carryOverFrom } from './slip-carry-over.js';
 import { outFeeFor } from '../shared/out-fee.js';
 import { accountNumber } from '../shared/account-number.js';
 import { ocrCheckSlip } from './slip-ocr.js';
-import { verifySlip } from './slip-verify.js';
+import { PENDING_TEXT, verifySlip } from './slip-verify.js';
 import logger from '../logger.js';
 import { stopwatch, timingOf, withTiming } from '../shared/stopwatch.js';
 import { BALANCE_SQL } from '../shared/balance-sql.js';
@@ -376,8 +376,14 @@ async function lastSlipProblems(paymentId) {
 }
 const slipTaken = () => new ApiError(409, 'SLIP_ALREADY_UPLOADED', 'ได้รับสลิปของรายการนี้แล้ว — ส่งซ้ำไม่ได้ หากมีปัญหาโปรดติดต่อร้านค้า');
 
-/** `once`: refuse when an accepted / in-review slip is already attached (customer checkout page). */
-async function attachAndVerify(m, p, { image, mime }, base, { once = false } = {}) {
+/** Background re-checks of a slip the bank was still processing: due after 1, 3 and 6 minutes. */
+const RECHECK_AFTER_MIN = [1, 2, 3];
+
+/**
+ * `once`: refuse when an accepted / in-review slip is already attached (customer checkout page).
+ * `recheck`: a background re-check of the stored slip (n = which one); the provider is asked once, without waiting.
+ */
+async function attachAndVerify(m, p, { image, mime }, base, { once = false, recheck = 0 } = {}) {
   const buf = Buffer.from(image, 'base64');
   if (buf.length < 100 || buf.length > 8 << 20) throw new ApiError(400, 'INVALID_SLIP', 'ไฟล์สลิปต้องเป็นรูปขนาดไม่เกิน 8 MB');
   if (!['pending', 'expired'].includes(p.status)) throw new ApiError(409, 'ORDER_NOT_PENDING', `ออเดอร์นี้สถานะ ${STATUS[p.status]} แล้ว`);
@@ -386,10 +392,13 @@ async function attachAndVerify(m, p, { image, mime }, base, { once = false } = {
   const fp = await slipFingerprint(buf, mime);
   time.lap('qr', 'อ่าน QR จากภาพ');
   if (isSampleSlip(fp)) throw new ApiError(400, 'SAMPLE_SLIP', SAMPLE_SLIP_MESSAGE);
-  const v = await verifySlip(buf, mime);
+  const v = await verifySlip(buf, mime, { pendingRetries: !recheck });
   time.lap('provider', `ตรวจกับธนาคาร (${v.provider})`);
   // No definite answer from a provider (none connected / down): read the slip image itself.
-  const ocr = v.verified === null ? await ocrCheckSlip(buf, p, v.cfg) : null;
+  // Not while the bank is still processing the transfer — the slip is re-checked with the provider instead.
+  const ocr = v.verified === null && !v.pending ? await ocrCheckSlip(buf, p, v.cfg) : null;
+  const nextRecheck = v.pending && recheck < RECHECK_AFTER_MIN.length ? RECHECK_AFTER_MIN[recheck] : null;
+  if (v.pending) v.message = nextRecheck ? PENDING_TEXT : 'ธนาคารยังประมวลผลรายการโอนนี้อยู่ (EasySlip: slip_pending) หลังตรวจซ้ำครบแล้ว — รอผู้ดูแลตรวจ';
   if (ocr) time.lap('ocr', 'อ่านข้อความจากภาพ');
   const via = ocr ? 'ocr' : v.provider;
   const out = await withTransaction(async (c) => {
@@ -462,6 +471,9 @@ async function attachAndVerify(m, p, { image, mime }, base, { once = false } = {
         JSON.stringify({ verified: v.verified, amount: v.amount ?? null, date: v.date ?? null, message: reason, decision, mismatches, warnings, ocr, carriedFrom: carried && !reusedOn ? carried.ref : null }), fp.sha256, fp.qr],
     );
     await c.query('UPDATE payments SET slip_received_at = now(), review_note = coalesce($2, review_note), slip_reused_ref = $3 WHERE id = $1', [p.id, reason, reusedOn]);
+    // Still being processed by the bank: schedule the next background check (none once the slip has an answer).
+    await c.query(`UPDATE payment_slips SET recheck_at = CASE WHEN $2::int IS NULL THEN NULL ELSE now() + make_interval(mins => $2::int) END,
+                          recheck_attempts = $3 WHERE payment_id = $1`, [p.id, decision === 'review' ? nextRecheck : null, recheck]);
     const warn = warnings.length ? ` · ⚠️ ${warnings.join(' · ')}` : '';
     // The earlier order keeps its status; its note says which order its transfer paid.
     if (carried && !reusedOn && decision !== 'invalid') {
@@ -493,7 +505,8 @@ async function attachAndVerify(m, p, { image, mime }, base, { once = false } = {
         autoCancelled.push({ ref: s.ref, orderId: s.merchant_order_id ?? null, amount: Number(s.amount), reason: `สลิปเดียวกันเคยไม่ผ่านในออเดอร์นี้ และใช้ชำระ ${p.ref} แล้ว` });
       }
     }
-    await audit(c, m, 'payment.slip', 'payment', p.ref, `แนบสลิป · ${via}: ${decision === 'approve' ? `ผ่าน — อนุมัติอัตโนมัติ${warn}` : reason ?? decision}`);
+    await audit(c, m, recheck ? 'payment.slip_recheck' : 'payment.slip', 'payment', p.ref,
+      `${recheck ? `ตรวจสลิปซ้ำอัตโนมัติ ครั้งที่ ${recheck}` : 'แนบสลิป'} · ${via}: ${decision === 'approve' ? `ผ่าน — อนุมัติอัตโนมัติ${warn}` : reason ?? decision}`);
     const { rows } = await c.query(`${PAY_SELECT} WHERE p.id = $1`, [p.id]);
     return {
       success: decision !== 'invalid',
@@ -1117,4 +1130,50 @@ export async function changePortalPassword(m, userId, b) {
   await query('UPDATE merchant_portal_users SET password_hash = $2, must_change_password = false WHERE id = $1', [userId, await hashPassword(b.next)]);
   await query(`INSERT INTO audit_logs (actor, action, entity, entity_ref, detail) VALUES ($1, 'merchant.portal_password', 'merchant', $2, 'เปลี่ยนรหัสผ่าน portal')`, [rows[0].username, m.slug]);
   return { success: true };
+}
+
+// ---------- slip re-checks (EasySlip slip_pending) ----------
+
+/** Re-checks slips whose transfer the bank was still processing; approves them like a fresh upload once confirmed. */
+export async function recheckDueSlips(limit = 5) {
+  // Claim the due rows first so a slow check is never picked up twice.
+  const { rows } = await query(
+    `UPDATE payment_slips s SET recheck_at = NULL
+      WHERE s.payment_id IN (SELECT payment_id FROM payment_slips WHERE recheck_at IS NOT NULL AND recheck_at <= now() ORDER BY recheck_at LIMIT $1)
+      RETURNING s.payment_id, s.recheck_attempts`,
+    [limit],
+  );
+  let done = 0;
+  for (const r of rows) {
+    try {
+      const { rows: ps } = await query(`${PAY_SELECT.replace('SELECT p.*', 'SELECT p.*, m.slug')} JOIN merchants m ON m.id = p.merchant_id WHERE p.id = $1`, [r.payment_id]);
+      const p = ps[0];
+      if (!p || !['pending', 'expired'].includes(p.status)) continue;
+      const { rows: sl } = await query('SELECT data, mime FROM payment_slips WHERE payment_id = $1', [r.payment_id]);
+      if (!sl[0]) continue;
+      const out = await attachAndVerify({ id: p.merchant_id, slug: `${p.slug}:recheck` }, p, { image: sl[0].data.toString('base64'), mime: sl[0].mime },
+        process.env.PUBLIC_BASE_URL ?? 'https://optionpay.co', { recheck: r.recheck_attempts + 1 });
+      logger.info({ ref: p.ref, attempt: r.recheck_attempts + 1, result: out.result }, 'slip re-checked');
+      done += 1;
+    } catch (err) {
+      logger.warn({ err, paymentId: r.payment_id }, 'slip re-check failed');
+    }
+  }
+  return done;
+}
+
+let recheckTimer = null;
+export function startSlipRechecks() {
+  if (recheckTimer) return;
+  let busy = false;
+  recheckTimer = setInterval(async () => {
+    if (busy) return;
+    busy = true;
+    try { await recheckDueSlips(); } catch (err) { logger.warn({ err }, 'slip re-check loop failed'); } finally { busy = false; }
+  }, 20_000);
+  recheckTimer.unref();
+}
+export function stopSlipRechecks() {
+  clearInterval(recheckTimer);
+  recheckTimer = null;
 }

@@ -19,6 +19,11 @@ function rejectText(name, msg) {
   return `${name}: ${msg ?? 'สลิปไม่ถูกต้อง'}`;
 }
 
+export const PENDING_TEXT = 'ธนาคารยังประมวลผลรายการโอนนี้อยู่ (EasySlip: slip_pending) — ระบบจะตรวจซ้ำอัตโนมัติ';
+const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+/** Waits before re-asking the provider about a slip the bank is still processing (inside one request). */
+const PENDING_WAITS_MS = [3000, 5000];
+
 async function easyslip(cfg, buf, mime) {
   if (!cfg.easySlipApiKey) return { verified: null, message: 'ยังไม่ได้ตั้ง EasySlip API Key' };
   const form = new FormData();
@@ -26,6 +31,8 @@ async function easyslip(cfg, buf, mime) {
   const r = await safeRequest('https://developer.easyslip.com/api/v1/verify', { headers: { authorization: `Bearer ${cfg.easySlipApiKey}` }, body: form });
   const j = JSON.parse(r.body || '{}');
   if (r.status === 200 && j.data) return { verified: true, amount: Number(j.data.amount?.amount), transRef: j.data.transRef ?? null, date: j.data.date ?? null, raw: j.data };
+  // slip_pending: the bank hasn't finished the transfer yet — not a bad slip; check again shortly.
+  if (/pending/i.test(String(j.message ?? ''))) return { verified: null, pending: true, message: PENDING_TEXT };
   // 400 = the slip itself is bad (not a slip / not found); anything else is the provider's problem.
   if (r.status === 400 || r.status === 404) return { verified: false, message: rejectText('EasySlip', j.message) };
   return { verified: null, message: `EasySlip ตอบ HTTP ${r.status}: ${j.message ?? ''}`.trim() };
@@ -53,10 +60,18 @@ async function run(provider, cfg, buf, mime) {
   }
 }
 
-/** Primary first; the fallback only when the primary gave no definitive answer (or a "not found" we were told to trust it on). */
-export async function verifySlip(buf, mime) {
+/**
+ * Primary first; the fallback only when the primary gave no definitive answer (or a "not found" we were told to trust it on).
+ * `pendingRetries`: when the bank is still processing the transfer, ask again after 3 s and 5 s before answering.
+ */
+export async function verifySlip(buf, mime, { pendingRetries = true } = {}) {
   const cfg = await configOf('slip');
-  const first = await run(cfg.provider, cfg, buf, mime);
+  let first = await run(cfg.provider, cfg, buf, mime);
+  for (const wait of pendingRetries ? PENDING_WAITS_MS : []) {
+    if (!first.pending) break;
+    await sleep(wait);
+    first = await run(cfg.provider, cfg, buf, mime);
+  }
   if (first.verified !== null || !cfg.fallbackProvider || cfg.provider === 'none') return { ...first, cfg };
   const second = await run(cfg.fallbackProvider, cfg, buf, mime);
   if (second.verified === false && !cfg.failoverTrustNotFound) return { ...first, message: `${first.message} · ตัวสำรอง: ${second.message} (รอตัวหลักตรวจซ้ำ)`, cfg };

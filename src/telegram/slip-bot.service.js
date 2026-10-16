@@ -3,6 +3,7 @@ import { query } from '../db/pool.js';
 import { internal as configOf } from '../config-admin/config.service.js';
 import logger from '../logger.js';
 import { verifySlip } from '../merchant-api/slip-verify.js';
+import { readTxnText } from '../merchant-api/txn-ocr.js';
 import { isSampleSlip, qrReason, slipFingerprint } from '../shared/slip-fingerprint.js';
 import { accountMatches, matchSlip, nameMatches, normalizeSlip } from '../merchant-api/slip-match.js';
 import { carryOverFrom } from '../merchant-api/slip-carry-over.js';
@@ -38,12 +39,49 @@ function imageOf(msg) {
   return null;
 }
 
-async function download(token, fileId) {
+async function downloadOnce(token, fileId) {
   const f = await tg(token, 'getFile', { file_id: fileId });
   if (!f.ok) throw new Error(f.description ?? 'getFile failed');
   const r = await fetch(`https://api.telegram.org/file/bot${token}/${f.result.file_path}`, { signal: AbortSignal.timeout(20_000) });
   if (!r.ok) throw new Error(`download HTTP ${r.status}`);
   return Buffer.from(await r.arrayBuffer());
+}
+
+// Fingerprint (QR + hash) of an image buffer: computed once per downloaded image (the download cache returns the same Buffer).
+const prints = new WeakMap();
+function fingerprintOf(buf, mime) {
+  if (!prints.has(buf)) prints.set(buf, slipFingerprint(buf, mime).catch((err) => { prints.delete(buf); throw err; }));
+  return prints.get(buf);
+}
+
+/** "typing…" in the chat until `done` settles (Telegram shows it for ~5 s per call). */
+function typingWhile(token, chatId, done) {
+  const ping = () => tg(token, 'sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
+  ping();
+  const t = setInterval(ping, 4000);
+  return done.finally(() => clearInterval(t));
+}
+
+// One image is needed several times in a check (TXN search, earlier result, the check itself): fetched once,
+// kept for a few minutes, and retried — the link to Telegram occasionally drops a request.
+const images = new Map();
+const IMAGE_KEEP_MS = 5 * 60_000;
+async function download(token, fileId) {
+  const hit = images.get(fileId);
+  if (hit && Date.now() - hit.at < IMAGE_KEEP_MS) return hit.buf;
+  let last;
+  for (const wait of [0, 1000, 2500]) {
+    if (wait) await new Promise((res) => setTimeout(res, wait));
+    try {
+      const buf = await downloadOnce(token, fileId);
+      for (const [k, v] of images) if (Date.now() - v.at >= IMAGE_KEEP_MS) images.delete(k);
+      images.set(fileId, { buf, at: Date.now() });
+      return buf;
+    } catch (err) {
+      last = err;
+    }
+  }
+  throw last;
 }
 
 const CHECKED_BY = { easyslip: 'EasySlip (ธนาคาร)', slipok: 'SlipOK (ธนาคาร)', ocr: 'อ่านจากภาพ + ผู้ดูแล', none: 'ผู้ดูแล' };
@@ -154,7 +192,7 @@ function checkAnswer(step, v, value) {
 
 /** Verify one slip image (against `expect` when given) → { result, reason, ... }. */
 export async function checkSlip(buf, mime, expect = null, { recheck = false } = {}) {
-  const fp = await slipFingerprint(buf, mime);
+  const fp = await fingerprintOf(buf, mime);
   if (isSampleSlip(fp)) return { result: 'invalid', reason: 'เป็นภาพตัวอย่างสลิปจาก Option Pay ไม่ใช่สลิปจริง', fp };
   const v = await verifySlip(buf, mime);
   // "No QR" from the provider: say what the image actually has (a fake QR, or a QR that isn't a slip's).
@@ -187,12 +225,14 @@ function replyText(r) {
   return `⚠️ ตรวจสลิปไม่ได้ในขณะนี้ (ไม่ใช่ว่าสลิปไม่ถูกต้อง)\n\nสาเหตุ: ${r.reason}\nลองส่งใหม่อีกครั้งภายหลัง`;
 }
 
-const HELP = 'ส่งรูปสลิปโอนเงินมาที่นี่ — บอทจะถามก่อนว่าต้องการตรวจสลิปหรือไม่ ถ้าตอบ “ใช่” จะถามรายการที่ต้องชำระ (เลขที่รายการ หรือ ยอด/บัญชีปลายทาง) แล้วตรวจกับธนาคาร (EasySlip) และตอบว่า valid slip หรือ invalid slip พร้อมเหตุผล\n\nแนะนำ: ส่งแบบ “ไฟล์” (File) จะชัดกว่าส่งแบบรูปภาพที่ Telegram บีบอัด';
+const HELP = 'ส่งรูปสลิปโอนเงินมาที่นี่ — ถ้าพิมพ์เลขที่รายการ (เช่น TXN172919) ในข้อความที่แนบกับรูป บอทจะตรวจสลิปกับรายการนั้นทันที ไม่ถามคำถาม · ถ้าไม่มี บอทจะถามก่อนว่าต้องการตรวจสลิปหรือไม่ (ถ้ามีเลข TXN อยู่ในภาพ บอทจะใช้เลขนั้นแทนการถามเลขที่รายการ) ถ้าตอบ “ใช่” จะถามรายการที่ต้องชำระ (เลขที่รายการ หรือ ยอด/บัญชีปลายทาง) แล้วตรวจกับธนาคาร (EasySlip) และตอบว่า valid slip หรือ invalid slip พร้อมเหตุผล\n\nแนะนำ: ส่งแบบ “ไฟล์” (File) จะชัดกว่าส่งแบบรูปภาพที่ Telegram บีบอัด';
 
 /** Handle one Telegram update (called after the webhook has answered 200). */
 // ---------- asking for the expected payment before verifying ----------
 
 const SESSION_MIN = 10;
+/** Reading a TXN printed in the image must not keep the user waiting long; past this the usual questions start. */
+const IMAGE_TXN_TIMEOUT_MS = 12_000;
 const ASK = {
   confirm: 'ต้องการตรวจสลิป (slip validation) ภาพนี้หรือไม่? 🔍\nกด / พิมพ์ “ใช่” เพื่อตรวจ หรือ “ไม่” เพื่อไม่ตรวจ',
   ref: 'ก่อนตรวจสลิป กรุณาระบุรายการที่ต้องชำระ 🧾\n\nพิมพ์ “เลขที่รายการ” (ขึ้นต้นด้วย TXN) หรือ “เลขออเดอร์ของร้าน”\nถ้าไม่มี พิมพ์ “ไม่มี” แล้วบอทจะถามรายละเอียดทีละข้อ\n(พิมพ์ “ยกเลิก” เพื่อยกเลิก)',
@@ -218,6 +258,55 @@ const saveSession = (chatId, userId, f) => query(
 const endSession = (chatId, userId) => query('DELETE FROM telegram_slip_sessions WHERE chat_id = $1 AND user_id = $2', [chatId, userId]);
 
 /** An Option Pay order by TXN ref or the shop's Order ID (with its receiving account). */
+/**
+ * TXN numbers written anywhere in a text (a photo's caption or the text read from the image — top, middle or
+ * bottom alike): "TXN172919", "txn 172919", "TXN-172919"; an O read in place of a zero is accepted.
+ */
+export function txnRefsIn(text) {
+  const out = [];
+  for (const m of String(text ?? '').matchAll(/T\s*X\s*N[\s\-:#.]*([0-9Oo]{4,12})(?![0-9Oo])/gi)) {
+    const ref = `TXN${m[1].replace(/[Oo]/g, '0')}`;
+    if (!out.includes(ref)) out.push(ref);
+  }
+  return out;
+}
+
+/** Does the photo's caption name an order — a TXN number anywhere in it, or exactly the shop's order number? */
+export async function captionNamesOrder(caption) {
+  const c = String(caption ?? '').trim();
+  if (!c) return false;
+  if (txnRefsIn(c).length) return true;
+  return /^[A-Za-z0-9][A-Za-z0-9_-]{5,63}$/.test(c) && (await findOrder(c)).length > 0;
+}
+
+/** The order a slip image points to, if any: TXN in the caption first, then TXN read from the image itself. */
+async function orderHint(cfg, captionText, fileId) {
+  const caption = String(captionText ?? '').trim();
+  const fromCaption = txnRefsIn(caption);
+  // A caption that is just the shop's order number (e.g. PD-…) counts too.
+  if (!fromCaption.length && /^[A-Za-z0-9][A-Za-z0-9_-]{5,63}$/.test(caption) && (await findOrder(caption)).length === 1) return { ref: caption, where: 'ข้อความที่แนบมากับรูป' };
+  let refs = fromCaption;
+  let where = 'ข้อความที่แนบมากับรูป';
+  if (!refs.length) {
+    try {
+      const text = await Promise.race([
+        download(cfg.botToken, fileId).then((buf) => readTxnText(buf)),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), IMAGE_TXN_TIMEOUT_MS)),
+      ]);
+      refs = txnRefsIn(text);
+      where = 'ภาพ';
+    } catch (err) {
+      logger.warn({ err: err.message }, 'slip bot: reading TXN from the image failed');
+    }
+  }
+  if (!refs.length) return null;
+  const known = [];
+  for (const r of refs) if ((await findOrder(r)).length) known.push(r);
+  if (known.length === 1) return { ref: known[0], where };
+  if (known.length > 1) return { ask: `พบเลขรายการหลายรายการใน${where}: ${known.join(', ')} — กรุณาพิมพ์เลขที่รายการที่ต้องการตรวจ` };
+  return { unknown: refs[0], where };
+}
+
 async function findOrder(text) {
   const t = text.trim().replace(/\s+/g, '');
   const { rows } = await query(
@@ -277,19 +366,34 @@ async function verifySession(cfg, chatId, userId, sess, expect, who) {
  * "ใช่" to the first question: the slip-validation flow starts. A slip the bot has judged before gets that
  * result and the re-check question; otherwise the questions about the expected payment begin.
  */
-async function startValidation(cfg, chatId, userId, sess) {
+/** The earlier result for this slip image, if it was checked before (null when not, or when it can't be read). */
+async function priorOf(cfg, sess) {
   try {
-    const fp = await slipFingerprint(await download(cfg.botToken, sess.file_id), sess.mime);
-    const prior = await priorResult(fp);
-    if (prior) {
-      await saveSession(chatId, userId, { ...sess, step: 'recheck', data: {} });
-      return { text: `${prior}\n\n${ASK.recheck}`, markup: YES_NO };
-    }
+    return await priorResult(await fingerprintOf(await download(cfg.botToken, sess.file_id), sess.mime));
   } catch (err) {
     logger.warn({ err: err.message }, 'slip bot: download failed');
+    return null;
   }
+}
+
+async function startValidation(cfg, chatId, userId, sess, who) {
+  // A TXN in the caption or printed anywhere in the image replaces the "ระบุรายการ" question.
+  const hint = await orderHint(cfg, sess.data?.caption, sess.file_id);
+  const found = hint?.ref ? `🔍 พบเลขรายการ ${hint.ref} ใน${hint.where} — ตรวจสลิปกับรายการนี้` : null;
+  const prior = await priorOf(cfg, sess);
+  if (prior) {
+    await saveSession(chatId, userId, { ...sess, step: 'recheck', data: { autoRef: hint?.ref ?? null } });
+    return { text: `${found ? `${found}\n\n` : ''}${prior}\n\n${ASK.recheck}`, markup: YES_NO };
+  }
+  const next = { ...sess, step: 'ref', data: {} };
+  await saveSession(chatId, userId, next);
+  if (hint?.ref) {
+    const reply = await answer(cfg, chatId, userId, next, hint.ref, who);
+    return typeof reply === 'string' ? `${found}\n\n${reply}` : { ...reply, text: `${found}\n\n${reply.text}` };
+  }
+  if (hint?.ask) return hint.ask;
+  if (hint?.unknown) return `ไม่พบรายการ ${hint.unknown} (จาก${hint.where}) — กรุณาพิมพ์เลขที่รายการ (ขึ้นต้นด้วย TXN) หรือเลขออเดอร์ของร้านอีกครั้ง หรือพิมพ์ “ไม่มี”`;
   // Ask what the slip should match first; EasySlip is called only once the answers are in.
-  await saveSession(chatId, userId, { ...sess, step: 'ref', data: {} });
   return ASK.ref;
 }
 
@@ -303,9 +407,15 @@ async function answer(cfg, chatId, userId, sess, text, who) {
     case 'confirm': {
       if (NO.test(t)) { await endSession(chatId, userId); return 'รับทราบ — ไม่ตรวจสลิปภาพนี้\n(ส่งรูปใหม่เมื่อต้องการตรวจ)'; }
       if (!YES.test(t)) return again(`กรุณาตอบ “ใช่” หรือ “ไม่”\n\n${ASK.confirm}`);
-      return startValidation(cfg, chatId, userId, sess);
+      return startValidation(cfg, chatId, userId, sess, who);
     }
     case 'recheck': {
+      if (YES.test(t) && data.autoRef) {
+        // The TXN came with the photo: re-check against it without asking again.
+        const next = { ...sess, step: 'ref', data: { recheck: true } };
+        await saveSession(chatId, userId, next);
+        return answer(cfg, chatId, userId, next, data.autoRef, who);
+      }
       if (YES.test(t)) { await saveSession(chatId, userId, { ...sess, step: 'ref', data: { recheck: true } }); return ASK.ref; }
       if (NO.test(t)) { await endSession(chatId, userId); return 'ไม่ตรวจซ้ำ — ใช้ผลการตรวจเดิม'; }
       return again(`กรุณาตอบ “ใช่” หรือ “ไม่”\n\n${ASK.recheck}`);
@@ -390,14 +500,27 @@ export async function handleUpdate(update) {
   if (sess) {
     // In a group, ordinary chat after posting a picture isn't an answer to "ตรวจสลิปไหม?" — no nagging; the question stays open.
     if (inGroup && (sess.step === 'confirm' || sess.step === 'recheck') && !YES.test(msg.text.trim()) && !NO.test(msg.text.trim())) return;
-    const reply = await answer(cfg, chatId, userId, sess, msg.text, who);
+    // Answers like "ใช่" can start the bank check (a few seconds): show "typing…" meanwhile.
+    const reply = await typingWhile(cfg.botToken, msg.chat.id, answer(cfg, chatId, userId, sess, msg.text, who));
     const asksYesNo = typeof reply === 'string' && /“ใช่” หรือ “ไม่”/.test(reply);
     await send(reply, asksYesNo ? YES_NO : NO_KEYBOARD);
     return;
   }
   if (!img) { await send(HELP); return; }
   if (img.size && img.size > MAX_BYTES) { await send('❌ invalid slip\n\nเหตุผล: ไฟล์ใหญ่เกิน 8 MB'); return; }
-  // Every image: ask first whether to validate it as a slip (a new image replaces any open question).
-  await saveSession(chatId, userId, { file_id: img.fileId, mime: img.mime, message_id: msg.message_id, step: 'confirm', data: {} });
+  const fresh = { file_id: img.fileId, mime: img.mime, message_id: msg.message_id, step: 'confirm', data: { caption: msg.caption ?? null } };
+  await saveSession(chatId, userId, fresh);
+  // A caption that names the order (TXN… or the shop's order number) means "check this slip": no "ตรวจไหม?" question.
+  if (await captionNamesOrder(msg.caption)) {
+    // Say right away that the check has started (the bank check takes a few seconds), and show "typing…" until done.
+    const named = txnRefsIn(msg.caption)[0] ?? String(msg.caption).trim();
+    await send(`⏳ กำลังตรวจสลิปกับรายการ ${named} — สักครู่`);
+    const reply = await typingWhile(cfg.botToken, msg.chat.id, startValidation(cfg, chatId, userId, fresh, who));
+    const asksYesNo = typeof reply === 'string' && /“ใช่” หรือ “ไม่”/.test(reply);
+    await send(reply, asksYesNo ? YES_NO : NO_KEYBOARD);
+    return;
+  }
+  // Otherwise ask first whether to validate it as a slip (a new image replaces any open question).
+  // After "ใช่" a TXN printed in the image (if any) answers the "ระบุรายการ" question.
   await send(ASK.confirm, YES_NO);
 }

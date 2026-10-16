@@ -91,6 +91,25 @@ export function create(actor, b) {
   });
 }
 
+export const ratesBodySchema = z.object({ feePercent: z.coerce.number().min(0).max(100), feeFlat: money, outFeePercent: z.coerce.number().min(0).max(100), outFeeFlat: money });
+
+/** แดชบอร์ดร้านค้า: change only a shop's fee rates (new transactions only). Not below its parent's, not above any child's. */
+export function setRates(id, actor, r) {
+  return withTransaction(async (client) => {
+    const m = await lock(client, id);
+    if (m.parent_id) {
+      const { rows } = await client.query('SELECT * FROM merchants WHERE id = $1', [m.parent_id]);
+      checkRatesAgainstParent(rows[0], r, (msg) => new BadRequestError(msg));
+    }
+    await checkRatesAgainstChildren(client, id, r, (msg) => new BadRequestError(msg));
+    await client.query('UPDATE merchants SET fee_percent = $2, fee_flat = $3, out_fee_percent = $4, out_fee_flat = $5 WHERE id = $1', [id, r.feePercent, r.feeFlat, r.outFeePercent, r.outFeeFlat]);
+    const was = `เข้า ${Number(m.fee_percent)}% + ฿${Number(m.fee_flat).toFixed(2)} · ออก ${Number(m.out_fee_percent)}% + ฿${Number(m.out_fee_flat).toFixed(2)}`;
+    const now = `เข้า ${r.feePercent}% + ฿${r.feeFlat.toFixed(2)} · ออก ${r.outFeePercent}% + ฿${r.outFeeFlat.toFixed(2)}`;
+    await audit(client, actor, 'merchant.rates', m.slug, `เปลี่ยนอัตราค่าธรรมเนียม ${m.name}: ${was} → ${now} (มีผลกับรายการใหม่)`);
+    return { rates: r };
+  });
+}
+
 export function update(id, actor, b) {
   return withTransaction(async (client) => {
     const m = await lock(client, id);

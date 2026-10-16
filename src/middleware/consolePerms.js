@@ -25,6 +25,7 @@ const WRITE_RULES = [
   [/^\/p2p(\/|$)/, 'p2p.manage'],
   [/^\/double-credits(\/|$)/, 'payment.double_credit'],
   [/^\/merchants\/[^/]+\/credits$/, 'merchant.credit'],
+  [/^\/merchants\/[^/]+\/rates$/, 'merchant.manage'],
   [/^\/merchants(\/|$)/, 'merchant.manage'],
   [/^\/webhooks\/settings\//, 'merchant.manage'],
   [/^\/webhooks(\/|$)/, 'webhook.retry'],
@@ -44,6 +45,7 @@ const WRITE_RULES = [
 const READ_RULES = [
   [/^\/merchants\/[^/]+\/(api-keys|webhook|portal-users)$/, 'merchant.manage'],
   [/^\/merchants\/[^/]+\/credits$/, 'merchant.view'],
+  [/^\/merchants\/[^/]+\/breakdown\//, 'merchant.view'],
   [/^\/config\/?$/, 'settings.manage'],
 ];
 

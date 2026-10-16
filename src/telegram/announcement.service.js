@@ -114,6 +114,12 @@ const COLS = `id, title, message, mode, times, to_char(on_date, 'YYYY-MM-DD') AS
 const audit = (actor, action, ref, detail) => query(`INSERT INTO audit_logs (actor, action, entity, entity_ref, detail) VALUES ($1, $2, 'setting', $3, $4)`, [actor ?? 'console', action, ref, detail]);
 const present = (a) => ({ ...a, nextRuns: nextSlots({ mode: a.mode, times: a.times, on_day: a.onDate, interval_seconds: a.intervalSeconds, start_at: a.startAt }) });
 
+/** Can scheduled posts go out? (shown on the ประชาสัมพันธ์ page) */
+export async function postingStatus() {
+  const cfg = await configOf('supportBot');
+  return { canPost: !!cfg.botToken, faqEnabled: !!cfg.enabled };
+}
+
 export async function listAnnouncements() {
   const { rows } = await query(`SELECT ${COLS} FROM announcements ORDER BY id`);
   return rows.map(present);
@@ -173,8 +179,9 @@ async function post(a, slotAt, manual) {
 
 /** One scheduler tick: post every enabled announcement whose latest slot is due and not yet posted. */
 export async function runDue(now = Date.now()) {
+  // Posting needs only the bot token: switching off บอทตอบคำถาม (FAQ answers) does not stop ประชาสัมพันธ์.
   const cfg = await configOf('supportBot');
-  if (!cfg.enabled || !cfg.botToken) return;
+  if (!cfg.botToken) return;
   const { rows } = await query(`SELECT *, to_char(on_date, 'YYYY-MM-DD') AS on_day FROM announcements WHERE enabled AND mode <> 'now'`);
   for (const a of rows) {
     const slot = latestSlot(a, now);

@@ -4,6 +4,7 @@ import logger from './logger.js';
 import { closePool, healthCheck } from './db/pool.js';
 import { startScheduler, stopScheduler } from './telegram/announcement.service.js';
 import { startWebhookRetries, stopWebhookRetries } from './webhooks/webhook.service.js';
+import { startSlipRechecks, stopSlipRechecks } from './merchant-api/v1.service.js';
 
 const app = createApp();
 const server = app.listen(config.port, () => {
@@ -23,6 +24,8 @@ try {
 if (config.isProduction) startScheduler();
 // Payout callbacks that failed are re-sent from production only (local dev shares the database).
 if (config.isProduction) startWebhookRetries(logger);
+// Slips the bank was still processing (EasySlip slip_pending) are re-checked from production only.
+if (config.isProduction) startSlipRechecks();
 
 let shuttingDown = false;
 
@@ -32,6 +35,7 @@ async function shutdown(signal) {
   logger.info({ signal }, 'shutting down');
   stopScheduler();
   stopWebhookRetries();
+  stopSlipRechecks();
 
   const force = setTimeout(() => {
     logger.error('graceful shutdown timed out, forcing exit');
