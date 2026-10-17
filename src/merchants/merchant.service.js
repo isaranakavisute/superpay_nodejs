@@ -258,7 +258,7 @@ export function rotateSecret(id, actor) {
 export async function portalUsers(id) {
   const { rows } = await query(
     `SELECT id, username, full_name AS "fullName", tier, status, email, (password_hash IS NOT NULL) AS "canApiLogin", last_login_at AS "lastLoginAt", created_at AS "createdAt"
-       FROM merchant_portal_users WHERE merchant_id = $1 ORDER BY tier, id`,
+       FROM merchant_portal_users WHERE merchant_id = $1 AND NOT super_admin ORDER BY tier, id`,
     [id],
   );
   return rows;

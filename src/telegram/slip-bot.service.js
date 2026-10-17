@@ -1,12 +1,14 @@
 import { timingSafeEqual } from 'node:crypto';
-import { query } from '../db/pool.js';
+import { pool, query } from '../db/pool.js';
 import { internal as configOf } from '../config-admin/config.service.js';
 import logger from '../logger.js';
-import { verifySlip } from '../merchant-api/slip-verify.js';
+import { PENDING_TEXT, verifySlip } from '../merchant-api/slip-verify.js';
+import { ocrCheckSlip } from '../merchant-api/slip-ocr.js';
+import { decideSlip, orderNotPendingText } from '../merchant-api/v1.service.js';
+import { leftOf } from '../merchant-api/slip-transfers.js';
 import { readTxnText } from '../merchant-api/txn-ocr.js';
-import { isSampleSlip, qrReason, slipFingerprint } from '../shared/slip-fingerprint.js';
-import { accountMatches, matchSlip, nameMatches, normalizeSlip } from '../merchant-api/slip-match.js';
-import { carryOverFrom } from '../merchant-api/slip-carry-over.js';
+import { isSampleSlip, qrReason, SAMPLE_SLIP_MESSAGE, slipFingerprint } from '../shared/slip-fingerprint.js';
+import { accountMatches, nameMatches, normalizeSlip } from '../merchant-api/slip-match.js';
 
 /**
  * @OptionPayBot: a user sends an image; the bot first asks whether to validate it as a slip (ใช่ / ไม่) —
@@ -115,17 +117,21 @@ async function orderDetail(paymentId) {
   return lines.filter((x) => x !== null).join('\n');
 }
 
-/** Where this slip was seen before: an Option Pay order, or an earlier valid check by this bot. */
+/**
+ * Without an order (typed answers): where this slip / transfer already paid an Option Pay order — the API's rule
+ * (a slip refused on its order doesn't count unless an admin approved that order anyway). The bot's own earlier
+ * checks are only mentioned (botNote): the API never refuses a slip for having been checked in the bot.
+ */
 async function seenBefore({ transRef, sha256, qr }, excludePaymentId = null, recheck = false) {
   const { rows: onOrder } = await query(
     `SELECT p.id, p.ref, s.uploaded_at FROM payment_slips s JOIN payments p ON p.id = s.payment_id
-      WHERE coalesce(s.verify_result->>'decision', '') <> 'invalid' AND ($4::int IS NULL OR p.id <> $4)
+      WHERE (coalesce(s.verify_result->>'decision', '') <> 'invalid' OR p.status IN ('approved', 'refunded')) AND ($4::int IS NULL OR p.id <> $4)
         AND (($1::text IS NOT NULL AND s.trans_ref = $1) OR s.image_sha256 = $2 OR ($3::text IS NOT NULL AND s.qr_payload = $3))
       ORDER BY s.uploaded_at LIMIT 1`,
     [transRef ?? null, sha256, qr, excludePaymentId],
   );
   if (onOrder[0]) {
-    return { reason: `สลิปนี้ถูกใช้แล้วกับรายการ ${onOrder[0].ref} (เมื่อ ${when(onOrder[0].uploaded_at)})`, detail: await orderDetail(onOrder[0].id) };
+    return { reason: 'สลิปนี้ถูกใช้กับรายการอื่นแล้ว — ใช้ซ้ำไม่ได้', detail: await orderDetail(onOrder[0].id) };
   }
   // Re-checking on request: the bot's own earlier checks of this slip don't make it a duplicate.
   if (recheck) return null;
@@ -135,47 +141,63 @@ async function seenBefore({ transRef, sha256, qr }, excludePaymentId = null, rec
       ORDER BY created_at LIMIT 1`,
     [transRef ?? null, sha256, qr],
   );
-  if (here[0]) {
-    const h = here[0];
-    return {
-      reason: `สลิปนี้เคยส่งตรวจแล้วเมื่อ ${when(h.created_at)} (สลิปซ้ำ)`,
-      detail: [`📄 การตรวจครั้งก่อน`, `เมื่อ: ${when(h.created_at)}`, `ส่งโดย: ${h.from_user ?? '-'}`, h.amount != null ? `ยอด: ${baht(h.amount)}` : null,
-        h.trans_ref ? `เลขอ้างอิงธนาคาร: ${h.trans_ref}` : null, 'ยังไม่ได้ผูกกับรายการใดใน Option Pay'].filter((x) => x !== null).join('\n'),
-    };
-  }
+  if (here[0]) return { botNote: `สลิปนี้เคยส่งตรวจในบอทแล้วเมื่อ ${when(here[0].created_at)}${here[0].from_user ? ` (โดย ${here[0].from_user})` : ''} — ยังไม่ได้ผูกกับรายการใดใน Option Pay` };
   return null;
 }
 
 const baht2 = (n) => `฿${Number(n).toLocaleString('th-TH', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 
-const STATUS_SHORT = { pending: 'ยังเปิดอยู่', expired: 'หมดอายุ', rejected: 'ยกเลิก' };
+/** Runs the API's own decision in a transaction that is always rolled back: the bot reports, it never changes anything. */
+async function dryRun(fn) {
+  const c = await pool.connect();
+  try {
+    await c.query('BEGIN');
+    await c.query("SET LOCAL lock_timeout = '5s'");
+    return await fn(c);
+  } finally {
+    await c.query('ROLLBACK').catch(() => {});
+    c.release();
+  }
+}
 
 /**
- * What the slip must match: an Option Pay order (typed answers are checked one by one in checkAnswer).
- * Same rules as the API: a transfer made before the order was created is still fine when it is the
- * carry-over of the same customer's earlier unpaid order of the shop (see slip-carry-over.js) —
- * e.g. ฿250 transferred for a ฿299 order, then a ฿250 order created and checked with that slip.
- * The bot only reports; it does not cancel or approve anything.
+ * A slip checked against an Option Pay order: EXACTLY what the merchant API would decide if the shop sent this slip
+ * for that order (decideSlip in v1.service.js — amount, transfer time, receiving account, sender, slip age, carry-over,
+ * left-over, slip + left-over, duplicate use, bank still processing, image reading when the bank can't answer), with
+ * the API's own reason and per-check results. Nothing is attached, approved or cancelled.
  */
-async function compare(v, expect) {
-  const { problems, unknown, warnings, early } = matchSlip(v, expect.order);
-  const notes = [...unknown, ...warnings];
-  let left = problems;
-  const carried = early && problems.length === 1 && problems[0] === early ? await carryOverFrom({ query }, expect.order, v) : null;
-  if (carried) {
-    left = [];
-    notes.unshift(`โอนก่อนสร้างรายการนี้ แต่เป็นเงินโอนของรายการก่อนหน้า ${carried.ref}${carried.merchant_order_id ? ` (${carried.merchant_order_id})` : ''} ยอด ${baht2(carried.amount)} `
-      + `ที่ยังไม่ได้ชำระ (${STATUS_SHORT[carried.status] ?? carried.status}) — ลูกค้าคนเดียวกัน บัญชีผู้รับเดียวกัน จึงใช้ชำระรายการนี้ได้`);
+async function checkAgainstOrder(buf, mime, fp, p) {
+  if (!['pending', 'expired'].includes(p.status)) {
+    const { rows } = await query(
+      `SELECT 1 FROM payment_slips WHERE payment_id = $1 AND (image_sha256 = $2 OR ($3::text IS NOT NULL AND qr_payload = $3))`, [p.id, fp.sha256, fp.qr ?? null]);
+    const own = rows[0] && ['approved', 'refunded'].includes(p.status);
+    return { result: 'invalid', reason: orderNotPendingText(p.status), problems: own ? ['สลิปนี้คือสลิปที่ใช้ชำระรายการนี้แล้ว'] : [], detail: await orderDetail(p.id), fp, order: p };
   }
-  return { problems: left, notes, carried, matched: [`ยอด ${baht2(expect.order.amount)}`, `บัญชีปลายทาง ${expect.order.acct_bank} ${expect.order.account_no}`] };
+  const v = await verifySlip(buf, mime);
+  // Same as the API: no answer from the bank → read the image; the bank still processing → "will be re-checked".
+  const ocr = v.verified === null && !v.pending ? await ocrCheckSlip(buf, p, v.cfg) : null;
+  if (v.pending) v.message = PENDING_TEXT;
+  const d = await dryRun((c) => decideSlip(c, p, v, fp, ocr));
+  const usedOn = d.reusedOn && d.reusedOn !== 'อื่น' ? (await query('SELECT id FROM payments WHERE ref = $1', [d.reusedOn])).rows[0] : null;
+  return {
+    result: d.decision === 'approve' ? 'valid' : d.decision === 'invalid' ? 'invalid' : 'review',
+    reason: d.reason, problems: d.mismatches.length > 1 ? d.mismatches : [], decision: d, v, fp, order: p,
+    detail: usedOn ? await orderDetail(usedOn.id) : null,
+  };
 }
 
 /** One typed answer against the bank's reading of the slip → { problem } | { note } | { matched }. */
 function checkAnswer(step, v, value) {
   const slip = normalizeSlip(v.provider, v.raw);
   if (step === 'amount') {
+    // A transfer that already paid part of an order: the API accepts an order its left-over covers.
+    if (v.leftover != null) {
+      return value > v.leftover + 0.009
+        ? { problem: `ยอดคงเหลือของการโอนนี้ ${baht2(v.leftover)} — ไม่พอสำหรับออเดอร์ยอด ${baht2(value)} · สร้างออเดอร์ยอดไม่เกิน ${baht2(v.leftover)} เพื่อใช้ยอดนี้` }
+        : { matched: `ยอด ${baht2(value)} (จากยอดคงเหลือ ${baht2(v.leftover)})` };
+    }
     return Math.abs(Number(v.amount) - value) > 0.009
-      ? { problem: `ยอดเงินในสลิป ${baht2(v.amount)} ไม่ตรงกับยอดที่ระบุ ${baht2(value)}` } : { matched: `ยอด ${baht2(value)}` };
+      ? { problem: `ยอดเงินในสลิป ${baht2(v.amount)} ไม่ตรงกับยอดที่ต้องชำระ ${baht2(value)} — ต้องโอนตรงยอดทุกสตางค์` } : { matched: `ยอด ${baht2(value)}` };
   }
   if (step === 'account') {
     const acct = accountMatches(slip?.receiverAccount, value) ?? accountMatches(slip?.receiverProxy, value);
@@ -190,38 +212,92 @@ function checkAnswer(step, v, value) {
   return ok === null ? { note: `ยืนยัน${label}จากสลิปไม่ได้` } : { matched: `${step === 'name' ? label : 'ผู้โอน'} ${value}` };
 }
 
-/** Verify one slip image (against `expect` when given) → { result, reason, ... }. */
+/** The API's slip-age rule without an order (slipMaxAgeHours = 0: transferred today, Bangkok). */
+function ageProblem(v) {
+  const cfg = v.cfg ?? {};
+  if (!cfg.slipAgeCheck || !v.date) return null;
+  if (cfg.slipMaxAgeHours === 0) {
+    const day = (d) => new Date(d).toLocaleDateString('en-CA', { timeZone: 'Asia/Bangkok' });
+    return day(v.date) === day(Date.now()) ? null : 'สลิปต้องเป็นการโอนวันเดียวกับที่สร้างรายการ';
+  }
+  return Date.now() - new Date(v.date).getTime() > cfg.slipMaxAgeHours * 3_600_000 ? `สลิปเก่าเกิน ${cfg.slipMaxAgeHours} ชั่วโมง — ใช้สลิปเก่าไม่ได้` : null;
+}
+
+/**
+ * Verify one slip image → { result: valid | invalid | review | unverified, reason, ... }.
+ * With an order (`expect.kind === 'order'`): the merchant API's decision (checkAgainstOrder). Without one (typed
+ * answers): the same bank check, slip-age and duplicate / left-over rules, then each typed answer (checkAnswer).
+ */
 export async function checkSlip(buf, mime, expect = null, { recheck = false } = {}) {
   const fp = await fingerprintOf(buf, mime);
-  if (isSampleSlip(fp)) return { result: 'invalid', reason: 'เป็นภาพตัวอย่างสลิปจาก Option Pay ไม่ใช่สลิปจริง', fp };
+  if (isSampleSlip(fp)) return { result: 'invalid', reason: SAMPLE_SLIP_MESSAGE, fp };
+  if (expect?.kind === 'order') return checkAgainstOrder(buf, mime, fp, expect.order);
   const v = await verifySlip(buf, mime);
   // "No QR" from the provider: say what the image actually has (a fake QR, or a QR that isn't a slip's).
   if (v.verified === false) return { result: 'invalid', reason: (/QR/.test(v.message ?? '') && qrReason(fp)) || v.message || 'สลิปไม่ถูกต้อง', fp };
+  if (v.pending) return { result: 'review', reason: PENDING_TEXT, fp };
   if (v.verified !== true) return { result: 'unverified', reason: v.message ?? 'ผู้ให้บริการตรวจสลิปไม่ตอบ', fp };
-  const cmp = expect ? await compare(v, expect) : { problems: [], notes: [], matched: [] };
-  if (cmp.problems.length) return { result: 'invalid', reason: 'ข้อมูลในสลิปไม่ตรงกับที่ต้องชำระ', problems: cmp.problems, fp, v };
-  const dup = await seenBefore({ transRef: v.transRef, sha256: fp.sha256, qr: fp.qr }, expect?.kind === 'order' ? expect.order.id : null, recheck);
-  if (dup) return { result: 'invalid', reason: dup.reason, detail: dup.detail, fp, v };
-  return { result: 'valid', fp, v, matched: cmp.matched, notes: cmp.notes, carried: cmp.carried ?? null, order: expect?.kind === 'order' ? expect.order : null };
+  const notes = [];
+  // Already paid an order: refused like the API — unless part of the money is left (then only up to that amount).
+  const t = v.transRef ? (await query('SELECT * FROM slip_transfers WHERE trans_ref = $1', [v.transRef])).rows[0] : null;
+  const open = t && Number(t.used) > 0 && leftOf(t) > 0.009 && t.leftover_until && new Date(t.leftover_until) > new Date();
+  if (open) {
+    const paid = (await query(`SELECT p.ref, u.amount FROM slip_transfer_uses u JOIN payments p ON p.id = u.payment_id WHERE u.transfer_id = $1 ORDER BY u.id`, [t.id])).rows;
+    v.leftover = leftOf(t);
+    notes.push(`เงินโอนนี้ใช้ชำระ ${paid.map((x) => `${x.ref} ${baht2(x.amount)}`).join(', ')} แล้ว — คงเหลือ ${baht2(v.leftover)} ใช้กับออเดอร์ยอดไม่เกิน ${baht2(v.leftover)} ของลูกค้าคนเดิมได้ถึง ${when(t.leftover_until)}`);
+  } else {
+    const dup = await seenBefore({ transRef: v.transRef, sha256: fp.sha256, qr: fp.qr }, null, recheck);
+    if (dup?.reason) return { result: 'invalid', reason: dup.reason, detail: dup.detail, fp, v };
+    if (dup?.botNote) notes.push(dup.botNote);
+    const age = ageProblem(v);
+    if (age) return { result: 'invalid', reason: age, fp, v };
+  }
+  return { result: 'valid', fp, v, matched: [], notes, carried: null, order: null };
+}
+
+const ICON = { PASS: '✅', FAIL: '❌', WARN: '⚠️', UNKNOWN: '❔', SKIPPED: '➖' };
+
+/** What the bank says the slip is. */
+function slipLines(v) {
+  if (v?.verified !== true) return [];
+  const d = v.raw ?? {};
+  const name = (x) => x?.account?.name?.th || x?.account?.name?.en || x?.displayName || '-';
+  const acct = (x) => x?.account?.bank?.account || x?.account?.value || x?.account?.proxy?.account || '';
+  return [`ยอด ${baht(v.amount)}`,
+    `จาก ${name(d.sender)} ${d.sender?.bank?.short ?? ''} ${acct(d.sender)}`.trim(),
+    `ถึง ${name(d.receiver)} ${d.receiver?.bank?.short ?? ''} ${acct(d.receiver)}`.trim(),
+    v.date ? `เวลาโอน ${when(v.date)}` : null,
+    v.transRef ? `เลขอ้างอิง ${v.transRef}` : null].filter((x) => x !== null);
+}
+
+/** Against an order: the API's verdict, reason and every check, word for word. */
+function decisionReply(r) {
+  const p = r.order;
+  const head = {
+    valid: '✅ valid slip — ผ่านทุกเงื่อนไข: ถ้าร้านส่งสลิปนี้เข้ารายการนี้ ระบบจะอนุมัติอัตโนมัติ',
+    review: '⚠️ ต้องให้ผู้ดูแลตรวจ — ถ้าร้านส่งสลิปนี้เข้ารายการนี้ ระบบจะยังไม่อนุมัติอัตโนมัติ',
+    invalid: '❌ invalid slip — ถ้าร้านส่งสลิปนี้เข้ารายการนี้ ระบบจะไม่อนุมัติ',
+  }[r.result];
+  const d = r.decision;
+  return [head, '',
+    `รายการ ${p.ref}${p.merchant_order_id ? ` (เลขออเดอร์ ${p.merchant_order_id})` : ''} ยอด ${baht(p.amount)}`,
+    ...slipLines(r.v), '',
+    `${r.result === 'valid' ? 'ผล' : 'เหตุผล'}: ${r.reason ?? (r.result === 'valid' ? 'ตรวจสลิปผ่าน' : '-')}`,
+    ...(r.problems ?? []).map((x) => `• ${x}`),
+    d?.checks?.length ? `\nผลการตรวจแต่ละข้อ (เหมือนระบบ):\n${d.checks.map((x) => `${ICON[x.status] ?? '•'} ${x.detail}`).join('\n')}` : null,
+    r.result === 'review' && r.v?.pending ? '\n(ในบอท: ลองส่งตรวจอีกครั้งในอีกสักครู่)' : null,
+    r.detail ? `\n${r.detail}` : null].filter((x) => x !== null).join('\n');
 }
 
 function replyText(r) {
+  if (r.order && (r.decision || r.result === 'invalid')) return decisionReply(r);
   if (r.result === 'valid') {
-    const d = r.v.raw ?? {};
-    const name = (x) => x?.account?.name?.th || x?.account?.name?.en || x?.displayName || '-';
-    const acct = (x) => x?.account?.bank?.account || x?.account?.value || x?.account?.proxy?.account || '';
-    return ['✅ valid slip', '',
-      `ยอด ${baht(r.v.amount)}`,
-      `จาก ${name(d.sender)} ${d.sender?.bank?.short ?? ''} ${acct(d.sender)}`.trim(),
-      `ถึง ${name(d.receiver)} ${d.receiver?.bank?.short ?? ''} ${acct(d.receiver)}`.trim(),
-      r.v.date ? `เวลาโอน ${when(r.v.date)}` : null,
-      r.v.transRef ? `เลขอ้างอิง ${r.v.transRef}` : null,
-      r.order ? `\nตรงกับรายการ ${r.order.ref}${r.order.merchant_order_id ? ` (เลขออเดอร์ ${r.order.merchant_order_id})` : ''}` : null,
+    return ['✅ valid slip', '', ...slipLines(r.v),
       r.matched?.length ? `✔️ ตรงกับที่ระบุ: ${r.matched.join(' · ')}` : null,
-      r.carried ? `🔁 ${r.notes[0]}` : null,
-      r.notes?.length > (r.carried ? 1 : 0) ? `⚠️ ${r.notes.slice(r.carried ? 1 : 0).join(' · ')}` : null].filter((x) => x !== null).join('\n');
+      r.notes?.length ? `⚠️ ${r.notes.join(' · ')}` : null].filter((x) => x !== null).join('\n');
   }
   if (r.result === 'invalid') return `❌ invalid slip\n\nเหตุผล: ${r.reason}${r.problems?.length ? `\n${r.problems.map((x) => `• ${x}`).join('\n')}` : ''}${r.detail ? `\n\n${r.detail}` : ''}`;
+  if (r.result === 'review') return `⚠️ ต้องให้ผู้ดูแลตรวจ\n\nเหตุผล: ${r.reason}`;
   return `⚠️ ตรวจสลิปไม่ได้ในขณะนี้ (ไม่ใช่ว่าสลิปไม่ถูกต้อง)\n\nสาเหตุ: ${r.reason}\nลองส่งใหม่อีกครั้งภายหลัง`;
 }
 
@@ -347,7 +423,7 @@ async function finish(chatId, userId, sess, r, who) {
 async function priorResult(fp) {
   const { rows } = await query(
     `SELECT created_at, from_user, result, reason, reply_text FROM telegram_slip_checks
-      WHERE result IN ('valid', 'invalid') AND (image_sha256 = $1 OR ($2::text IS NOT NULL AND qr_payload = $2))
+      WHERE result IN ('valid', 'invalid', 'review') AND (image_sha256 = $1 OR ($2::text IS NOT NULL AND qr_payload = $2))
       ORDER BY created_at DESC LIMIT 1`,
     [fp.sha256, fp.qr ?? null],
   );
@@ -426,8 +502,8 @@ async function answer(cfg, chatId, userId, sess, text, who) {
         // and every answer below is compared on the spot — the first mismatch ends the questions.
         const r = await runCheck(cfg, sess, null);
         if (r.result !== 'valid') return finish(chatId, userId, sess, r, who);
-        const { provider, raw, amount, transRef, date } = r.v;
-        await saveSession(chatId, userId, { ...sess, step: 'amount', data: { recheck: !!data.recheck, v: { provider, raw, amount, transRef, date }, fp: { sha256: r.fp.sha256, qr: r.fp.qr }, matched: [], notes: [] } });
+        const { provider, raw, amount, transRef, date, leftover } = r.v;
+        await saveSession(chatId, userId, { ...sess, step: 'amount', data: { recheck: !!data.recheck, v: { provider, raw, amount, transRef, date, leftover }, fp: { sha256: r.fp.sha256, qr: r.fp.qr }, matched: [], notes: r.notes ?? [] } });
         return ASK.amount;
       }
       const found = await findOrder(t);

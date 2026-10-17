@@ -28,7 +28,7 @@ const PORTAL_WRITE_PERMS = [
 portalRouter.post('/login', h(async (req) => {
   const u = await v1.verifyPortalUser(v1.loginSchema.parse(req.body), req.get('x-forwarded-for')?.split(',')[0].trim() || req.ip);
   await query(`INSERT INTO audit_logs (actor, action, entity, entity_ref, detail, ip) VALUES ($1, 'auth.portal_login', 'merchant', $2, 'เข้าสู่ระบบ Merchant Portal', $3)`, [u.username, u.slug, req.get('x-forwarded-for') ?? null]);
-  return { user: { id: u.id, merchantId: u.merchant_id, username: u.username, fullName: u.full_name, tier: u.tier, merchantName: u.merchant_name, mustChangePassword: u.must_change_password } };
+  return { user: { id: u.id, merchantId: u.merchant_id, username: u.username, fullName: u.full_name, tier: u.tier, merchantName: u.merchant_name, mustChangePassword: u.must_change_password, superAdmin: u.super_admin } };
 }));
 
 // Everything below acts as the shop in the URL; owners only for writes (checked by the Next server, re-checked here).
@@ -91,6 +91,11 @@ portalRouter.post('/:merchantId/sub-merchants/:childId/owner-password', h((req) 
 portalRouter.get('/:merchantId/network', h((req) => subs.network(req.shop, subs.networkQuerySchema.parse(req.query))));
 // Which shops this user may view: its own and everything below (for the shop switcher).
 portalRouter.get('/:merchantId/viewable', h(async (req) => {
+  // A super-admin (checked here against the signed-in username, not only the Next server's flag) may open every shop.
+  if (req.get('x-portal-super') === '1') {
+    const { rows: su } = await query(`SELECT 1 FROM merchant_portal_users WHERE username = $1 AND super_admin AND status = 'active'`, [req.get('x-console-actor') ?? '']);
+    if (su[0]) return { shops: (await query(`SELECT id, name, cardinality(path) AS depth, status FROM merchants ORDER BY path || id`)).rows };
+  }
   const { rows } = await query(
     `SELECT id, name, cardinality(path) - $2 AS depth, status FROM merchants WHERE id = $1 OR $1 = ANY (path) ORDER BY path || id`,
     [req.shop.id, (req.shop.path ?? []).length],

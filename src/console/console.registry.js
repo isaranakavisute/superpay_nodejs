@@ -183,7 +183,7 @@ export const RESOURCES = {
 
   'portal-users': {
     from: 'merchant_portal_users u JOIN merchants m ON m.id = u.merchant_id',
-    columns: `u.id, u.username, u.full_name AS "fullName", u.tier, u.status, u.merchant_id AS "merchantId", m.name AS "merchantName",
+    columns: `u.id, u.username, u.full_name AS "fullName", u.tier, u.status, u.merchant_id AS "merchantId", m.name AS "merchantName", u.super_admin AS "superAdmin",
       u.last_login_at AS "lastLoginAt", u.created_at AS "createdAt"`,
     order: 'm.name, u.id',
     search: ['u.username', 'u.full_name', 'm.name'],
