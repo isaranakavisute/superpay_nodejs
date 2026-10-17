@@ -6,7 +6,7 @@ import { safePost } from '../shared/safe-fetch.js';
 
 export const ALERT_KINDS = [
   'withdrawal.pending', 'outflow.pending', 'double_credit.detected', 'low_balance',
-  'device.offline', 'channel.error', 'webhook.failed', 'slip.provider_down', 'webhook.delivery',
+  'device.offline', 'channel.error', 'webhook.failed', 'slip.provider_down', 'webhook.delivery', 'midnight.cancel',
 ];
 
 const bot = z.object({

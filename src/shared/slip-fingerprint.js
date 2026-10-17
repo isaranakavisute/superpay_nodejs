@@ -76,7 +76,8 @@ export const SAMPLE_SLIP_MESSAGE = 'นี่คือสลิปตัวอ�
 
 /**
  * The other order this slip is already attached to (oldest first), or null.
- * Slips rejected on their order don't count: the transfer was not applied there.
+ * Slips rejected on their order don't count: the transfer was not applied there — unless an admin approved that
+ * order anyway (its slip still reads "invalid", but the transfer did pay it).
  * Takes per-fingerprint advisory locks so two uploads of one slip can't race.
  */
 export async function findReusedSlip(c, paymentId, { sha256, qr }) {
@@ -84,7 +85,7 @@ export async function findReusedSlip(c, paymentId, { sha256, qr }) {
   const { rows } = await c.query(
     `SELECT p.ref FROM payment_slips s JOIN payments p ON p.id = s.payment_id
       WHERE s.payment_id <> $1 AND (s.image_sha256 = $2 OR (s.qr_payload IS NOT NULL AND s.qr_payload = $3))
-        AND coalesce(s.verify_result->>'decision', '') <> 'invalid'
+        AND (coalesce(s.verify_result->>'decision', '') <> 'invalid' OR p.status IN ('approved', 'refunded'))
       ORDER BY s.uploaded_at LIMIT 1`,
     [paymentId, sha256, qr],
   );

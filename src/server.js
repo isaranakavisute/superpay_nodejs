@@ -5,6 +5,7 @@ import { closePool, healthCheck } from './db/pool.js';
 import { startScheduler, stopScheduler } from './telegram/announcement.service.js';
 import { startWebhookRetries, stopWebhookRetries } from './webhooks/webhook.service.js';
 import { startSlipRechecks, stopSlipRechecks } from './merchant-api/v1.service.js';
+import { startMidnightCancel } from './jobs/midnight-cancel.js';
 
 const app = createApp();
 const server = app.listen(config.port, () => {
@@ -26,6 +27,8 @@ if (config.isProduction) startScheduler();
 if (config.isProduction) startWebhookRetries(logger);
 // Slips the bank was still processing (EasySlip slip_pending) are re-checked from production only.
 if (config.isProduction) startSlipRechecks();
+// Midnight (Bangkok): unfinished payments and payouts created before it are rejected — production only.
+if (config.isProduction) startMidnightCancel(logger);
 
 let shuttingDown = false;
 

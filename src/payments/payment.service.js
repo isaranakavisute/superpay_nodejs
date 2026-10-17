@@ -6,6 +6,7 @@ import { BadRequestError, ConflictError, NotFoundError } from '../errors.js';
 import { findReusedSlip, isSampleSlip, SAMPLE_SLIP_MESSAGE, slipFingerprint } from '../shared/slip-fingerprint.js';
 import { syncPaymentSplits } from '../merchants/tree.js';
 import { amountRule, uniqueAmount } from '../shared/account-links.js';
+import { closeUsedUp, coverShortfall, fillTransRefs, recordUse } from '../merchant-api/slip-transfers.js';
 
 /**
  * Operator actions on payments. Each runs in one transaction: lock the row,
@@ -56,7 +57,8 @@ export const emitPaymentEvent = (client, ref, event) => {
   else void run();
 };
 
-export async function approveOne(client, ref, actor, note) {
+/** `opts.cover`: the left-over a slip check already chose to pay this order's shortfall (see coverShortfall). */
+export async function approveOne(client, ref, actor, note, opts = {}) {
   const p = await lock(client, ref);
   requireStatus(p, ['pending', 'expired'], 'approve');
   await client.query(
@@ -64,6 +66,21 @@ export async function approveOne(client, ref, actor, note) {
     [p.id, actor, note ?? null],
   );
   await audit(client, actor, 'payment.approve', ref, `ยอด ${fmt(p.amount)} บาท`);
+  // Every approval (automatic, admin, bulk) records how much of the slip's bank transfer this order used.
+  const use = await recordUse(client, p.id, actor);
+  if (use?.kind === 'partial') await audit(client, actor, 'payment.transfer_leftover', ref, `เงินโอน ${fmt(use.transfer.amount)} บาท ใช้ ${fmt(use.take)} บาท — คงเหลือ ${fmt(use.transfer.amount - use.transfer.used)} บาท`);
+  if (use?.kind === 'over_used') await audit(client, actor, 'payment.transfer_over_used', ref, `เงินโอนในสลิปถูกใช้ครบแล้ว — อนุมัติเกินยอดที่โอน ${fmt(p.amount)} บาท`);
+  const { rows: who } = await client.query('SELECT id, amount, merchant_id, customer_name, metadata FROM payments WHERE id = $1', [p.id]);
+  const shortfall = await coverShortfall(client, who[0], use, actor, opts.cover ?? null);
+  if (shortfall) {
+    await audit(client, actor, 'payment.leftover', ref, `สลิป ${fmt(use.take)} บาท + ยอดคงเหลือ ${fmt(shortfall.short)} บาท จากการโอน ${fmt(shortfall.cover.amount)} บาท (ชำระ ${shortfall.paid.map((x) => x.ref).join(', ')} แล้ว) = ${fmt(p.amount)} บาท`);
+  }
+  for (const u of [use, shortfall?.use]) {
+    for (const s of await closeUsedUp(client, u, p.id)) {
+      if (s.was === 'pending') emitPaymentEvent(client, s.ref, 'payment.rejected');
+      await audit(client, 'system', 'payment.auto_cancel', s.ref, `ปิดอัตโนมัติ — เงินโอนในสลิปใช้ครบแล้ว (ล่าสุด ${ref})`);
+    }
+  }
   client.afterCommit?.(() => notifyPaymentApproved({ ref, merchantId: p.merchant_id, merchantOrderId: p.merchant_order_id, amount: p.amount, approvedBy: actor }));
   emitPaymentEvent(client, ref, 'payment.approved');
 }
@@ -80,7 +97,10 @@ async function rejectOne(client, ref, actor, reason) {
   emitPaymentEvent(client, ref, 'payment.rejected');
 }
 
-export const approve = (ref, actor, note) => withTransaction((c) => approveOne(c, ref, actor, note));
+export async function approve(ref, actor, note) {
+  await fillTransRefs(query, [ref]);
+  return withTransaction((c) => approveOne(c, ref, actor, note));
+}
 export const reject = (ref, actor, reason) => withTransaction((c) => rejectOne(c, ref, actor, reason));
 
 export function refund(ref, actor, { amount, note }) {
@@ -153,7 +173,8 @@ export function remove(ref, actor) {
 }
 
 /** All-or-nothing: if any ref cannot move, none do. */
-export function bulk(actor, { action, refs, reason }) {
+export async function bulk(actor, { action, refs, reason }) {
+  if (action === 'approve') await fillTransRefs(query, [...new Set(refs)]);
   return withTransaction(async (client) => {
     for (const ref of [...new Set(refs)]) {
       if (action === 'approve') await approveOne(client, ref, actor);

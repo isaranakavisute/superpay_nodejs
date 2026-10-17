@@ -32,7 +32,23 @@ export const RESOURCES = {
       p.amount, p.fee, p.commission, p.currency, p.status, p.reviewed_by AS "reviewedBy", p.created_at AS "createdAt", p.checkout_token AS "checkoutToken", p.source, p.expires_at AS "expiresAt",
       p.merchant_order_id AS "merchantOrderId", p.slip_received_at AS "slipReceivedAt", p.review_note AS "reviewNote",
       p.completed_at AS "completedAt", p.refunded_amount AS "refundedAmount", p.slip_reused_ref AS "slipReusedRef",
-      EXISTS (SELECT 1 FROM payment_slips s WHERE s.payment_id = p.id) AS "hasSlipImage"`,
+      EXISTS (SELECT 1 FROM payment_slips s WHERE s.payment_id = p.id) AS "hasSlipImage",
+      (SELECT s.verify_result->>'amount' FROM payment_slips s WHERE s.payment_id = p.id) AS "slipAmount",
+      (SELECT s.verify_result->>'decision' FROM payment_slips s WHERE s.payment_id = p.id) AS "slipDecision",
+      (SELECT t.amount - t.used FROM payment_slips s JOIN slip_transfers t ON t.trans_ref = coalesce(s.trans_ref, s.verify_result->>'transRef')
+        WHERE s.payment_id = p.id) AS "slipTransferLeft",
+      (SELECT string_agg(px.ref, ', ' ORDER BY u.id) FROM payment_slips s JOIN slip_transfers t ON t.trans_ref = coalesce(s.trans_ref, s.verify_result->>'transRef')
+         JOIN slip_transfer_uses u ON u.transfer_id = t.id JOIN payments px ON px.id = u.payment_id
+        WHERE s.payment_id = p.id AND u.payment_id <> p.id) AS "slipTransferUsedBy",
+      -- The most this customer has left on earlier transfers at this shop (same name, or same full sender account) —
+      -- an admin approval of a short slip takes the difference from it (slip-transfers.js coverShortfall).
+      (SELECT max(t.amount - t.used) FROM slip_transfers t
+         JOIN LATERAL (SELECT px.customer_name, px.metadata FROM slip_transfer_uses u JOIN payments px ON px.id = u.payment_id
+                        WHERE u.transfer_id = t.id ORDER BY u.id LIMIT 1) f ON true
+        WHERE t.merchant_id = p.merchant_id AND t.used > 0 AND t.amount > t.used AND t.leftover_until > now()
+          AND ((length(regexp_replace(f.customer_name, '[[:space:]]', '', 'g')) >= 2 AND f.customer_name <> '-'
+                AND lower(regexp_replace(f.customer_name, '[[:space:]]', '', 'g')) = lower(regexp_replace(p.customer_name, '[[:space:]]', '', 'g')))
+               OR (length(f.metadata->>'senderAccountNumber') >= 8 AND f.metadata->>'senderAccountNumber' = p.metadata->>'senderAccountNumber'))) AS "customerLeftover"`,
     order: 'p.created_at DESC, p.id DESC',
     time: 'p.created_at',
     search: ['p.ref', 'p.customer_name', 'm.name', 'p.merchant_order_id'],
@@ -318,6 +334,31 @@ export const RESOURCES = {
     status: 'x.status',
     amount: 'x.amount',
     filters: { status: 'x.status' },
+  },
+
+  // Bank transfers that paid only part of their amount (an admin approved a bigger slip): what is left, for whom,
+  // and the exact order amount the shop must create to use it. Status: open / expired / used.
+  'transfer-leftovers': {
+    from: `(SELECT t.*, t.amount - t.used AS left_amount,
+               CASE WHEN t.amount - t.used <= 0.009 THEN 'used' WHEN t.leftover_until IS NULL OR t.leftover_until < now() THEN 'expired' ELSE 'open' END AS state
+          FROM slip_transfers t
+         WHERE EXISTS (SELECT 1 FROM slip_transfer_uses u WHERE u.transfer_id = t.id AND u.kind IN ('partial', 'leftover'))) t
+      LEFT JOIN merchants m     ON m.id = t.merchant_id
+      LEFT JOIN bank_accounts a ON a.id = t.bank_account_id
+      LEFT JOIN LATERAL (SELECT p.ref, p.merchant_order_id, p.customer_name FROM slip_transfer_uses u JOIN payments p ON p.id = u.payment_id
+                          WHERE u.transfer_id = t.id ORDER BY u.id LIMIT 1) f ON true`,
+    columns: `t.id, t.trans_ref AS "transRef", t.merchant_id AS "merchantId", m.name AS "merchantName",
+      a.bank_code AS "bankCode", a.account_no AS "accountNo", a.account_name AS "accountName",
+      t.transfer_at AS "transferAt", t.amount, t.used, t.left_amount AS "left", t.leftover_until AS "leftoverUntil", t.state AS status,
+      f.customer_name AS "customerName", f.ref AS "firstRef", f.merchant_order_id AS "firstOrderId", t.note,
+      (SELECT json_agg(json_build_object('ref', p.ref, 'orderId', p.merchant_order_id, 'amount', u.amount, 'kind', u.kind, 'at', u.created_at) ORDER BY u.id)
+         FROM slip_transfer_uses u JOIN payments p ON p.id = u.payment_id WHERE u.transfer_id = t.id) AS "paidOrders"`,
+    order: `CASE t.state WHEN 'open' THEN 0 WHEN 'expired' THEN 1 ELSE 2 END, t.leftover_until ASC NULLS LAST, t.id DESC`,
+    time: 't.transfer_at',
+    search: ['t.trans_ref', 'm.name', 'f.customer_name', 'f.ref', 'f.merchant_order_id'],
+    status: 't.state',
+    amount: 't.left_amount',
+    filters: { status: 't.state', merchantId: 't.merchant_id::text' },
   },
 
   'double-credits': {

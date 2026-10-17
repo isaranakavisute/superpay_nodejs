@@ -1,4 +1,4 @@
-import { hasCustomer, nameMatches, normalizeSlip } from './slip-match.js';
+import { accountMatches, hasCustomer, nameMatches, normalizeSlip } from './slip-match.js';
 
 /**
  * Carry-over: a genuine transfer made for an earlier, unpaid order of the same customer may pay a newer order.
@@ -14,12 +14,21 @@ import { hasCustomer, nameMatches, normalizeSlip } from './slip-match.js';
  *   - the transfer itself is at most WINDOW_HOURS old.
  */
 export const WINDOW_HOURS = 24;
+/** Safety cap on candidates read for one check (a 24 h window on one account is normally far below this). */
+const MAX_CANDIDATES = 5000;
 
 const digits = (s) => String(s ?? '').replace(/\D/g, '');
 
-/** The slip's payer is the earlier order's customer: name match, or the order's payer account digits on the slip. */
-function sameCustomer(slip, order) {
+/**
+ * The slip's payer is the earlier order's customer: name match, or the payer's bank account.
+ * The account is compared with the order's FULL sender account (metadata.senderAccountNumber, sent by the shop)
+ * digit by digit where the bank shows them (557-7-xxx631 ⇄ 5577189631) — needed when the slip shows the name only
+ * in English and the order has it in Thai (16 Oct 2026, TXN173893). At least 4 visible digits must match.
+ */
+export function sameCustomer(slip, order) {
   if (hasCustomer(order.customer_name) && nameMatches(slip?.senderNames ?? [], order.customer_name) === true) return true;
+  const full = digits(order.metadata?.senderAccountNumber);
+  if (full.length >= 8 && digits(slip?.senderAccount).length >= 4 && accountMatches(slip?.senderAccount, full) === true) return true;
   const want = digits(order.payer_account_masked);
   const shown = digits(slip?.senderAccount);
   return want.length >= 4 && shown.length >= 4 && (shown.includes(want) || want.includes(shown));
@@ -32,16 +41,18 @@ export async function carryOverFrom(c, p, v) {
   if (Date.now() - at.getTime() > WINDOW_HOURS * 3_600_000) return null;
   const slip = normalizeSlip(v.provider, v.raw);
   const { rows } = await c.query(
-    `SELECT id, ref, merchant_order_id, amount, status, customer_name, payer_account_masked, created_at, expires_at FROM payments
+    `SELECT id, ref, merchant_order_id, amount, status, customer_name, payer_account_masked, metadata, created_at, expires_at FROM payments
       WHERE merchant_id = $1 AND bank_account_id = $2 AND id <> $3
         AND (status IN ('expired', 'rejected')
              OR (status = 'pending' AND NOT EXISTS (SELECT 1 FROM payment_slips s WHERE s.payment_id = payments.id
                                                      AND coalesce(s.verify_result->>'decision', '') <> 'invalid')))
         AND created_at <= $4::timestamptz + interval '10 minutes'
         AND created_at >= $4::timestamptz - make_interval(hours => $5)
-      ORDER BY created_at DESC LIMIT 20`,
+      ORDER BY created_at DESC LIMIT ${MAX_CANDIDATES}`,
     [p.merchant_id, p.bank_account_id, p.id, at, WINDOW_HOURS],
   );
+  // Match the customer across ALL eligible orders in the window (newest first). Taking only the newest few first
+  // missed real ones on busy shared accounts (16 Oct 2026: the customer's order was #24 of 151, the old limit was 20).
   return rows.find((o) => sameCustomer(slip, o)) ?? null;
 }
 

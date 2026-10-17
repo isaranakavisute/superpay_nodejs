@@ -12,6 +12,7 @@ import { findReusedSlip, isSampleSlip, qrReason, SAMPLE_SLIP_MESSAGE, slipFinger
 import { MERCHANT_PERMISSIONS } from './permission-catalog.js';
 import { matchSlip, normalizeSlip } from './slip-match.js';
 import { cancelSlipSiblings, carryOverFrom } from './slip-carry-over.js';
+import { closeUsedUp, leftOf, leftoverChecks, leftoverFor, lockTransfer, openLeftoverFor, paidBy, useLeftover } from './slip-transfers.js';
 import { outFeeFor } from '../shared/out-fee.js';
 import { accountNumber } from '../shared/account-number.js';
 import { ocrCheckSlip } from './slip-ocr.js';
@@ -259,12 +260,18 @@ export async function createPayment(m, b, { base, source = 'api', unique = true,
     if (generated) b = { ...b, orderId: await newOrderId(c, m.id) };
     const { rows: dup } = await c.query('SELECT ref FROM payments WHERE merchant_id = $1 AND merchant_order_id = $2', [m.id, b.orderId]);
     if (dup[0]) throw new ApiError(409, 'DUPLICATE_ORDER_ID', `orderId ${b.orderId} ถูกใช้แล้ว`, { ref: dup[0].ref });
-    const acct = await pickAccount(c, m, b.bankAccountId);
-    // Unique satang: per setting, and always on a shared account (the amount is what tells its shops' orders apart).
-    const rule = await amountRule(c, acct.id, slip);
-    const amount = unique && rule.unique ? await uniqueAmount(c, acct.id, b.amount, rule.maxSatang, rule.cooldown) : b.amount;
-    const fee = round2((amount * Number(m.fee_percent)) / 100 + Number(m.fee_flat));
     const md = b.metadata ?? {};
+    // The customer still has money left from an earlier transfer (an admin approved a smaller order with it) that covers
+    // this order: it is paid from that left-over at once — no transfer, no slip (see slip-transfers.js). The order goes
+    // on the account the money is in, for its exact amount (no unique satang: nothing will be transferred).
+    const lo = await openLeftoverFor(c, m.id, b.amount, { customer_name: md.memberName || '-', metadata: md });
+    const acct = lo
+      ? (await c.query(`SELECT ${ACCOUNT_COLS} FROM bank_accounts a JOIN banks b ON b.code = a.bank_code WHERE a.id = $1`, [lo.bank_account_id])).rows[0]
+      : await pickAccount(c, m, b.bankAccountId);
+    // Unique satang: per setting, and always on a shared account (the amount is what tells its shops' orders apart).
+    const rule = lo ? null : await amountRule(c, acct.id, slip);
+    const amount = !lo && unique && rule.unique ? await uniqueAmount(c, acct.id, b.amount, rule.maxSatang, rule.cooldown) : b.amount;
+    const fee = round2((amount * Number(m.fee_percent)) / 100 + Number(m.fee_flat));
     const { rows: bank } = md.senderBankCode ? await c.query('SELECT code FROM banks WHERE code = $1', [md.senderBankCode]) : { rows: [] };
     await c.query('LOCK TABLE payments IN SHARE ROW EXCLUSIVE MODE');
     const { rows: last } = await c.query(`SELECT coalesce(max(substring(ref from 4)::bigint), 172800) AS n FROM payments WHERE ref ~ '^TXN[0-9]+$'`);
@@ -281,7 +288,23 @@ export async function createPayment(m, b, { base, source = 'api', unique = true,
     );
     await syncPaymentSplits(c, rows[0].id);
     await audit(c, m, 'payment.create', 'payment', ref, `สร้างออเดอร์ผ่าน ${source === 'portal' ? 'Merchant Portal' : 'API'} ยอด ${fmt(amount)} บาท (${b.orderId})`, actor);
-    return { success: true, orderIdGenerated: generated, transaction: present({ ...rows[0], promptpay_id: acct.promptpay_id }, base), selectedAccount: presentAccount(acct) };
+    if (!lo) return { success: true, orderIdGenerated: generated, transaction: present({ ...rows[0], promptpay_id: acct.promptpay_id }, base), selectedAccount: presentAccount(acct) };
+    const paid = await paidBy(c, lo.id);
+    const use = await useLeftover(c, lo, rows[0].id, amount, actorOf(m));
+    const note = `ชำระจากยอดคงเหลือของการโอน ${fmt(lo.amount)} บาท (ชำระ ${paid.map((x) => `${x.ref} ${fmt(x.amount)} บาท`).join(', ')} แล้ว) — ไม่ต้องโอน/ส่งสลิป · คงเหลืออีก ${fmt(Number(use.transfer.amount) - Number(use.transfer.used))} บาท`;
+    await approveOne(c, ref, 'system', note);
+    for (const s of await closeUsedUp(c, use, rows[0].id)) {
+      if (s.was === 'pending') emitPaymentEvent(c, s.ref, 'payment.rejected');
+      await audit(c, m, 'payment.auto_cancel', 'payment', s.ref, `ปิดอัตโนมัติ — เงินโอนใช้ครบแล้ว (ล่าสุด ${ref})`);
+    }
+    await audit(c, m, 'payment.leftover', 'payment', ref, note);
+    const { rows: now } = await c.query(`${PAY_SELECT} WHERE p.id = $1`, [rows[0].id]);
+    return {
+      success: true, orderIdGenerated: generated, transaction: present(now[0], base), selectedAccount: presentAccount(acct),
+      result: 'PAID', message: `ออเดอร์ชำระแล้ว (อนุมัติอัตโนมัติ) — ${note}`,
+      leftover: { transferAmount: Number(lo.amount), leftBefore: leftOf(lo), leftAfter: round2(Number(use.transfer.amount) - Number(use.transfer.used)),
+        paidOrders: paid.map((x) => ({ id: x.ref, orderId: x.orderId ?? null, amount: x.amount })) },
+    };
   });
 }
 
@@ -289,7 +312,7 @@ export async function createPayment(m, b, { base, source = 'api', unique = true,
  * The checks returned to the caller, in order: bank verification, the order match (amount, transfer time,
  * receiving account, sender), slip age and duplicate use — each PASS / FAIL / WARN / UNKNOWN / SKIPPED with a reason.
  */
-export function buildChecks(v, ocr, matchChecks, { carried, ageOk, maxAge, reusedOn, requireApproval, decision }) {
+export function buildChecks(v, ocr, matchChecks, { carried, leftover = null, ageOk, maxAge, reusedOn, requireApproval, decision }) {
   const out = [];
   if (v.verified === true) out.push({ check: 'BANK_VERIFICATION', status: 'PASS', detail: `ธนาคารยืนยันว่ามีการโอนจริง (${v.provider})${v.transRef ? ` · เลขอ้างอิง ${v.transRef}` : ''}` });
   else if (v.verified === false) out.push({ check: 'BANK_VERIFICATION', status: 'FAIL', detail: v.message ?? 'ธนาคารไม่พบรายการโอนนี้ / สลิปไม่ถูกต้อง' });
@@ -304,9 +327,10 @@ export function buildChecks(v, ocr, matchChecks, { carried, ageOk, maxAge, reuse
     for (const t of ocr.flags ?? []) out.push({ check: 'IMAGE_READ', status: 'UNKNOWN', detail: t });
     if (ocr.matched?.length) out.push({ check: 'IMAGE_READ', status: 'PASS', detail: `อ่านจากภาพ ตรงกับออเดอร์: ${ocr.matched.join(', ')}` });
   }
-  if (v.verified === true) out.push(ageOk ? { check: 'SLIP_AGE', status: 'PASS', detail: carried ? 'อยู่ในช่วง 24 ชั่วโมงของเงินโอนจากออเดอร์ก่อนหน้า' : `ไม่เก่าเกิน ${maxAge ?? '-'} ชั่วโมง` }
+  if (v.verified === true) out.push(ageOk ? { check: 'SLIP_AGE', status: 'PASS', detail: carried ? 'อยู่ในช่วง 24 ชั่วโมงของเงินโอนจากออเดอร์ก่อนหน้า' : leftover ? 'ยอดคงเหลือยังอยู่ในเวลาที่ใช้ได้' : `ไม่เก่าเกิน ${maxAge ?? '-'} ชั่วโมง` }
     : { check: 'SLIP_AGE', status: 'FAIL', detail: `สลิปเก่าเกิน ${maxAge} ชั่วโมง` });
   out.push(reusedOn ? { check: 'DUPLICATE', status: 'FAIL', detail: 'สลิป / เงินโอนนี้ถูกใช้ชำระรายการอื่นแล้ว — ใช้ซ้ำไม่ได้' }
+    : leftover ? { check: 'DUPLICATE', status: 'PASS', detail: `เงินโอนนี้ใช้ชำระ ${leftover.paid.map((x) => x.ref).join(', ')} ไปบางส่วน — ออเดอร์นี้ใช้ยอดคงเหลือ (เหลืออีก ${fmt(leftover.after)} บาท)` }
     : { check: 'DUPLICATE', status: 'PASS', detail: 'สลิปและเงินโอนนี้ยังไม่เคยใช้ชำระรายการอื่น' });
   if (requireApproval && decision === 'review') out.push({ check: 'APPROVAL', status: 'UNKNOWN', detail: 'ตั้งค่าให้เจ้าหน้าที่ยืนยันทุกสลิปก่อนอนุมัติ' });
   return out;
@@ -336,8 +360,11 @@ export function nextStepFor(decision, { carryOver, autoCancelled }) {
 
 const thTime = (d) => new Date(d).toLocaleString('th-TH', { timeZone: 'Asia/Bangkok', dateStyle: 'medium', timeStyle: 'short' });
 /** The approved slip's message: plain, or explaining a carry-over and the orders closed with it. */
-export function approvedMessage(carryOver, autoCancelled, warn) {
+export function approvedMessage(carryOver, autoCancelled, warn, leftover = null) {
   const parts = ['ตรวจสลิปผ่าน — ออเดอร์ชำระแล้ว (อนุมัติอัตโนมัติ)'];
+  if (leftover) {
+    parts.push(`ใช้ยอดคงเหลือ ${fmt(leftover.left)} บาท ของการโอน ${fmt(leftover.transferAmount)} บาท (ชำระ ${leftover.paid.map((x) => `${x.ref} ${fmt(x.amount)} บาท`).join(', ')} แล้ว) — คงเหลืออีก ${fmt(leftover.after)} บาท · ลูกค้าคนเดียวกัน บัญชีผู้รับเดียวกัน`);
+  }
   if (carryOver) {
     parts.push(`ใช้เงินโอน ${fmt(carryOver.transferAmount)} บาท (โอนเมื่อ ${thTime(carryOver.transferredAt)}) จากออเดอร์ก่อนหน้า ${carryOver.fromRef}${carryOver.fromOrderId ? ` (${carryOver.fromOrderId})` : ''} ยอด ${fmt(carryOver.fromAmount)} บาท ที่ยังไม่ได้ชำระ — ลูกค้าคนเดียวกัน บัญชีผู้รับเดียวกัน`);
   }
@@ -416,6 +443,9 @@ async function attachAndVerify(m, p, { image, mime }, base, { once = false, rech
     let checks = [];      // each check and its outcome, returned to the caller
     let ageOkFinal = true;
     let paidRequested = false; // slip pays the shop's amount without the added satang
+    let leftover = null;  // this order is paid from what is left of a transfer that already paid another order
+    let leftoverHint = null; // the transfer is used, but a new order of its left-over amount could use it
+    let combined = null;  // the slip is short of the order and the customer's left-over pays the difference
     if (v.verified === false) {
       decision = 'invalid';
       if (/QR/.test(reason ?? '') && qrReason(fp)) reason = qrReason(fp);
@@ -433,13 +463,44 @@ async function attachAndVerify(m, p, { image, mime }, base, { once = false, rech
       const { unknown } = m2;
       let { problems } = m2;
       warnings = m2.warnings;
+      // A transfer that already paid (part of) an order: only its exact left-over may pay this one — see slip-transfers.js.
+      const t = await lockTransfer(c, v.transRef);
+      const lo = leftoverFor(t, p, normalizeSlip(v.provider, v.raw));
+      if (lo?.ok) {
+        leftover = { ...lo, transferAmount: Number(t.amount), paid: await paidBy(c, t.id) };
+        // The left-over covers the order: the rest of the match (receiver, sender) as if the slip were for this amount;
+        // the transfer predates this order by design.
+        const m3 = matchSlip({ ...v, amount: Number(p.amount) }, p);
+        problems = m3.problems.filter((x) => x !== m3.early);
+        checks = leftoverChecks(m3.checks, leftover, v);
+        warnings = m3.warnings;
+        paidRequested = false;
+      } else if (lo) {
+        reusedOn = reusedOn ?? (await paidBy(c, t.id))[0]?.ref ?? 'อื่น';
+        leftoverHint = lo.hint ?? null;
+      } else if (!t && Number(v.amount) < Number(p.amount) - 0.009) {
+        // A new transfer SHORT of the order: the same customer's open left-over may pay the difference
+        // (฿300 slip + ฿200 left-over = ฿500). The rest of the match as if the slip were for the full amount.
+        const short = round2(Number(p.amount) - Number(v.amount));
+        const cover = await openLeftoverFor(c, p.merchant_id, short, p, normalizeSlip(v.provider, v.raw));
+        if (cover) {
+          combined = { cover, short, slipAmount: Number(v.amount), leftBefore: leftOf(cover), paid: await paidBy(c, cover.id) };
+          const m3 = matchSlip({ ...v, amount: Number(p.amount) }, p);
+          problems = m3.problems;
+          warnings = m3.warnings;
+          paidRequested = false;
+          checks = m3.checks.map((x) => (x.check === 'AMOUNT'
+            ? { ...x, status: 'PASS', detail: `ยอดในสลิป ${fmt(v.amount)} บาท + ยอดคงเหลือของลูกค้า ${fmt(short)} บาท (จากการโอน ${fmt(cover.amount)} บาท ที่ชำระ ${combined.paid.map((y) => y.ref).join(', ')} แล้ว) = ${fmt(p.amount)} บาท ตรงกับยอดออเดอร์` }
+            : x));
+        }
+      }
       // Transfer made before this order: accepted only as a carry-over from the same customer's earlier unpaid
       // order (and then the 24-hour carry-over window replaces the slip-age setting).
-      if (m2.early && problems.length === 1 && (carried = await carryOverFrom(c, p, v))) problems = [];
-      if (!ageOk && !carried) problems.push(v.cfg.slipMaxAgeHours === 0 ? 'สลิปต้องเป็นการโอนวันเดียวกับที่สร้างรายการ' : `สลิปเก่าเกิน ${v.cfg.slipMaxAgeHours} ชั่วโมง — ใช้สลิปเก่าไม่ได้`);
+      if (!leftover && !combined && m2.early && problems.length === 1 && (carried = await carryOverFrom(c, p, v))) problems = [];
+      if (!ageOk && !carried && !leftover) problems.push(v.cfg.slipMaxAgeHours === 0 ? 'สลิปต้องเป็นการโอนวันเดียวกับที่สร้างรายการ' : `สลิปเก่าเกิน ${v.cfg.slipMaxAgeHours} ชั่วโมง — ใช้สลิปเก่าไม่ได้`);
       if (problems.length) { decision = 'invalid'; mismatches = problems; reason = problems.join(' · '); }
       else {
-        if (v.transRef) {
+        if (v.transRef && !leftover) {
           const { rows } = await c.query('SELECT p.ref FROM payment_slips s JOIN payments p ON p.id = s.payment_id WHERE s.trans_ref = $1 AND s.payment_id <> $2', [v.transRef, p.id]);
           if (rows[0]) reusedOn ??= rows[0].ref;
         }
@@ -452,7 +513,15 @@ async function attachAndVerify(m, p, { image, mime }, base, { once = false, rech
           const note = `ใช้เงินโอนจากออเดอร์ก่อนหน้า ${carried.ref} (${was}) — โอน ${new Date(v.date).toLocaleString('th-TH', { timeZone: 'Asia/Bangkok', dateStyle: 'medium', timeStyle: 'short' })}`;
           reason = decision === 'approve' ? note : `${reason} · ${note}`;
         }
-        if (warnings.length) reason = decision === 'approve' ? `${carried ? reason : 'ตรวจสลิปผ่าน'} · ⚠️ ${warnings.join(' · ')}` : `${reason} · ⚠️ ${warnings.join(' · ')}`;
+        if (combined) {
+          const note = `โอน ${fmt(combined.slipAmount)} บาท + ใช้ยอดคงเหลือ ${fmt(combined.short)} บาท จากการโอน ${fmt(combined.cover.amount)} บาท (ชำระ ${combined.paid.map((x) => `${x.ref} ${fmt(x.amount)} บาท`).join(', ')} แล้ว) = ${fmt(p.amount)} บาท · ยอดคงเหลือเหลืออีก ${fmt(combined.leftBefore - combined.short)} บาท`;
+          reason = decision === 'approve' ? note : `${reason} · ${note}`;
+        }
+        if (leftover) {
+          const note = `ใช้ยอดคงเหลือของการโอน ${fmt(leftover.transferAmount)} บาท (ชำระ ${leftover.paid.map((x) => `${x.ref} ${fmt(x.amount)} บาท`).join(', ')} แล้ว) — ออเดอร์นี้ ${fmt(p.amount)} บาท คงเหลืออีก ${fmt(leftover.after)} บาท`;
+          reason = decision === 'approve' ? note : `${reason} · ${note}`;
+        }
+        if (warnings.length) reason = decision === 'approve' ? `${carried || leftover || combined ? reason : 'ตรวจสลิปผ่าน'} · ⚠️ ${warnings.join(' · ')}` : `${reason} · ⚠️ ${warnings.join(' · ')}`;
       }
     } else if (ocr) {
       // Pixels can be edited: numbers that clearly differ reject; a match still needs the admin.
@@ -460,15 +529,17 @@ async function attachAndVerify(m, p, { image, mime }, base, { once = false, rech
       else reason = [ocr.matched.length ? `ตรงกับรายการ: ${ocr.matched.join(', ')}` : null, ...ocr.flags].filter(Boolean).join(' · ') + ' — อ่านจากภาพสลิป รอผู้ดูแลยืนยัน';
     }
     // The other order's ref is kept for the admin (it may belong to another shop), not shown to the uploader.
-    if (reusedOn) { decision = 'invalid'; reason = 'สลิปนี้ถูกใช้กับรายการอื่นแล้ว — ใช้ซ้ำไม่ได้'; mismatches = [reason]; }
-    checks = buildChecks(v, ocr, checks, { carried, ageOk: ageOkFinal || !!carried, maxAge: v.cfg?.slipMaxAgeHours, reusedOn, requireApproval: v.cfg?.requireApproval, decision });
+    // A different photo / the same image of a transfer paying this order from its left-over is not a reuse.
+    if (leftover) reusedOn = null;
+    if (reusedOn) { decision = 'invalid'; reason = `สลิปนี้ถูกใช้กับรายการอื่นแล้ว — ใช้ซ้ำไม่ได้${leftoverHint ? ` · ${leftoverHint}` : ''}`; mismatches = [reason]; }
+    checks = buildChecks(v, ocr, checks, { carried, leftover, ageOk: ageOkFinal || !!carried || !!leftover, maxAge: v.cfg?.slipMaxAgeHours, reusedOn, requireApproval: v.cfg?.requireApproval, decision });
     await c.query(
       `INSERT INTO payment_slips (payment_id, mime, data, uploaded_by, provider, trans_ref, verify_result, image_sha256, qr_payload) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        ON CONFLICT (payment_id) DO UPDATE SET mime = EXCLUDED.mime, data = EXCLUDED.data, uploaded_by = EXCLUDED.uploaded_by, uploaded_at = now(),
          provider = EXCLUDED.provider, trans_ref = EXCLUDED.trans_ref, verify_result = EXCLUDED.verify_result,
          image_sha256 = EXCLUDED.image_sha256, qr_payload = EXCLUDED.qr_payload`,
-      [p.id, mime, buf, actorOf(m), via, decision === 'approve' || decision === 'review' ? v.transRef ?? null : null,
-        JSON.stringify({ verified: v.verified, amount: v.amount ?? null, date: v.date ?? null, message: reason, decision, mismatches, warnings, ocr, carriedFrom: carried && !reusedOn ? carried.ref : null }), fp.sha256, fp.qr],
+      [p.id, mime, buf, actorOf(m), via, (decision === 'approve' || decision === 'review') && !leftover ? v.transRef ?? null : null,
+        JSON.stringify({ verified: v.verified, amount: v.amount ?? null, date: v.date ?? null, transRef: v.transRef ?? null, message: reason, decision, mismatches, warnings, ocr, carriedFrom: carried && !reusedOn ? carried.ref : null, leftoverOf: leftover ? leftover.paid.map((x) => x.ref) : null, coverTransferId: combined && decision !== 'invalid' ? combined.cover.id : null }), fp.sha256, fp.qr],
     );
     await c.query('UPDATE payments SET slip_received_at = now(), review_note = coalesce($2, review_note), slip_reused_ref = $3 WHERE id = $1', [p.id, reason, reusedOn]);
     // Still being processed by the bank: schedule the next background check (none once the slip has an answer).
@@ -482,7 +553,11 @@ async function attachAndVerify(m, p, { image, mime }, base, { once = false, rech
       const { rowCount } = close
         ? await c.query(`UPDATE payments SET status = 'rejected', completed_at = now(), reviewed_by = 'system', review_note = $2 WHERE id = $1 AND status = 'pending'`,
           [carried.id, `ยกเลิกอัตโนมัติ — ลูกค้าชำระผ่าน ${p.ref} แทน (เงินโอนของออเดอร์นี้ใช้ชำระ ${p.ref} แล้ว)`])
-        : await c.query(`UPDATE payments SET review_note = $2 WHERE id = $1`, [carried.id, `เงินโอนของออเดอร์นี้ใช้ชำระ ${p.ref} แล้ว`]);
+        : decision === 'approve' && carried.status === 'expired'
+          // Already expired: close it too, so it leaves รอตรวจสอบ (it has a slip) — no callback, the shop saw it expire.
+          ? await c.query(`UPDATE payments SET status = 'rejected', completed_at = now(), reviewed_by = 'system', review_note = $2 WHERE id = $1 AND status = 'expired'`,
+            [carried.id, `ปิดรายการ — เงินโอนของออเดอร์นี้ใช้ชำระ ${p.ref} แล้ว (carry-over) · ไม่มีการเติมเงินจากออเดอร์นี้`]).then(() => ({ rowCount: 0 }))
+          : await c.query(`UPDATE payments SET review_note = $2 WHERE id = $1`, [carried.id, `เงินโอนของออเดอร์นี้ใช้ชำระ ${p.ref} แล้ว`]);
       if (close && rowCount) emitPaymentEvent(c, carried.ref, 'payment.rejected');
       carryOver = {
         fromRef: carried.ref, fromOrderId: carried.merchant_order_id ?? null, fromAmount: Number(carried.amount),
@@ -496,7 +571,10 @@ async function attachAndVerify(m, p, { image, mime }, base, { once = false, rech
     }
     // Unique satang were added but the customer paid the amount the shop asked for (bank-verified): the order is for that.
     if (decision === 'approve' && paidRequested) await setAmountByRef(c, p.ref, Number(v.amount), 'system', 'ลูกค้าโอนตามยอดที่ร้านสั่ง (ไม่รวมสตางค์ที่ระบบเติม) — ธนาคารยืนยันแล้ว');
-    if (decision === 'approve') await approveOne(c, p.ref, 'system', carried && !reusedOn ? `ตรวจสลิปผ่าน ${v.provider} · ${reason}` : `ตรวจสลิปผ่าน ${v.provider}${warn}`);
+    if (decision === 'approve') {
+      await approveOne(c, p.ref, 'system', (carried && !reusedOn) || leftover || combined ? `ตรวจสลิปผ่าน ${v.provider} · ${reason}` : `ตรวจสลิปผ่าน ${v.provider}${warn}`,
+        { cover: combined?.cover ?? null });
+    }
     // The same slip refused earlier on another still-open order of this shop: that order is closed now.
     if (decision === 'approve') {
       for (const s of await cancelSlipSiblings(c, p, fp)) {
@@ -512,11 +590,18 @@ async function attachAndVerify(m, p, { image, mime }, base, { once = false, rech
       success: decision !== 'invalid',
       verified: decision === 'approve',
       result: decision === 'approve' ? 'PAID' : decision === 'invalid' ? 'INVALID_SLIP' : 'PENDING_REVIEW',
-      message: decision === 'approve' ? approvedMessage(carryOver, autoCancelled, warn) : reason,
+      message: decision === 'approve' ? approvedMessage(carryOver, autoCancelled, warn, leftover) + (combined ? ` · ${reason}` : '') : reason,
       mismatches,
       warnings,
       carriedFrom: carried && !reusedOn && decision !== 'invalid' ? carried.ref : null,
       carryOver,
+      leftover: leftover && decision !== 'invalid'
+        ? { transferAmount: leftover.transferAmount, leftBefore: leftover.left, leftAfter: leftover.after, paidOrders: leftover.paid.map((x) => ({ id: x.ref, orderId: x.orderId ?? null, amount: x.amount })) }
+        : combined && decision !== 'invalid'
+          ? { combined: true, slipAmount: combined.slipAmount, fromLeftover: combined.short, transferAmount: Number(combined.cover.amount),
+            leftBefore: combined.leftBefore, leftAfter: round2(combined.leftBefore - combined.short),
+            paidOrders: combined.paid.map((x) => ({ id: x.ref, orderId: x.orderId ?? null, amount: x.amount })) }
+          : null,
       autoCancelled,
       checks,
       slip: slipDetails(v),
@@ -531,7 +616,8 @@ async function attachAndVerify(m, p, { image, mime }, base, { once = false, rech
 
 export async function createSlipPayment(m, b, { base }) {
   const created = await createPayment(m, b, { base, source: 'slip', unique: false });
-  if (!b.image) return created;
+  // Already paid from the customer's left-over: no slip to check.
+  if (!b.image || created.result === 'PAID') return created;
   const p = await payByToken({ query }, m, created.transaction.id);
   return attachAndVerify(m, p, { image: b.image, mime: b.mime ?? 'image/jpeg' }, base);
 }

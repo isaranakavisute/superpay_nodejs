@@ -15,6 +15,7 @@ import outflowsAdminRouter from './routes/outflows-admin.routes.js';
 import withdrawalsAdminRouter from './routes/withdrawals-admin.routes.js';
 import p2pAdminRouter from './routes/p2p-admin.routes.js';
 import doubleCreditsAdminRouter from './routes/double-credits-admin.routes.js';
+import transferLeftoversAdminRouter from './routes/transfer-leftovers-admin.routes.js';
 import merchantsAdminRouter from './routes/merchants-admin.routes.js';
 import webhooksAdminRouter from './routes/webhooks-admin.routes.js';
 import channelsAdminRouter from './routes/channels-admin.routes.js';
@@ -109,6 +110,7 @@ export function createApp() {
   app.use('/api/console/withdrawals', requireConsoleKey, withdrawalsAdminRouter);
   app.use('/api/console/p2p', requireConsoleKey, p2pAdminRouter);
   app.use('/api/console/double-credits', requireConsoleKey, doubleCreditsAdminRouter);
+  app.use('/api/console/transfer-leftovers', requireConsoleKey, transferLeftoversAdminRouter);
   app.use('/api/console/merchants', requireConsoleKey, merchantsAdminRouter);
   app.use('/api/console/webhooks', requireConsoleKey, webhooksAdminRouter);
   app.use('/api/console/channels', requireConsoleKey, channelsAdminRouter);

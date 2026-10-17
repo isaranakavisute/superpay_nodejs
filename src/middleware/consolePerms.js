@@ -24,6 +24,7 @@ const WRITE_RULES = [
   [/^\/withdrawals(\/|$)/, 'withdrawal.approve'],
   [/^\/p2p(\/|$)/, 'p2p.manage'],
   [/^\/double-credits(\/|$)/, 'payment.double_credit'],
+  [/^\/transfer-leftovers(\/|$)/, 'payment.approve'],
   [/^\/merchants\/[^/]+\/credits$/, 'merchant.credit'],
   [/^\/merchants\/[^/]+\/rates$/, 'merchant.manage'],
   [/^\/merchants(\/|$)/, 'merchant.manage'],
