@@ -229,3 +229,15 @@ describe('slip short of the order: the customer left-over pays the difference', 
     assert.equal(await coverShortfall(db.c, order, { kind: 'over_used', take: 0 }, 'admin', { ...db.transfers[0] }), null);
   });
 });
+
+describe('สถานะ: the one decisive reason first', async () => {
+  const { byWeight } = await import('../src/merchant-api/v1.service.js');
+  it('wrong account beats transfer time and amount', () => {
+    const r = byWeight(['สลิปทำรายการเมื่อ 14:10 ก่อนสร้างรายการนี้ — ใช้สลิปเก่าไม่ได้', 'ยอดเงินในสลิป ฿1,700.00 ไม่ตรงกับยอดที่ต้องชำระ ฿1,400.00', 'โอนเข้าธนาคาร SCB แต่รายการนี้ต้องโอนเข้า KTB 0170809536']);
+    assert.match(r[0], /^โอนเข้าธนาคาร SCB/);
+    assert.match(r[1], /^ยอดเงินในสลิป/);
+  });
+  it('wrong amount beats an old slip', () => {
+    assert.match(byWeight(['สลิปเก่าเกิน 6 ชั่วโมง — ใช้สลิปเก่าไม่ได้', 'ยอดเงินในสลิป ฿500.00 ไม่ตรงกับยอดที่ต้องชำระ ฿1,000.00'])[0], /^ยอดเงิน/);
+  });
+});

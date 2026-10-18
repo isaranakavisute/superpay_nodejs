@@ -416,6 +416,16 @@ const RECHECK_AFTER_MIN = [1, 2, 3];
  * Returns { decision: 'approve' | 'review' | 'invalid', reason, mismatches, warnings, checks, carried, leftover,
  * combined, reusedOn, paidRequested }. Nothing is written.
  */
+/**
+ * Problems in the order of how decisively they block a slip (agreed 17 Oct 2026: the สถานะ column shows only the
+ * first): the money went to another account › wrong amount › transferred before the order › slip too old › the rest.
+ */
+const WEIGHT = [/โอนเข้าธนาคาร|บัญชีผู้รับ|ชื่อผู้รับ|ต้องโอนเข้า/, /ยอดเงิน|ยอดคงเหลือ|ยอด /, /ก่อนสร้างรายการ|ก่อนสร้างออเดอร์/, /สลิปเก่า|วันเดียวกับ/];
+export function byWeight(problems) {
+  const rank = (t) => { const i = WEIGHT.findIndex((re) => re.test(t)); return i < 0 ? WEIGHT.length : i; };
+  return [...problems].sort((a, b) => rank(a) - rank(b));
+}
+
 export async function decideSlip(c, p, v, fp, ocr) {
   // One transfer pays one order: the same slip (file or bank QR) already on another order is refused.
   let reusedOn = await findReusedSlip(c, p.id, fp);
@@ -481,8 +491,14 @@ export async function decideSlip(c, p, v, fp, ocr) {
     // Transfer made before this order: accepted only as a carry-over from the same customer's earlier unpaid
     // order (and then the 24-hour carry-over window replaces the slip-age setting).
     if (!leftover && !combined && m2.early && problems.length === 1 && (carried = await carryOverFrom(c, p, v))) problems = [];
+    // "Transferred before this order" is not the real reason when the same customer had an earlier unpaid order the
+    // transfer was for (a carry-over case): what actually blocks it (e.g. paid into the shop's other account) is
+    // the only reason shown (agreed 17 Oct 2026).
+    else if (!leftover && !combined && m2.early && problems.length > 1 && problems.includes(m2.early)
+      && (await carryOverFrom(c, p, v, { anyAccount: true }))) problems = problems.filter((x) => x !== m2.early);
     if (!ageOk && !carried && !leftover) problems.push(v.cfg.slipMaxAgeHours === 0 ? 'สลิปต้องเป็นการโอนวันเดียวกับที่สร้างรายการ' : `สลิปเก่าเกิน ${v.cfg.slipMaxAgeHours} ชั่วโมง — ใช้สลิปเก่าไม่ได้`);
-    if (problems.length) { decision = 'invalid'; mismatches = problems; reason = problems.join(' · '); }
+    // สถานะ is straight to the point: the one reason that really blocks the slip; every problem stays in mismatches / checks.
+    if (problems.length) { decision = 'invalid'; mismatches = byWeight(problems); reason = mismatches[0]; }
     else {
       if (v.transRef && !leftover) {
         const { rows } = await c.query('SELECT p.ref FROM payment_slips s JOIN payments p ON p.id = s.payment_id WHERE s.trans_ref = $1 AND s.payment_id <> $2', [v.transRef, p.id]);
@@ -505,11 +521,11 @@ export async function decideSlip(c, p, v, fp, ocr) {
         const note = `ใช้ยอดคงเหลือของการโอน ${fmt(leftover.transferAmount)} บาท (ชำระ ${leftover.paid.map((x) => `${x.ref} ${fmt(x.amount)} บาท`).join(', ')} แล้ว) — ออเดอร์นี้ ${fmt(p.amount)} บาท คงเหลืออีก ${fmt(leftover.after)} บาท`;
         reason = decision === 'approve' ? note : `${reason} · ${note}`;
       }
-      if (warnings.length) reason = decision === 'approve' ? `${carried || leftover || combined ? reason : 'ตรวจสลิปผ่าน'} · ⚠️ ${warnings.join(' · ')}` : `${reason} · ⚠️ ${warnings.join(' · ')}`;
+      if (warnings.length) reason = decision === 'approve' ? `${carried || leftover || combined ? reason : 'ตรวจสลิปผ่าน'} · ⚠️ ${warnings.join(' · ')}` : reason;   // waiting for an admin: the main reason only (warnings are in checks)
     }
   } else if (ocr) {
     // Pixels can be edited: numbers that clearly differ reject; a match still needs the admin.
-    if (ocr.problems.length) { decision = 'invalid'; mismatches = ocr.problems; reason = ocr.problems.join(' · '); }
+    if (ocr.problems.length) { decision = 'invalid'; mismatches = byWeight(ocr.problems); reason = mismatches[0]; }
     else reason = [ocr.matched.length ? `ตรงกับรายการ: ${ocr.matched.join(', ')}` : null, ...ocr.flags].filter(Boolean).join(' · ') + ' — อ่านจากภาพสลิป รอผู้ดูแลยืนยัน';
   }
   // The other order's ref is kept for the admin (it may belong to another shop), not shown to the uploader.
@@ -535,11 +551,18 @@ async function attachAndVerify(m, p, { image, mime }, base, { once = false, rech
   if (isSampleSlip(fp)) throw new ApiError(400, 'SAMPLE_SLIP', SAMPLE_SLIP_MESSAGE);
   const v = await verifySlip(buf, mime, { pendingRetries: !recheck });
   time.lap('provider', `ตรวจกับธนาคาร (${v.provider})`);
+  // Rule (17 Oct 2026): "not found" usually means a slip sent too soon after the transfer — re-check it a few times
+  // (like slip_pending) before it counts as a bad slip; only after the last re-check is it refused.
+  const notFoundRetry = v.verified === false && v.notFound && recheck < RECHECK_AFTER_MIN.length;
+  if (notFoundRetry) Object.assign(v, { verified: null, pending: true });
   // No definite answer from a provider (none connected / down): read the slip image itself.
   // Not while the bank is still processing the transfer — the slip is re-checked with the provider instead.
   const ocr = v.verified === null && !v.pending ? await ocrCheckSlip(buf, p, v.cfg) : null;
   const nextRecheck = v.pending && recheck < RECHECK_AFTER_MIN.length ? RECHECK_AFTER_MIN[recheck] : null;
-  if (v.pending) v.message = nextRecheck ? PENDING_TEXT : 'ธนาคารยังประมวลผลรายการโอนนี้อยู่ (EasySlip: slip_pending) หลังตรวจซ้ำครบแล้ว — รอผู้ดูแลตรวจ';
+  if (v.pending) {
+    v.message = notFoundRetry ? 'ธนาคารยังไม่พบรายการโอนนี้ (อาจเพิ่งโอน) — ระบบจะตรวจซ้ำอัตโนมัติ'
+      : nextRecheck ? PENDING_TEXT : 'ธนาคารยังประมวลผลรายการโอนนี้อยู่ (EasySlip: slip_pending) หลังตรวจซ้ำครบแล้ว — รอผู้ดูแลตรวจ';
+  }
   if (ocr) time.lap('ocr', 'อ่านข้อความจากภาพ');
   const via = ocr ? 'ocr' : v.provider;
   const out = await withTransaction(async (c) => {

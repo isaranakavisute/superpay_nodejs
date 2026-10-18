@@ -6,6 +6,7 @@ import { startScheduler, stopScheduler } from './telegram/announcement.service.j
 import { startWebhookRetries, stopWebhookRetries } from './webhooks/webhook.service.js';
 import { startSlipRechecks, stopSlipRechecks } from './merchant-api/v1.service.js';
 import { startMidnightCancel } from './jobs/midnight-cancel.js';
+import { startDuplicateCancel } from './jobs/duplicate-cancel.js';
 
 const app = createApp();
 const server = app.listen(config.port, () => {
@@ -29,6 +30,8 @@ if (config.isProduction) startWebhookRetries(logger);
 if (config.isProduction) startSlipRechecks();
 // Midnight (Bangkok): unfinished payments and payouts created before it are rejected — production only.
 if (config.isProduction) startMidnightCancel(logger);
+// 23:00 (Bangkok): a same-customer, same-amount order made after the earlier one was paid, with no new payment, is rejected.
+if (config.isProduction) startDuplicateCancel(logger);
 
 let shuttingDown = false;
 

@@ -1,4 +1,5 @@
 import { timingSafeEqual } from 'node:crypto';
+import { tgSend } from '../shared/telegram-send.js';
 import { pool, query } from '../db/pool.js';
 import { internal as configOf } from '../config-admin/config.service.js';
 import logger from '../logger.js';
@@ -19,9 +20,8 @@ import { accountMatches, nameMatches, normalizeSlip } from '../merchant-api/slip
  * with a switch off, only chats listed in slipBot.allowedChatIds — each check spends quota.
  */
 const MAX_BYTES = 8 << 20;
-const tg = (token, method, body) => fetch(`https://api.telegram.org/bot${token}/${method}`, {
-  method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(15_000),
-}).then((r) => r.json());
+// Every post is paced per chat and retried on Telegram 429 (shared rule — see shared/telegram-send.js).
+const tg = (token, method, body) => tgSend(token, method, body);
 
 const baht = (n) => `฿${Number(n).toLocaleString('th-TH', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 const when = (d) => new Date(d).toLocaleString('th-TH', { timeZone: 'Asia/Bangkok', dateStyle: 'medium', timeStyle: 'short' });
@@ -174,9 +174,11 @@ async function checkAgainstOrder(buf, mime, fp, p) {
     return { result: 'invalid', reason: orderNotPendingText(p.status), problems: own ? ['สลิปนี้คือสลิปที่ใช้ชำระรายการนี้แล้ว'] : [], detail: await orderDetail(p.id), fp, order: p };
   }
   const v = await verifySlip(buf, mime);
+  // Same as the API: "not found" right after a transfer is re-checked first (rule 17 Oct 2026), not refused.
+  if (v.verified === false && v.notFound) Object.assign(v, { verified: null, pending: true, notFoundRetry: true });
   // Same as the API: no answer from the bank → read the image; the bank still processing → "will be re-checked".
   const ocr = v.verified === null && !v.pending ? await ocrCheckSlip(buf, p, v.cfg) : null;
-  if (v.pending) v.message = PENDING_TEXT;
+  if (v.pending) v.message = v.notFoundRetry ? 'ธนาคารยังไม่พบรายการโอนนี้ (อาจเพิ่งโอน) — ระบบจะตรวจซ้ำอัตโนมัติ' : PENDING_TEXT;
   const d = await dryRun((c) => decideSlip(c, p, v, fp, ocr));
   const usedOn = d.reusedOn && d.reusedOn !== 'อื่น' ? (await query('SELECT id FROM payments WHERE ref = $1', [d.reusedOn])).rows[0] : null;
   return {
@@ -234,6 +236,7 @@ export async function checkSlip(buf, mime, expect = null, { recheck = false } = 
   if (expect?.kind === 'order') return checkAgainstOrder(buf, mime, fp, expect.order);
   const v = await verifySlip(buf, mime);
   // "No QR" from the provider: say what the image actually has (a fake QR, or a QR that isn't a slip's).
+  if (v.verified === false && v.notFound) return { result: 'review', reason: 'ธนาคารยังไม่พบรายการโอนนี้ (อาจเพิ่งโอน) — ระบบจะตรวจซ้ำอัตโนมัติ', fp };
   if (v.verified === false) return { result: 'invalid', reason: (/QR/.test(v.message ?? '') && qrReason(fp)) || v.message || 'สลิปไม่ถูกต้อง', fp };
   if (v.pending) return { result: 'review', reason: PENDING_TEXT, fp };
   if (v.verified !== true) return { result: 'unverified', reason: v.message ?? 'ผู้ให้บริการตรวจสลิปไม่ตอบ', fp };
@@ -255,50 +258,15 @@ export async function checkSlip(buf, mime, expect = null, { recheck = false } = 
   return { result: 'valid', fp, v, matched: [], notes, carried: null, order: null };
 }
 
-const ICON = { PASS: '✅', FAIL: '❌', WARN: '⚠️', UNKNOWN: '❔', SKIPPED: '➖' };
-
-/** What the bank says the slip is. */
-function slipLines(v) {
-  if (v?.verified !== true) return [];
-  const d = v.raw ?? {};
-  const name = (x) => x?.account?.name?.th || x?.account?.name?.en || x?.displayName || '-';
-  const acct = (x) => x?.account?.bank?.account || x?.account?.value || x?.account?.proxy?.account || '';
-  return [`ยอด ${baht(v.amount)}`,
-    `จาก ${name(d.sender)} ${d.sender?.bank?.short ?? ''} ${acct(d.sender)}`.trim(),
-    `ถึง ${name(d.receiver)} ${d.receiver?.bank?.short ?? ''} ${acct(d.receiver)}`.trim(),
-    v.date ? `เวลาโอน ${when(v.date)}` : null,
-    v.transRef ? `เลขอ้างอิง ${v.transRef}` : null].filter((x) => x !== null);
-}
-
-/** Against an order: the API's verdict, reason and every check, word for word. */
-function decisionReply(r) {
-  const p = r.order;
-  const head = {
-    valid: '✅ valid slip — ผ่านทุกเงื่อนไข: ถ้าร้านส่งสลิปนี้เข้ารายการนี้ ระบบจะอนุมัติอัตโนมัติ',
-    review: '⚠️ ต้องให้ผู้ดูแลตรวจ — ถ้าร้านส่งสลิปนี้เข้ารายการนี้ ระบบจะยังไม่อนุมัติอัตโนมัติ',
-    invalid: '❌ invalid slip — ถ้าร้านส่งสลิปนี้เข้ารายการนี้ ระบบจะไม่อนุมัติ',
-  }[r.result];
-  const d = r.decision;
-  return [head, '',
-    `รายการ ${p.ref}${p.merchant_order_id ? ` (เลขออเดอร์ ${p.merchant_order_id})` : ''} ยอด ${baht(p.amount)}`,
-    ...slipLines(r.v), '',
-    `${r.result === 'valid' ? 'ผล' : 'เหตุผล'}: ${r.reason ?? (r.result === 'valid' ? 'ตรวจสลิปผ่าน' : '-')}`,
-    ...(r.problems ?? []).map((x) => `• ${x}`),
-    d?.checks?.length ? `\nผลการตรวจแต่ละข้อ (เหมือนระบบ):\n${d.checks.map((x) => `${ICON[x.status] ?? '•'} ${x.detail}`).join('\n')}` : null,
-    r.result === 'review' && r.v?.pending ? '\n(ในบอท: ลองส่งตรวจอีกครั้งในอีกสักครู่)' : null,
-    r.detail ? `\n${r.detail}` : null].filter((x) => x !== null).join('\n');
-}
-
+/**
+ * The bot's answer — one line (agreed 17 Oct 2026): "✅ passed", or "❌" with the single main reason it fails.
+ * The verdict itself is the merchant API's (checkAgainstOrder / decideSlip); only the wording is short here.
+ */
 function replyText(r) {
-  if (r.order && (r.decision || r.result === 'invalid')) return decisionReply(r);
-  if (r.result === 'valid') {
-    return ['✅ valid slip', '', ...slipLines(r.v),
-      r.matched?.length ? `✔️ ตรงกับที่ระบุ: ${r.matched.join(' · ')}` : null,
-      r.notes?.length ? `⚠️ ${r.notes.join(' · ')}` : null].filter((x) => x !== null).join('\n');
-  }
-  if (r.result === 'invalid') return `❌ invalid slip\n\nเหตุผล: ${r.reason}${r.problems?.length ? `\n${r.problems.map((x) => `• ${x}`).join('\n')}` : ''}${r.detail ? `\n\n${r.detail}` : ''}`;
-  if (r.result === 'review') return `⚠️ ต้องให้ผู้ดูแลตรวจ\n\nเหตุผล: ${r.reason}`;
-  return `⚠️ ตรวจสลิปไม่ได้ในขณะนี้ (ไม่ใช่ว่าสลิปไม่ถูกต้อง)\n\nสาเหตุ: ${r.reason}\nลองส่งใหม่อีกครั้งภายหลัง`;
+  if (r.result === 'valid') return '✅ passed';
+  if (r.result === 'invalid') return `❌ ${r.decision?.mismatches?.[0] ?? r.problems?.[0] ?? r.reason ?? 'สลิปไม่ผ่านการตรวจ'}`;
+  if (r.result === 'review') return `⚠️ ต้องให้ผู้ดูแลตรวจ — ${String(r.reason ?? '').split(' · ')[0] || 'ระบบยืนยันเองไม่ได้'}`;
+  return `⚠️ ตรวจสลิปไม่ได้ในขณะนี้ — ${r.reason ?? 'ลองส่งใหม่อีกครั้งภายหลัง'}`;
 }
 
 const HELP = 'ส่งรูปสลิปโอนเงินมาที่นี่ — ถ้าพิมพ์เลขที่รายการ (เช่น TXN172919) ในข้อความที่แนบกับรูป บอทจะตรวจสลิปกับรายการนั้นทันที ไม่ถามคำถาม · ถ้าไม่มี บอทจะถามก่อนว่าต้องการตรวจสลิปหรือไม่ (ถ้ามีเลข TXN อยู่ในภาพ บอทจะใช้เลขนั้นแทนการถามเลขที่รายการ) ถ้าตอบ “ใช่” จะถามรายการที่ต้องชำระ (เลขที่รายการ หรือ ยอด/บัญชีปลายทาง) แล้วตรวจกับธนาคาร (EasySlip) และตอบว่า valid slip หรือ invalid slip พร้อมเหตุผล\n\nแนะนำ: ส่งแบบ “ไฟล์” (File) จะชัดกว่าส่งแบบรูปภาพที่ Telegram บีบอัด';
@@ -465,7 +433,9 @@ async function startValidation(cfg, chatId, userId, sess, who) {
   await saveSession(chatId, userId, next);
   if (hint?.ref) {
     const reply = await answer(cfg, chatId, userId, next, hint.ref, who);
-    return typeof reply === 'string' ? `${found}\n\n${reply}` : { ...reply, text: `${found}\n\n${reply.text}` };
+    // A final verdict is one line on its own; a follow-up question keeps the "found TXN" line.
+    if (typeof reply === 'string') return /^(✅|❌|⚠️)/.test(reply) ? reply : `${found}\n\n${reply}`;
+    return { ...reply, text: `${found}\n\n${reply.text}` };
   }
   if (hint?.ask) return hint.ask;
   if (hint?.unknown) return `ไม่พบรายการ ${hint.unknown} (จาก${hint.where}) — กรุณาพิมพ์เลขที่รายการ (ขึ้นต้นด้วย TXN) หรือเลขออเดอร์ของร้านอีกครั้ง หรือพิมพ์ “ไม่มี”`;

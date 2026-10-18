@@ -1,8 +1,8 @@
 import { z } from 'zod';
+import { tgSend } from '../shared/telegram-send.js';
 import { query, withTransaction } from '../db/pool.js';
 import { BadRequestError, NotFoundError } from '../errors.js';
 import { open, seal } from '../shared/secret-box.js';
-import { safePost } from '../shared/safe-fetch.js';
 
 export const ALERT_KINDS = [
   'withdrawal.pending', 'outflow.pending', 'double_credit.detected', 'low_balance',
@@ -100,12 +100,9 @@ export async function test(id, actor) {
   const results = [];
   for (const chat of chats) {
     try {
-      const r = await safePost(`https://api.telegram.org/bot${token}/sendMessage`, {
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ chat_id: chat, text: `✅ ทดสอบการแจ้งเตือนจาก Option Pay (${a.name})` }),
-      });
-      const ok = r.status === 200 && /"ok":true/.test(r.body);
-      const detail = ok ? 'ส่งสำเร็จ' : (r.body.match(/"description":"([^"]+)"/)?.[1] ?? `HTTP ${r.status}`);
+      const r = await tgSend(token, 'sendMessage', { chat_id: chat, text: `✅ ทดสอบการแจ้งเตือนจาก Option Pay (${a.name})` });
+      const ok = !!r.ok;
+      const detail = ok ? 'ส่งสำเร็จ' : r.description ?? 'error';
       results.push({ chat, ok, detail });
     } catch (err) {
       results.push({ chat, ok: false, detail: err?.cause?.code ?? err?.message ?? 'ส่งไม่ได้' });
@@ -131,7 +128,9 @@ export async function sendAlert(kind, text, { merchantId = null } = {}) {
       `SELECT a.id, a.name, a.chat_ids, a.mentions, a.bot_token_enc, c.secrets_enc->>'botToken' AS channel_token
          FROM alert_channels a LEFT JOIN channels c ON c.id = a.bot_channel_id
         WHERE a.enabled AND $1 = ANY (a.events)
-          AND (a.merchant_id IS NULL OR a.merchant_id IN (
+          -- Callback alerts (webhook.delivery) go ONLY to the shop's own group(s) — never to an "all shops" bot — so each
+          -- parent shop's callbacks land in its own Telegram group (rule C, 18 Oct 2026; set in ตั้งค่าแจ้งเตือน → เฉพาะร้าน).
+          AND ((a.merchant_id IS NULL AND $1 <> 'webhook.delivery') OR a.merchant_id IN (
                 WITH RECURSIVE up AS (
                   SELECT id, parent_id, 0 AS depth FROM merchants WHERE id = $2::int
                   UNION ALL SELECT m.id, m.parent_id, up.depth + 1 FROM up JOIN merchants m ON m.id = up.parent_id WHERE up.depth < 10)
@@ -146,21 +145,10 @@ export async function sendAlert(kind, text, { merchantId = null } = {}) {
       const html = `${tags ? `${tags}\n` : ''}${esc(text.slice(0, 3800))}`;
       let ok = false;
       for (const chat of a.chat_ids.split(',').map((x) => x.trim()).filter(Boolean)) {
-        let last = null;
-        for (let attempt = 1; attempt <= 3; attempt += 1) {
-          try {
-            const r = await safePost(`https://api.telegram.org/bot${token}/sendMessage`, {
-              headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({ chat_id: chat, text: html, parse_mode: 'HTML', disable_web_page_preview: true }),
-            });
-            if (r.status === 200) { last = null; ok = true; sent += 1; break; }
-            last = r.body.match(/"description":"([^"]+)"/)?.[1] ?? `HTTP ${r.status}`;
-            if (r.status >= 400 && r.status < 429) break;   // bad chat id / bot removed: retrying won't help
-          } catch (err) {
-            last = err?.cause?.code ?? err?.message ?? 'ส่งไม่ได้';
-          }
-          await new Promise((res) => setTimeout(res, attempt * 1500));
-        }
+        // Paced per chat and retried on Telegram 429 (shared rule — shared/telegram-send.js).
+        const r = await tgSend(token, 'sendMessage', { chat_id: chat, text: html, parse_mode: 'HTML', disable_web_page_preview: true });
+        if (r.ok) { ok = true; sent += 1; }
+        const last = r.ok ? null : r.description ?? 'error';
         if (last) {
           await query(`INSERT INTO audit_logs (actor, action, entity, entity_ref, detail) VALUES ('system', 'alerts.failed', 'setting', $1, $2)`,
             [a.name, `ส่งแจ้งเตือน ${kind} ไม่สำเร็จ (chat ${chat}): ${last}`]).catch(() => {});

@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { tgSend } from '../shared/telegram-send.js';
 import { query } from '../db/pool.js';
 import { NotFoundError } from '../errors.js';
 import { internal as configOf } from '../config-admin/config.service.js';
@@ -161,9 +162,7 @@ async function post(a, slotAt, manual) {
   const results = [];
   for (const c of await activeChats()) {
     try {
-      const r = await fetch(`https://api.telegram.org/bot${cfg.botToken}/sendMessage`, {
-        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ chat_id: c.chat_id, text: a.message }), signal: AbortSignal.timeout(15_000),
-      }).then((x) => x.json());
+      const r = await tgSend(cfg.botToken, 'sendMessage', { chat_id: c.chat_id, text: a.message });
       results.push({ chatId: c.chat_id, title: c.title, ok: !!r.ok, error: r.ok ? null : r.description ?? 'error' });
       // Removed from the group (or it was deleted): stop posting there.
       if (!r.ok && /kicked|not a member|chat not found|bot was blocked/i.test(r.description ?? '')) await recordChat({ id: c.chat_id, title: c.title, type: 'group' }, 'left');

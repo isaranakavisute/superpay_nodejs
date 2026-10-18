@@ -34,22 +34,25 @@ export function sameCustomer(slip, order) {
   return want.length >= 4 && shown.length >= 4 && (shown.includes(want) || want.includes(shown));
 }
 
-/** The earlier unpaid order this transfer belongs to, or null. */
-export async function carryOverFrom(c, p, v) {
-  if (!v.date || !p.merchant_id || !p.bank_account_id) return null;
+/**
+ * The earlier unpaid order this transfer belongs to, or null. `anyAccount`: look on every receiving account of the
+ * shop (only to explain a refusal — e.g. paid into the shop's previous account — never to accept a slip).
+ */
+export async function carryOverFrom(c, p, v, { anyAccount = false } = {}) {
+  if (!v.date || !p.merchant_id || (!p.bank_account_id && !anyAccount)) return null;
   const at = new Date(v.date);
   if (Date.now() - at.getTime() > WINDOW_HOURS * 3_600_000) return null;
   const slip = normalizeSlip(v.provider, v.raw);
   const { rows } = await c.query(
     `SELECT id, ref, merchant_order_id, amount, status, customer_name, payer_account_masked, metadata, created_at, expires_at FROM payments
-      WHERE merchant_id = $1 AND bank_account_id = $2 AND id <> $3
+      WHERE merchant_id = $1 AND ($2::int IS NULL OR bank_account_id = $2) AND id <> $3
         AND (status IN ('expired', 'rejected')
              OR (status = 'pending' AND NOT EXISTS (SELECT 1 FROM payment_slips s WHERE s.payment_id = payments.id
                                                      AND coalesce(s.verify_result->>'decision', '') <> 'invalid')))
         AND created_at <= $4::timestamptz + interval '10 minutes'
         AND created_at >= $4::timestamptz - make_interval(hours => $5)
       ORDER BY created_at DESC LIMIT ${MAX_CANDIDATES}`,
-    [p.merchant_id, p.bank_account_id, p.id, at, WINDOW_HOURS],
+    [p.merchant_id, anyAccount ? null : p.bank_account_id, p.id, at, WINDOW_HOURS],
   );
   // Match the customer across ALL eligible orders in the window (newest first). Taking only the newest few first
   // missed real ones on busy shared accounts (16 Oct 2026: the customer's order was #24 of 151, the old limit was 20).

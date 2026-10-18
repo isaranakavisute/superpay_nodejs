@@ -1,10 +1,11 @@
-import { createHmac } from 'node:crypto';
+import { createHmac, timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
 import { query, withTransaction } from '../db/pool.js';
 import { NotFoundError } from '../errors.js';
 import { open } from '../shared/secret-box.js';
 import { BlockedUrlError, safePost } from '../shared/safe-fetch.js';
 import { sendAlert } from '../alerts/alert.service.js';
+import logger from '../logger.js';
 import { EVENT_CODES, WEBHOOK_EVENTS } from './events.js';
 
 export const idParamSchema = z.object({ id: z.coerce.number().int().positive() });
@@ -62,7 +63,7 @@ const kindOf = (d) => (d.withdrawal_ref ? ['withdrawal', d.withdrawal_ref] : d.o
 const WD_STATUS = { pending: 'pending', approved: 'approved', rejected: 'failed' };
 
 /** The body for one event, rebuilt from the record on every attempt (payments keep their original shape). */
-async function payloadFor(kind, ref, event) {
+export async function payloadFor(kind, ref, event) {
   if (kind === 'outflow') {
     const { rows } = await query('SELECT ref, merchant_ref, amount, status, review_note, created_at, completed_at, admin_done_at FROM outflows WHERE ref = $1', [ref]);
     return rows[0] ? payoutPayload(event, rows[0]) : { event, ref };
@@ -83,9 +84,73 @@ async function payloadFor(kind, ref, event) {
       createdAt: iso(w.created_at), completedAt: iso(event === 'withdrawal.completed' ? w.paid_at ?? w.decided_at : w.decided_at),
     };
   }
+  // The payment callback body exactly as first sent to prismapays on 15 Oct 2026 (restored 17 Oct at their request):
+  // event, ref, orderId, amount, status, createdAt, resentAt (= the time of sending).
   const { rows } = await query('SELECT ref, merchant_order_id, amount, status, created_at FROM payments WHERE ref = $1', [ref]);
   const p = rows[0] ?? { ref };
   return { event, ref: p.ref, orderId: p.merchant_order_id, amount: p.amount, status: p.status, createdAt: p.created_at, resentAt: new Date().toISOString() };
+}
+
+const hmacHex = (key, msg) => createHmac('sha256', key).update(msg).digest('hex');
+
+/** Option B key (agreed 18 Oct 2026): the API-request signature formula over this callback, with the shop's sk_live_ key. */
+export const deriveCallbackKey = (skLive, t, path, body) => hmacHex(skLive, `${t}.POST.${path}.${body}`);
+
+/** The endpoint shop's owner secret key (sk_live_…), or null. */
+async function ownerSecretKey(merchantId) {
+  const { rows } = await query(
+    `SELECT secret_key_sealed FROM merchant_portal_users WHERE merchant_id = $1 AND tier = 'owner' AND status = 'active'
+        AND NOT super_admin AND secret_key_sealed IS NOT NULL ORDER BY id LIMIT 1`,
+    [merchantId],
+  );
+  return rows[0] ? open(rows[0].secret_key_sealed) : null;
+}
+
+/**
+ * The x-signature of one callback — the single place callbacks are signed (send, retry, resend, alert-only, manuals).
+ * e = endpoint { url, secret_enc, signing, merchant_id }. 'sk_live_derived': key = HMAC(sk_live, t.POST.path.body),
+ * v1 = HMAC(key, t.body); without an owner secret key it falls back to the whsec_ secret (and says so in `fallback`).
+ */
+export async function callbackSignature(e, t, body) {
+  if (e.signing === 'sk_live_derived') {
+    const sk = await ownerSecretKey(e.merchant_id);
+    if (sk) return { signature: `t=${t},v1=${hmacHex(deriveCallbackKey(sk, t, new URL(e.url).pathname, body), `${t}.${body}`)}`, mode: 'sk_live_derived' };
+    logger.warn({ endpointMerchantId: e.merchant_id }, 'callback signing: no owner secret key — signed with whsec instead');
+    return { signature: e.secret_enc ? `t=${t},v1=${hmacHex(open(e.secret_enc), `${t}.${body}`)}` : null, mode: 'whsec', fallback: true };
+  }
+  return { signature: e.secret_enc ? `t=${t},v1=${hmacHex(open(e.secret_enc), `${t}.${body}`)}` : null, mode: 'whsec' };
+}
+
+/**
+ * Rule A (18 Oct 2026): before EVERY callback is sent, its x-signature is re-computed INDEPENDENTLY of
+ * callbackSignature() — own key lookup, own HMAC steps — from the webhook owner's secret key and the exact body, and
+ * compared. A signature that does not verify is never sent. Returns { ok, text } — text goes into the Telegram alert.
+ */
+export async function verifyBeforeSend(e, t, body, signature) {
+  const m = /^t=(\d+),v1=([0-9a-f]{64})$/.exec(signature ?? '');
+  if (!m || m[1] !== String(t)) return { ok: false, text: '❌ ไม่ผ่าน — รูปแบบ x-signature ไม่ถูกต้อง · ไม่ได้ส่ง' };
+  const same = (hex) => timingSafeEqual(Buffer.from(hex, 'hex'), Buffer.from(m[2], 'hex'));
+  const path = new URL(e.url).pathname;
+  if (e.signing === 'sk_live_derived') {
+    const { rows } = await query(
+      `SELECT ms.name, u.secret_key_sealed, u.secret_key_prefix FROM merchant_portal_users u JOIN merchants ms ON ms.id = u.merchant_id
+        WHERE u.merchant_id = $1 AND u.tier = 'owner' AND u.status = 'active' AND NOT u.super_admin AND u.secret_key_sealed IS NOT NULL ORDER BY u.id LIMIT 1`,
+      [e.merchant_id],
+    );
+    if (rows[0]) {
+      const key = createHmac('sha256', open(rows[0].secret_key_sealed)).update(`${t}.POST.${path}.${body}`, 'utf8').digest('hex');
+      const ok = same(createHmac('sha256', key).update(`${t}.${body}`, 'utf8').digest('hex'));
+      const who = `secret key ของร้าน ${rows[0].name} (${String(rows[0].secret_key_prefix ?? 'sk_live_').slice(0, 12)}…)`;
+      return { ok, text: ok
+        ? `✅ ผ่าน — คำนวณซ้ำด้วย ${who} + body ที่ส่ง: key = HMAC-SHA256(sk_live, t.POST.${path}.body) → v1 = HMAC-SHA256(key, t.body) ตรงกับ x-signature`
+        : `❌ ไม่ผ่าน — คำนวณซ้ำด้วย ${who} + body ที่ส่ง แล้วไม่ตรงกับ x-signature · ไม่ได้ส่ง` };
+    }
+  }
+  if (!e.secret_enc) return { ok: false, text: '❌ ไม่ผ่าน — ปลายทางนี้ไม่มี key สำหรับเซ็น · ไม่ได้ส่ง' };
+  const ok = same(createHmac('sha256', open(e.secret_enc)).update(`${t}.${body}`, 'utf8').digest('hex'));
+  return { ok, text: ok
+    ? `✅ ผ่าน — คำนวณซ้ำด้วย webhook secret (whsec_…) ของปลายทาง + body ที่ส่ง ตรงกับ x-signature${e.signing === 'sk_live_derived' ? ' (ร้านไม่มี secret key ที่ใช้งานอยู่ จึงเซ็นด้วย whsec แทน)' : ''}`
+    : '❌ ไม่ผ่าน — คำนวณซ้ำด้วย webhook secret + body ที่ส่ง แล้วไม่ตรงกับ x-signature · ไม่ได้ส่ง' };
 }
 
 /**
@@ -96,7 +161,7 @@ async function payloadFor(kind, ref, event) {
  */
 async function retryOne(id, actor, action = 'webhook.retry') {
   const { rows } = await query(
-    `SELECT d.id, d.event, d.attempts, d.payment_ref, d.outflow_ref, d.withdrawal_ref, e.url, e.secret_enc, e.alert_events,
+    `SELECT d.id, d.event, d.attempts, d.payment_ref, d.outflow_ref, d.withdrawal_ref, e.url, e.secret_enc, e.alert_events, e.signing,
             e.merchant_id AS endpoint_merchant_id
        FROM webhook_deliveries d JOIN webhook_endpoints e ON e.id = d.endpoint_id
       WHERE d.id = $1`,
@@ -109,19 +174,22 @@ async function retryOne(id, actor, action = 'webhook.retry') {
   const payload = await payloadFor(kind, ref, d.event);
   const body = JSON.stringify(payload);
   const t = Math.floor(Date.now() / 1000);
-  const signature = d.secret_enc ? `t=${t},v1=${createHmac('sha256', open(d.secret_enc)).update(`${t}.${body}`).digest('hex')}` : null;
+  const { signature, fallback } = await callbackSignature({ url: d.url, secret_enc: d.secret_enc, signing: d.signing, merchant_id: d.endpoint_merchant_id }, t, body);
+  const check = await verifyBeforeSend({ url: d.url, secret_enc: d.secret_enc, signing: d.signing, merchant_id: d.endpoint_merchant_id }, t, body, signature);
+  if (fallback) await sendAlert('webhook.failed', `⚠️ Callback ${d.event} — ${ref ?? '—'}: ตั้งให้เซ็นด้วย secret key ของร้าน แต่ร้านไม่มี secret key ที่ใช้งานอยู่ — เซ็นด้วย webhook secret แทน`, { merchantId: d.endpoint_merchant_id }).catch(() => {});
 
   let status = null;
   let responseBody = null;
   let ms = null;
   let error = null;
   try {
-    const r = await safePost(d.url, { body, headers: { 'content-type': 'application/json', 'user-agent': USER_AGENT, 'x-webhook-event': d.event, ...(signature ? { 'x-signature': signature } : {}) } });
+    if (!check.ok) throw Object.assign(new Error('signature self-check failed'), { selfCheck: true });
+    const r = await safePost(d.url, { body, headers: callbackHeaders(d.event, signature) });
     ({ status, ms } = r);
     responseBody = r.body;
     if (status < 200 || status >= 300) error = `ปลายทางตอบ ${status}`;
   } catch (err) {
-    error = err instanceof BlockedUrlError ? err.message : err?.name === 'TimeoutError' ? 'หมดเวลารอ (timeout 10s)' : `ส่งไม่ถึงปลายทาง: ${err?.cause?.code ?? err?.message}`;
+    error = err?.selfCheck ? 'ลายเซ็นไม่ผ่านการตรวจก่อนส่ง — ไม่ได้ส่ง' : err instanceof BlockedUrlError ? err.message : err?.name === 'TimeoutError' ? 'หมดเวลารอ (timeout 10s)' : `ส่งไม่ถึงปลายทาง: ${err?.cause?.code ?? err?.message}`;
   }
   const ok = status !== null && status >= 200 && status < 300;
   const attempts = d.attempts + 1;
@@ -139,13 +207,32 @@ async function retryOne(id, actor, action = 'webhook.retry') {
     return { state, statusCode: status, error: ok ? null : error };
   });
   if ((d.alert_events ?? []).includes(d.event)) {
-    await sendAlert('webhook.delivery', deliveryAlertText({ d, ref, payload, ok, status, ms, error, attempts, state, responseBody }), { merchantId: d.endpoint_merchant_id });
+    await sendAlert('webhook.delivery', deliveryAlertText({ d, ref, payload, ok, status, ms, error, attempts, state, responseBody, signature, body, check }), { merchantId: d.endpoint_merchant_id });
   }
   return result;
 }
 
 /** Telegram text for แจ้งเตือน Telegram → "ผลการส่ง webhook ไปยังร้าน": what was sent, and whether it arrived. */
-function deliveryAlertText({ d, ref, payload, ok, status, ms, error, attempts, state, responseBody }) {
+/**
+ * The exact headers of a callback POST — one object for the request itself and for the curl shown in Telegram.
+ * The format of the first callback to prismapays (15 Oct 2026), restored 17 Oct: content-type, user-agent,
+ * x-webhook-event, x-signature — lowercase names.
+ */
+function callbackHeaders(event, signature) {
+  return { 'content-type': 'application/json', 'user-agent': USER_AGENT, 'x-webhook-event': event, ...(signature ? { 'x-signature': signature } : {}) };
+}
+
+/**
+ * The exact request as a curl command (same URL, headers and byte-for-byte body) — shown in every callback alert, in
+ * prismapays' format (17 Oct 2026): URL and headers in "double quotes", the body in 'single quotes', POSIX shell.
+ */
+export function curlOf(url, headers, body) {
+  const dq = (x) => `"${String(x).replace(/(["\\$`])/g, '\\$1')}"`;
+  const sq = (x) => `'${String(x).replace(/'/g, `'\\''`)}'`;
+  return [`curl -X POST ${dq(url)}`, ...Object.entries(headers).map(([k, v]) => `  -H ${dq(`${k}: ${v}`)}`), `  --data-raw ${sq(body)}`].join(' \\\n');
+}
+
+function deliveryAlertText({ d, ref, payload, ok, status, ms, error, attempts, state, responseBody, signature = null, body = null, check = null }) {
   const when = (t) => new Date(t).toLocaleString('th-TH', { timeZone: 'Asia/Bangkok' });
   const result = ok
     ? `✅ ส่งถึงปลายทางแล้ว — HTTP ${status} (${ms} ms)`
@@ -155,7 +242,13 @@ function deliveryAlertText({ d, ref, payload, ok, status, ms, error, attempts, s
     result,
     `ปลายทาง: ${d.url}`,
     `ข้อมูลที่ส่ง: ${JSON.stringify(payload)}`,
-    status !== null ? `ปลายทางตอบ: ${String(responseBody ?? '').slice(0, 500) || '(ว่าง)'}` : null,
+    // The headers the receiver verifies with (HMAC-SHA256 of "<t>.<body>" with the endpoint secret) — shown so both sides can compare.
+    signature ? `X-Signature: ${signature}` : 'X-Signature: (ไม่มี — ปลายทางนี้ยังไม่มี secret)',
+    // Rule B: the result of the independent check made right before sending.
+    check ? `🔐 ตรวจลายเซ็นก่อนส่ง: ${check.text}` : null,
+    `คำสั่ง curl ที่ส่งจริง:\n${curlOf(d.url, callbackHeaders(d.event, signature), body ?? JSON.stringify(payload))}`,
+    // Last, after the request: what the receiver answered (or that it did not answer).
+    status !== null ? `ปลายทางตอบ: ${String(responseBody ?? '').slice(0, 500) || '(ว่าง)'}` : `ปลายทางตอบ: (ไม่มีคำตอบ — ${error ?? 'ส่งไม่สำเร็จ'})`,
   ].filter(Boolean).join('\n');
 }
 
@@ -182,7 +275,7 @@ async function dispatch(kind, ref, event) {
        UNION ALL
        SELECT m.id, m.parent_id, up.depth + 1 FROM up JOIN merchants m ON m.id = up.parent_id WHERE up.depth < 10
      ), hits AS (
-       SELECT e.id, e.url, e.merchant_id, ($2 = ANY (e.events)) AS send, up.depth
+       SELECT e.id, e.url, e.merchant_id, e.secret_enc, e.signing, ($2 = ANY (e.events)) AS send, up.depth
          FROM up JOIN webhook_endpoints e ON e.merchant_id = up.id
         WHERE e.status = 'active' AND ($2 = ANY (e.events) OR $2 = ANY (e.alert_events))
      )
@@ -194,11 +287,18 @@ async function dispatch(kind, ref, event) {
     if (!e.send) {
       // Alert only: posting this event is switched off for the endpoint.
       const payload = await payloadFor(kind, ref, event);
+      // Every callback alert carries X-Signature (17 Oct 2026): here the one this body WOULD be sent with.
+      const t = Math.floor(Date.now() / 1000);
+      const { signature: sig } = await callbackSignature(e, t, JSON.stringify(payload));
+      const check = await verifyBeforeSend(e, t, JSON.stringify(payload), sig);
       await sendAlert('webhook.delivery', [
         `📣 ${event} — ${ref}`,
         '⏸ ไม่ได้ส่งไปยังปลายทาง (ปิดการส่ง event นี้ไว้ที่หน้า ตั้งค่าการส่ง Webhook)',
         `ปลายทาง: ${e.url}`,
         `ข้อมูล: ${JSON.stringify(payload)}`,
+        sig ? `X-Signature (ถ้าส่ง): ${sig}` : 'X-Signature: (ไม่มี — ปลายทางนี้ยังไม่มี secret)',
+        `🔐 ตรวจลายเซ็น: ${check.text}`,
+        `คำสั่ง curl (ถ้าส่ง — ยังไม่ได้ส่ง):\n${curlOf(e.url, callbackHeaders(event, sig), JSON.stringify(payload))}`,
       ].join('\n'), { merchantId: e.merchant_id });
       continue;
     }
@@ -241,11 +341,11 @@ export const settingsBodySchema = z.object({
 export async function settings() {
   const { rows: endpoints } = await query(
     `SELECT e.id, e.merchant_id AS "merchantId", m.name AS "merchantName", e.url, e.status, e.events, e.alert_events AS "alertEvents",
-            (e.secret_enc IS NOT NULL) AS signed,
+            (e.secret_enc IS NOT NULL) AS signed, e.signing,
             coalesce((SELECT json_agg(json_build_object('id', a.id, 'name', a.name) ORDER BY a.id)
                         FROM alert_channels a
                        WHERE a.enabled AND 'webhook.delivery' = ANY (a.events)
-                         AND (a.merchant_id IS NULL OR a.merchant_id IN (
+                         AND (a.merchant_id IN (
                                WITH RECURSIVE up AS (
                                  SELECT id, parent_id, 0 AS depth FROM merchants WHERE id = e.merchant_id
                                  UNION ALL SELECT x.id, x.parent_id, up.depth + 1 FROM up JOIN merchants x ON x.id = up.parent_id WHERE up.depth < 10)
@@ -310,4 +410,44 @@ export function startWebhookRetries(logger) {
 export function stopWebhookRetries() {
   clearInterval(retryTimer);
   retryTimer = null;
+}
+
+/**
+ * Real callbacks of a shop, as the exact curl that was sent — for its own API manual (Merchant Portal, 17 Oct 2026).
+ * The endpoint used: the shop's own, else the nearest parent's (as dispatch()). Per posted event, the latest delivery whose
+ * signature verifies against the body rebuilt in the code's key order (so the command is byte-exact). Only this shop's tree.
+ */
+export async function realCallbackExamples(merchantId) {
+  const { rows: eps } = await query(
+    `WITH RECURSIVE up AS (
+       SELECT m.id, m.parent_id, 0 AS depth FROM merchants m WHERE m.id = $1
+       UNION ALL SELECT m.id, m.parent_id, up.depth + 1 FROM up JOIN merchants m ON m.id = up.parent_id WHERE up.depth < 10)
+     SELECT e.id, e.url, e.secret_enc, e.events, e.signing, e.merchant_id FROM up JOIN webhook_endpoints e ON e.merchant_id = up.id
+      WHERE e.status = 'active' AND e.secret_enc IS NOT NULL ORDER BY up.depth, e.id LIMIT 1`,
+    [merchantId],
+  );
+  const e = eps[0];
+  if (!e) return { endpointId: null, url: null, signing: null, examples: [] };
+  const examples = [];
+  for (const event of e.events) {
+    const { rows } = await query(
+      `SELECT signature, payload, status_code, response_body, delivered_at FROM webhook_deliveries
+        WHERE endpoint_id = $1 AND event = $2 AND signature IS NOT NULL AND status_code BETWEEN 200 AND 299 ORDER BY delivered_at DESC LIMIT 20`,
+      [e.id, event],
+    );
+    for (const d of rows) {
+      const p = d.payload ?? {};
+      const body = JSON.stringify(event.startsWith('payment.')
+        ? { event: p.event, ref: p.ref, orderId: p.orderId, amount: p.amount, status: p.status, createdAt: p.createdAt, resentAt: p.resentAt }
+        : payoutPayload(event, { ref: p.ref, merchant_ref: p.merchantRef, amount: p.amount, status: { completed: 'approved', failed: 'rejected' }[p.status] ?? p.status,
+          review_note: p.failureReason, created_at: p.createdAt, completed_at: p.completedAt, admin_done_at: p.completedAt }));
+      const [, t, v1] = String(d.signature).match(/^t=(\d+),v1=([0-9a-f]+)$/) ?? [];
+      if (!t || (await callbackSignature(e, t, body)).signature !== `t=${t},v1=${v1}`) continue;
+      // The shop's own URL is shown as a placeholder (agreed 17 Oct 2026); headers, signature and body are the real ones.
+      const cmd = curlOf(e.url, callbackHeaders(event, d.signature), body).replace(/^curl -X POST "[^"]*" \\/, 'curl -X POST <webhook-url goes here> \\');
+      examples.push({ event, sentAt: d.delivered_at, reply: d.response_body, cmd });
+      break;
+    }
+  }
+  return { endpointId: e.id, url: e.url, signing: e.signing, path: new URL(e.url).pathname, examples };
 }

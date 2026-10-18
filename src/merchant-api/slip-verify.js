@@ -34,7 +34,10 @@ async function easyslip(cfg, buf, mime) {
   // slip_pending: the bank hasn't finished the transfer yet — not a bad slip; check again shortly.
   if (/pending/i.test(String(j.message ?? ''))) return { verified: null, pending: true, message: PENDING_TEXT };
   // 400 = the slip itself is bad (not a slip / not found); anything else is the provider's problem.
-  if (r.status === 400 || r.status === 404) return { verified: false, message: rejectText('EasySlip', j.message) };
+  // "Not found" may only mean the bank hasn't registered a just-made transfer yet: flagged so the caller re-checks first.
+  if (r.status === 400 || r.status === 404) {
+    return { verified: false, notFound: r.status === 404 || /not.?found|1010|1011/i.test(String(j.message ?? '')), message: rejectText('EasySlip', j.message) };
+  }
   return { verified: null, message: `EasySlip ตอบ HTTP ${r.status}: ${j.message ?? ''}`.trim() };
 }
 

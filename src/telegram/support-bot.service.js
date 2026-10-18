@@ -1,4 +1,5 @@
 import { timingSafeEqual } from 'node:crypto';
+import { tgSend } from '../shared/telegram-send.js';
 import { z } from 'zod';
 import { query } from '../db/pool.js';
 import { NotFoundError } from '../errors.js';
@@ -98,9 +99,8 @@ export async function testMatch(text) {
 
 // ---------- Telegram ----------
 
-const tg = (token, method, body) => fetch(`https://api.telegram.org/bot${token}/${method}`, {
-  method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(15_000),
-}).then((r) => r.json());
+// Every post is paced per chat and retried on Telegram 429 (shared rule — see shared/telegram-send.js).
+const tg = (token, method, body) => tgSend(token, method, body);
 
 export async function checkSecret(header) {
   const cfg = await configOf('supportBot');

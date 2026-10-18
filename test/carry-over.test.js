@@ -47,3 +47,19 @@ describe('same customer by bank account when the slip shows only an English name
     assert.equal(sameCustomer({ senderNames: ['MS X'], senderAccount: '557-7-xxx631' }, { ...order, metadata: {} }), false);
   });
 });
+
+describe('explaining a refusal: the earlier order may be on another account of the shop', () => {
+  it('anyAccount drops the receiving-account filter (explanation only)', async () => {
+    let args = null;
+    const c = { query: async (_q, a) => { args = a; return { rows: [hers] }; } };
+    const found = await carryOverFrom(c, { ...order, bank_account_id: 20 }, slip, { anyAccount: true });
+    assert.equal(found?.ref, 'TXN173771');
+    assert.equal(args[1], null);
+  });
+  it('without it, only the order\'s own account is searched (accepting a slip)', async () => {
+    let args = null;
+    const c = { query: async (_q, a) => { args = a; return { rows: [] }; } };
+    await carryOverFrom(c, { ...order, bank_account_id: 20 }, slip);
+    assert.equal(args[1], 20);
+  });
+});

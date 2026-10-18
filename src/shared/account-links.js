@@ -46,6 +46,10 @@ export async function amountRule(c, accountId, slip) {
 /** Shops that still have orders waiting for payment on the account can't be unlinked from it. */
 export async function refuseUnlinkWithPending(c, accountId, merchantIds) {
   if (!merchantIds.length) return;
+  // A disabled account no longer receives new orders: its shops can always be removed (17 Oct 2026 — the unlink of a
+  // disabled SCB account was blocked by its pending orders). Those orders keep the account and are checked as before.
+  const { rows: acct } = await c.query('SELECT status FROM bank_accounts WHERE id = $1', [accountId]);
+  if (acct[0] && acct[0].status !== 'active') return;
   const { rows } = await c.query(
     `SELECT m.name, count(*)::int AS n FROM payments p JOIN merchants m ON m.id = p.merchant_id
       WHERE p.bank_account_id = $1 AND p.merchant_id = ANY ($2) AND p.status = 'pending' AND (p.expires_at IS NULL OR p.expires_at > now())

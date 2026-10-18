@@ -217,7 +217,11 @@ export function revokeKey(id, keyId, actor) {
 
 export async function webhook(id) {
   const { rows } = await query(
-    `SELECT id, url, events, status, secret_prefix AS "secretPrefix", rotated_at AS "rotatedAt" FROM webhook_endpoints WHERE merchant_id = $1 ORDER BY id LIMIT 1`,
+    `SELECT e.id, e.url, e.events, e.status, e.secret_prefix AS "secretPrefix", e.rotated_at AS "rotatedAt", e.signing,
+            -- How x-signature is really made: the shop owner's sk_live_ key (default) — shown by its prefix only.
+            (SELECT left(u.secret_key_prefix, 12) FROM merchant_portal_users u WHERE u.merchant_id = e.merchant_id AND u.tier = 'owner' AND u.status = 'active'
+                AND NOT u.super_admin AND u.secret_key_sealed IS NOT NULL ORDER BY u.id LIMIT 1) AS "signingKeyPrefix"
+       FROM webhook_endpoints e WHERE e.merchant_id = $1 ORDER BY e.id LIMIT 1`,
     [id],
   );
   const { rows: deliveries } = await query(

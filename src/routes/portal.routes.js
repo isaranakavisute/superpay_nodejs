@@ -6,6 +6,7 @@ import * as merchants from '../merchants/merchant.service.js';
 import { ApiError } from '../merchant-api/v1.service.js';
 import * as v1 from '../merchant-api/v1.service.js';
 import * as subs from '../merchants/sub-merchant.service.js';
+import * as webhooks from '../webhooks/webhook.service.js';
 import { effectiveStatus, inSubtree } from '../merchants/tree.js';
 
 /**
@@ -90,6 +91,9 @@ portalRouter.post('/:merchantId/sub-merchants/:childId/owner-password', h((req) 
 // Dashboard of everything below this shop (or one shop below it): ภาพรวมร้านย่อย.
 portalRouter.get('/:merchantId/network', h((req) => subs.network(req.shop, subs.networkQuerySchema.parse(req.query))));
 // Which shops this user may view: its own and everything below (for the shop switcher).
+// The shop's own real callbacks as exact curl commands (API manual).
+portalRouter.get('/:merchantId/callback-examples', h(async (req) => webhooks.realCallbackExamples(req.shop.id)));
+
 portalRouter.get('/:merchantId/viewable', h(async (req) => {
   // A super-admin (checked here against the signed-in username, not only the Next server's flag) may open every shop.
   if (req.get('x-portal-super') === '1') {

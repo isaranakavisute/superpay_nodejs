@@ -64,6 +64,8 @@ export const RESOURCES = {
       // Which card of the payments page a row belongs to.
       bucket: `(CASE
         WHEN p.status IN ('pending', 'expired') AND p.slip_reused_ref IS NOT NULL THEN 'dup'
+        -- A slip still being re-checked automatically (bank processing / not found yet) is not for the admin yet.
+        WHEN p.status IN ('pending', 'expired') AND EXISTS (SELECT 1 FROM payment_slips rs WHERE rs.payment_id = p.id AND rs.recheck_at IS NOT NULL) THEN 'waiting'
         WHEN p.status IN ('pending', 'expired') AND p.slip_received_at IS NOT NULL THEN 'review'
         WHEN p.status = 'pending' THEN 'waiting'
         WHEN p.status IN ('approved', 'refunded') THEN 'success'
