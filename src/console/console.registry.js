@@ -1,4 +1,5 @@
 import { BALANCE_SQL } from '../shared/balance-sql.js';
+import { visible } from '../shared/private-records.js';
 
 /**
  * Read-only list resources for the admin console: GET /api/console/:resource.
@@ -16,9 +17,13 @@ import { BALANCE_SQL } from '../shared/balance-sql.js';
  *   amount   expression summed per status in the summary (optional)
  *   sums     extra { alias: expression } summed per status (optional)
  *   filters  ?name=value → SQL expression compared with = (optional)
+ *   live     condition always applied — hides soft-deleted rows (optional)
+ *   hide     () => condition(s) hiding private test records from everyone but their owner (optional)
  */
 export const RESOURCES = {
   payments: {
+    hide: () => visible('payment', 'p.ref'),
+    live: 'p.deleted_at IS NULL',
     from: `payments p
       LEFT JOIN merchants m     ON m.id = p.merchant_id
       -- No payer bank yet on API / checkout orders until they are paid.
@@ -76,6 +81,8 @@ export const RESOURCES = {
   },
 
   outflows: {
+    hide: () => visible('outflow', 'o.ref'),
+    live: 'o.deleted_at IS NULL',
     // The deducting account can be empty until approval, hence the LEFT JOINs.
     from: `outflows o
       LEFT JOIN merchants m     ON m.id = o.merchant_id
@@ -140,6 +147,8 @@ export const RESOURCES = {
   },
 
   accounts: {
+    hide: () => visible('account', 'a.id'),
+    live: 'a.deleted_at IS NULL',
     // Balance and counts run from counters_reset_at (NULL = since the beginning).
     from: `bank_accounts a
       JOIN banks b ON b.code = a.bank_code
@@ -201,6 +210,7 @@ export const RESOURCES = {
   },
 
   audit: {
+    hide: () => [visible(['payment', 'outflow'], 'l.entity_ref'), visible('audit', 'l.id')],
     from: 'audit_logs l',
     columns: `l.id, l.actor, l.action, l.entity, l.entity_ref AS "entityRef", l.detail, l.ip, l.created_at AS "createdAt"`,
     order: 'l.created_at DESC, l.id DESC',
@@ -211,6 +221,7 @@ export const RESOURCES = {
   },
 
   apiLogs: {
+    hide: () => visible('api_log', 'r.id'),
     from: `api_request_logs r
       LEFT JOIN merchants m ON m.id = r.merchant_id
       LEFT JOIN merchants km ON km.id = r.key_merchant_id`,
@@ -231,6 +242,7 @@ export const RESOURCES = {
   },
 
   channels: {
+    live: 'c.deleted_at IS NULL',
     // Secret values never leave the backend: only which secret fields are set.
     from: 'channels c',
     columns: `c.id, c.name, c.channel_type AS "channelType", c.provider, c.account, c.events_today AS "eventsToday",
@@ -266,6 +278,7 @@ export const RESOURCES = {
   },
 
   devices: {
+    live: 'd.deleted_at IS NULL',
     // Online = reported within the last 3 minutes; 'disabled' = suspended by an admin.
     from: `forwarder_devices d
       LEFT JOIN channels c      ON c.id = d.channel_id
@@ -282,6 +295,7 @@ export const RESOURCES = {
   },
 
   webhooks: {
+    hide: () => [visible('webhook_endpoint', 'd.endpoint_id'), visible(['payment', 'outflow'], 'coalesce(d.payment_ref, d.outflow_ref)')],
     from: `webhook_deliveries d
       JOIN webhook_endpoints e ON e.id = d.endpoint_id
       JOIN merchants m         ON m.id = e.merchant_id
@@ -299,6 +313,7 @@ export const RESOURCES = {
   },
 
   'webhook-endpoints': {
+    hide: () => visible('webhook_endpoint', 'e.id'),
     from: 'webhook_endpoints e JOIN merchants m ON m.id = e.merchant_id',
     columns: `e.id, e.merchant_id AS "merchantId", m.name AS "merchantName", e.url, e.status`,
     order: 'm.name, e.id',
@@ -307,6 +322,7 @@ export const RESOURCES = {
   },
 
   alerts: {
+    live: 'a.deleted_at IS NULL',
     from: 'alert_channels a',
     columns: `a.id, a.name, a.chat_masked AS "chatMasked", a.events, a.status, a.last_sent_at AS "lastSentAt"`,
     order: 'a.id',

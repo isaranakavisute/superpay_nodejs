@@ -7,6 +7,7 @@ import { findReusedSlip, isSampleSlip, SAMPLE_SLIP_MESSAGE, slipFingerprint } fr
 import { syncPaymentSplits } from '../merchants/tree.js';
 import { amountRule, uniqueAmount } from '../shared/account-links.js';
 import { closeUsedUp, coverShortfall, fillTransRefs, recordUse } from '../merchant-api/slip-transfers.js';
+import { MARK_DELETED } from '../shared/soft-delete.js';
 
 /**
  * Operator actions on payments. Each runs in one transaction: lock the row,
@@ -17,7 +18,7 @@ const fmt = (n) => Number(n).toLocaleString('th-TH', { minimumFractionDigits: 2,
 
 async function lock(client, ref) {
   const { rows } = await client.query(
-    `SELECT p.id, p.ref, p.status, p.amount, p.merchant_id, p.refunded_amount, p.bank_account_id,
+    `SELECT p.id, p.ref, p.status, p.amount, p.merchant_id, p.refunded_amount, p.bank_account_id, p.deleted_at,
             m.fee_percent, m.fee_flat
        FROM payments p LEFT JOIN merchants m ON m.id = p.merchant_id
       WHERE p.ref = $1
@@ -161,14 +162,20 @@ export function revive(ref, actor) {
   });
 }
 
-export function remove(ref, actor) {
+/**
+ * "ลบ" keeps the order (soft delete, 18 Oct 2026): an open one is first rejected with the reason — the shop gets
+ * payment.rejected and the usual alert — then it is hidden from the console (รายการที่ลบแล้ว shows / restores it).
+ * The order, its slip and the bank check all stay. Approved / refunded orders cannot be deleted.
+ */
+export function remove(ref, actor, reason) {
   return withTransaction(async (client) => {
     const p = await lock(client, ref);
-    // Money that moved stays on record: only unpaid / closed-without-refund rows go.
     requireStatus(p, ['pending', 'expired', 'rejected'], 'delete');
     if (Number(p.refunded_amount) > 0) throw new ConflictError(`Cannot delete ${ref}: it has a refund`);
-    await client.query('DELETE FROM payments WHERE id = $1', [p.id]);
-    await audit(client, actor, 'payment.delete', ref, `ลบรายการ ยอด ${fmt(p.amount)} บาท`);
+    if (p.deleted_at) throw new ConflictError(`${ref} ถูกลบไปแล้ว`);
+    if (p.status !== 'rejected') await rejectOne(client, ref, actor, `ลบรายการ — ${reason}`);
+    await client.query(`UPDATE payments SET ${MARK_DELETED} WHERE id = $1`, [p.id, actor, reason]);
+    await audit(client, actor, 'payment.delete', ref, `ลบรายการ ยอด ${fmt(p.amount)} บาท — ${reason} (เก็บข้อมูลไว้ · กู้คืนได้ที่รายการที่ลบแล้ว)`);
   });
 }
 

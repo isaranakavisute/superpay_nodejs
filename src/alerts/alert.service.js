@@ -3,6 +3,7 @@ import { tgSend } from '../shared/telegram-send.js';
 import { query, withTransaction } from '../db/pool.js';
 import { BadRequestError, NotFoundError } from '../errors.js';
 import { open, seal } from '../shared/secret-box.js';
+import { deleteBodySchema, MARK_DELETED } from '../shared/soft-delete.js';
 
 export const ALERT_KINDS = [
   'withdrawal.pending', 'outflow.pending', 'double_credit.detected', 'low_balance',
@@ -22,7 +23,8 @@ const bot = z.object({
 });
 export const saveBodySchema = z.object({
   bots: z.array(bot).max(20),
-  deleted: z.array(z.coerce.number().int().positive()).default([]),
+  // Bots removed on the page — each with the reason (soft delete: kept, switched off, shown on รายการที่ลบแล้ว).
+  deleted: z.array(z.object({ id: z.coerce.number().int().positive(), reason: deleteBodySchema.shape.reason })).default([]),
   thresholds: z.object({
     repeatMinutes: z.coerce.number().int().min(1).max(1440),
     slipFailCount: z.coerce.number().int().min(1).max(100),
@@ -37,7 +39,7 @@ export async function load() {
   const { rows: bots } = await query(
     `SELECT a.id, a.name, a.enabled, a.bot_channel_id AS "botChannelId", (a.bot_token_enc IS NOT NULL) AS "hasOwnToken",
             a.chat_ids AS "chatIds", a.mentions, a.merchant_id AS "merchantId", a.events, a.last_sent_at AS "lastSentAt", a.updated_at AS "updatedAt"
-       FROM alert_channels a ORDER BY a.id`,
+       FROM alert_channels a WHERE a.deleted_at IS NULL ORDER BY a.id`,
   );
   const { rows: s } = await query(`SELECT key, value FROM console_settings WHERE key LIKE 'alerts.%'`);
   const v = Object.fromEntries(s.map((r) => [r.key, Number(r.value)]));
@@ -51,7 +53,12 @@ export async function load() {
 /** Saves every bot card plus the thresholds in one transaction (the page's single save button). */
 export function save(actor, { bots, deleted, thresholds }) {
   return withTransaction(async (client) => {
-    if (deleted.length) await client.query('DELETE FROM alert_channels WHERE id = ANY($1::int[])', [deleted]);
+    for (const d of deleted) {
+      const { rows } = await client.query(`UPDATE alert_channels SET enabled = false, updated_at = now(), ${MARK_DELETED} WHERE id = $1 AND deleted_at IS NULL RETURNING name`,
+        [d.id, actor ?? 'console', d.reason]);
+      if (rows[0]) await client.query(`INSERT INTO audit_logs (actor, action, entity, entity_ref, detail) VALUES ($1, 'alerts.delete', 'setting', $2, $3)`,
+        [actor ?? 'console', String(d.id), `ลบ bot แจ้งเตือน ${rows[0].name} — ${d.reason} (ปิด · เก็บข้อมูลไว้ · กู้คืนได้ที่รายการที่ลบแล้ว)`]);
+    }
     for (const b of bots) {
       if (b.botChannelId) {
         const { rows } = await client.query(`SELECT 1 FROM channels WHERE id = $1 AND channel_type = 'telegram'`, [b.botChannelId]);
@@ -62,7 +69,7 @@ export function save(actor, { bots, deleted, thresholds }) {
       if (b.id) {
         const { rowCount } = await client.query(
           `UPDATE alert_channels SET name = $2, enabled = $3, status = $4, bot_channel_id = $5, bot_token_enc = coalesce($6, bot_token_enc),
-                  chat_ids = $7, chat_masked = $8, events = $9, mentions = $10, merchant_id = $11, updated_at = now() WHERE id = $1`,
+                  chat_ids = $7, chat_masked = $8, events = $9, mentions = $10, merchant_id = $11, updated_at = now() WHERE id = $1 AND deleted_at IS NULL`,
           [b.id, b.name, b.enabled, status, b.botChannelId, token, b.chatIds, mask(b.chatIds) || '—', b.events, b.mentions, b.merchantId],
         );
         if (!rowCount) throw new NotFoundError(`Alert bot ${b.id} does not exist`);
@@ -88,7 +95,7 @@ export function save(actor, { bots, deleted, thresholds }) {
 export async function test(id, actor) {
   const { rows } = await query(
     `SELECT a.name, a.chat_ids, a.bot_token_enc, c.secrets_enc->>'botToken' AS channel_token
-       FROM alert_channels a LEFT JOIN channels c ON c.id = a.bot_channel_id WHERE a.id = $1`,
+       FROM alert_channels a LEFT JOIN channels c ON c.id = a.bot_channel_id WHERE a.id = $1 AND a.deleted_at IS NULL`,
     [id],
   );
   const a = rows[0];

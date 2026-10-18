@@ -4,6 +4,7 @@ import { BadRequestError, ConflictError, NotFoundError } from '../errors.js';
 import { normalizePromptPayId } from '../shared/promptpay.js';
 import { refuseUnlinkWithPending, syncPrimaryShop } from '../shared/account-links.js';
 import { accountNumber } from '../shared/account-number.js';
+import { MARK_DELETED } from '../shared/soft-delete.js';
 
 /**
  * Bank accounts page (/api/console/accounts-admin). "Reset" starts the
@@ -58,7 +59,7 @@ async function clean(c, b) {
 export function create(actor, body) {
   return withTransaction(async (c) => {
     const b = await clean(c, body);
-    const { rows: dup } = await c.query('SELECT id FROM bank_accounts WHERE bank_code = $1 AND account_no = $2', [b.bankCode, b.accountNo]);
+    const { rows: dup } = await c.query('SELECT id FROM bank_accounts WHERE bank_code = $1 AND account_no = $2 AND deleted_at IS NULL', [b.bankCode, b.accountNo]);
     if (dup[0]) throw new ConflictError(`บัญชีนี้มีอยู่แล้ว (#${dup[0].id})`);
     const { rows } = await c.query(
       `INSERT INTO bank_accounts (label, bank_code, account_type, status, account_name, account_no, promptpay_id, counters_reset_at, balance_at_reset)
@@ -107,16 +108,20 @@ export function reset(ids, actor) {
   });
 }
 
-/** Only accounts that never carried money can be deleted; others are disabled instead. */
-export function remove(id, actor) {
+/**
+ * Only accounts that never carried money can be deleted (others are disabled instead). "ลบ" keeps the account
+ * (soft delete, 18 Oct 2026): it is switched off and hidden from the console; รายการที่ลบแล้ว shows / restores it.
+ */
+export function remove(id, actor, reason) {
   return withTransaction(async (c) => {
     const a = await lock(c, id);
+    if (a.deleted_at) throw new ConflictError(`${a.label} ถูกลบไปแล้ว`);
     const { rows } = await c.query(
       `SELECT (SELECT count(*) FROM payments WHERE bank_account_id = $1) + (SELECT count(*) FROM outflows WHERE bank_account_id = $1) AS n`,
       [id],
     );
     if (Number(rows[0].n) > 0) throw new ConflictError(`บัญชีนี้มีรายการแล้ว ${rows[0].n} รายการ — ลบไม่ได้ ให้ปิดใช้งานแทน`);
-    await c.query('DELETE FROM bank_accounts WHERE id = $1', [id]);
-    await audit(c, actor, 'account.delete', a.label, 'ลบบัญชี');
+    await c.query(`UPDATE bank_accounts SET status = 'inactive', ${MARK_DELETED} WHERE id = $1`, [id, actor, reason]);
+    await audit(c, actor, 'account.delete', a.label, `ลบบัญชี — ${reason} (ปิดใช้งาน · เก็บข้อมูลไว้ · กู้คืนได้ที่รายการที่ลบแล้ว)`);
   });
 }

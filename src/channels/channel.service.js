@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { withTransaction } from '../db/pool.js';
-import { BadRequestError, NotFoundError } from '../errors.js';
+import { BadRequestError, ConflictError, NotFoundError } from '../errors.js';
+import { MARK_DELETED } from '../shared/soft-delete.js';
 import { seal } from '../shared/secret-box.js';
 
 const TYPES = ['telegram', 'line', 'facebook', 'email', 'sms'];
@@ -67,19 +68,14 @@ export function update(id, actor, body) {
   });
 }
 
-export function remove(id, actor) {
+/** "ลบ" keeps the channel (soft delete, 18 Oct 2026): switched off and hidden; รายการที่ลบแล้ว shows / restores it. */
+export function remove(id, actor, reason) {
   return withTransaction(async (client) => {
-    const { rows } = await client.query('SELECT name FROM channels WHERE id = $1 FOR UPDATE', [id]);
+    const { rows } = await client.query('SELECT name, deleted_at FROM channels WHERE id = $1 FOR UPDATE', [id]);
     if (!rows[0]) throw new NotFoundError(`Channel ${id} does not exist`);
-    const { rows: used } = await client.query('SELECT count(*)::int n FROM inbound_events WHERE channel_id = $1', [id]);
-    if (used[0].n > 0) {
-      // Keep history: a channel with events is switched off rather than deleted.
-      await client.query(`UPDATE channels SET enabled = false, status = 'inactive', updated_at = now() WHERE id = $1`, [id]);
-      await audit(client, actor, 'channel.disable', String(id), `ปิด ${rows[0].name} (มี event ${used[0].n} รายการ)`);
-      return { disabled: true };
-    }
-    await client.query('DELETE FROM channels WHERE id = $1', [id]);
-    await audit(client, actor, 'channel.delete', String(id), `ลบ ${rows[0].name}`);
+    if (rows[0].deleted_at) throw new ConflictError(`${rows[0].name} ถูกลบไปแล้ว`);
+    await client.query(`UPDATE channels SET enabled = false, status = 'inactive', updated_at = now(), ${MARK_DELETED} WHERE id = $1`, [id, actor, reason]);
+    await audit(client, actor, 'channel.delete', String(id), `ลบ ${rows[0].name} — ${reason} (ปิดใช้งาน · เก็บข้อมูลไว้ · กู้คืนได้ที่รายการที่ลบแล้ว)`);
     return { deleted: true };
   });
 }

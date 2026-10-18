@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { withTransaction } from '../db/pool.js';
-import { NotFoundError } from '../errors.js';
+import { ConflictError, NotFoundError } from '../errors.js';
+import { MARK_DELETED } from '../shared/soft-delete.js';
 
 export const idParamSchema = z.object({ id: z.coerce.number().int().positive() });
 export const renameBodySchema = z.object({ name: z.string().trim().min(1).max(80) });
@@ -36,9 +37,11 @@ export const resume = (id, actor) =>
     await audit(c, actor, 'device.resume', d.device_uid, `เปิดใช้ ${d.name}`);
   });
 
-export const remove = (id, actor) =>
+/** "ลบ" keeps the device (soft delete, 18 Oct 2026): suspended (it can no longer post) and hidden from the console. */
+export const remove = (id, actor, reason) =>
   withTransaction(async (c) => {
     const d = await lock(c, id);
-    await c.query('DELETE FROM forwarder_devices WHERE id = $1', [id]);
-    await audit(c, actor, 'device.delete', d.device_uid, `ลบ ${d.name}`);
+    if (d.deleted_at) throw new ConflictError(`${d.name} ถูกลบไปแล้ว`);
+    await c.query(`UPDATE forwarder_devices SET status = 'disabled', ${MARK_DELETED} WHERE id = $1`, [id, actor, reason]);
+    await audit(c, actor, 'device.delete', d.device_uid, `ลบ ${d.name} — ${reason} (ระงับ · เก็บข้อมูลไว้ · กู้คืนได้ที่รายการที่ลบแล้ว)`);
   });

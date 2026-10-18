@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import asyncHandler from '../middleware/asyncHandler.js';
+import { reasonOf } from '../shared/soft-delete.js';
 import * as cfg from '../config-admin/config.service.js';
 import * as s from '../telegram/support-bot.service.js';
 import * as ann from '../telegram/announcement.service.js';
@@ -13,7 +14,7 @@ const id = (req) => z.coerce.number().int().positive().parse(req.params.id);
 supportBotAdminRouter.get('/', h(async () => ({ faqs: await s.listFaqs(), settings: (await cfg.getAll()).supportBot ?? null })));
 supportBotAdminRouter.post('/faqs', h((req) => s.createFaq(req.actor, s.faqSchema.parse(req.body))));
 supportBotAdminRouter.post('/faqs/:id', h((req) => s.updateFaq(req.actor, id(req), s.faqSchema.parse(req.body))));
-supportBotAdminRouter.post('/faqs/:id/delete', h((req) => s.deleteFaq(req.actor, id(req))));
+supportBotAdminRouter.post('/faqs/:id/delete', h((req) => s.deleteFaq(req.actor, id(req), reasonOf(req.body))));
 supportBotAdminRouter.post('/test', h((req) => s.testMatch(z.object({ text: z.string().max(1000) }).parse(req.body).text)));
 supportBotAdminRouter.post('/settings', h((req) => cfg.save('supportBot', req.actor, req.body)));
 
@@ -21,6 +22,6 @@ supportBotAdminRouter.post('/settings', h((req) => cfg.save('supportBot', req.ac
 supportBotAdminRouter.get('/announcements', h(async () => ({ announcements: await ann.listAnnouncements(), chats: await ann.listChats(), slots: ann.HOURLY_SLOTS, posting: await ann.postingStatus() })));
 supportBotAdminRouter.post('/announcements', h((req) => ann.createAnnouncement(req.actor, ann.announcementSchema.parse(req.body))));
 supportBotAdminRouter.post('/announcements/:id', h((req) => ann.updateAnnouncement(req.actor, id(req), ann.announcementSchema.parse(req.body))));
-supportBotAdminRouter.post('/announcements/:id/delete', h((req) => ann.deleteAnnouncement(req.actor, id(req))));
+supportBotAdminRouter.post('/announcements/:id/delete', h((req) => ann.deleteAnnouncement(req.actor, id(req), reasonOf(req.body))));
 
 export default supportBotAdminRouter;

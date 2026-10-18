@@ -11,6 +11,8 @@ import dashboardRouter from './routes/dashboard.routes.js';
 import authRouter from './routes/auth.routes.js';
 import consoleRouter from './routes/console.routes.js';
 import paymentsAdminRouter from './routes/payments-admin.routes.js';
+import deletedAdminRouter from './routes/deleted-admin.routes.js';
+import txnSearchAdminRouter from './routes/txn-search-admin.routes.js';
 import outflowsAdminRouter from './routes/outflows-admin.routes.js';
 import withdrawalsAdminRouter from './routes/withdrawals-admin.routes.js';
 import p2pAdminRouter from './routes/p2p-admin.routes.js';
@@ -28,6 +30,9 @@ import profileRouter from './routes/profile.routes.js';
 import configAdminRouter from './routes/config-admin.routes.js';
 import v1Router from './routes/v1.routes.js';
 import { consoleActionLog } from './merchant-api/request-log.js';
+import asyncHandler from './middleware/asyncHandler.js';
+import { CALLBACK_CHECK_PATH, checkCallback } from './merchant-api/callback-check.js';
+import { viewerContext } from './shared/private-records.js';
 import telegramRouter from './routes/telegram.routes.js';
 import supportBotAdminRouter from './routes/support-bot.routes.js';
 import portalRouter from './routes/portal.routes.js';
@@ -97,7 +102,24 @@ export function createApp() {
   app.use('/api/products', productsRouter);
   // Merchant API: its own auth (X-API-Key), not the console key.
   // Admin actions through the console API are recorded alongside merchant API calls (บันทึกการเรียก API).
+  // Who is looking (private test records are shown only to their owner).
+  app.use(['/api/console', '/api/dashboard'], viewerContext);
   app.use('/api/console', consoleActionLog);
+  // Test receiver for shop callbacks (same request as prismapays' endpoint; my-shop only) — before the merchant API's auth.
+  const checkHits = new Map();
+  app.post(CALLBACK_CHECK_PATH, asyncHandler(async (req, res) => {
+    const ip = req.get('x-forwarded-for')?.split(',')[0].trim() || req.ip;
+    const minute = Math.floor(Date.now() / 60_000);
+    const hit = checkHits.get(ip);
+    const n = hit?.minute === minute ? hit.n + 1 : 1;
+    checkHits.set(ip, { minute, n });
+    if (checkHits.size > 5000) checkHits.clear();
+    if (n > 120) return res.status(429).json({ valid: false, error: { code: 'RATE_LIMITED', message: 'เรียกถี่เกินไป (สูงสุด 120 ครั้ง/นาที)' } });
+    const r = await checkCallback({ headers: req.headers, raw: req.rawBody });
+    // The result is also printed to the backend's console (docker logs superpayment_nodejs) for the operator to read.
+    console.log(`[callback-check ${new Date().toISOString()}] HTTP ${r.status}\n${JSON.stringify(r.body, null, 2)}`);
+    res.status(r.status).json(r.body);
+  }));
   app.use('/api/v1', v1Router);
   // Telegram slip-check bot webhook (secret header checked inside).
   app.use('/api/telegram', telegramRouter);
@@ -123,6 +145,8 @@ export function createApp() {
   app.use('/api/console/config', requireConsoleKey, configAdminRouter);
   app.use('/api/console/portal', requireConsoleKey, portalRouter);
   app.use('/api/console/accounts-admin', requireConsoleKey, accountsAdminRouter);
+  app.use('/api/console/deleted', requireConsoleKey, deletedAdminRouter);
+  app.use('/api/console/txn-search', requireConsoleKey, txnSearchAdminRouter);
   app.use('/api/console', requireConsoleKey, consoleRouter);
 
   app.use(notFoundHandler);

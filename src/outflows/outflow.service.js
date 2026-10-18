@@ -2,13 +2,14 @@ import { query, withTransaction } from '../db/pool.js';
 import { BadRequestError, ConflictError, NotFoundError } from '../errors.js';
 import logger from '../logger.js';
 import { deliverPayoutEvent, deliverWithdrawalEvent } from '../webhooks/webhook.service.js';
+import { MARK_DELETED } from '../shared/soft-delete.js';
 
 /** Operator actions on outflows: lock → check transition → update → audit. */
 
 const fmt = (n) => Number(n).toLocaleString('th-TH', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
 async function lock(client, ref) {
-  const { rows } = await client.query('SELECT id, ref, status, amount, fee, bank_account_id, receiver_name, admin_done, source FROM outflows WHERE ref = $1 FOR UPDATE', [ref]);
+  const { rows } = await client.query('SELECT id, ref, status, amount, fee, bank_account_id, receiver_name, admin_done, source, deleted_at FROM outflows WHERE ref = $1 FOR UPDATE', [ref]);
   if (!rows[0]) throw new NotFoundError(`Outflow ${ref} does not exist`);
   return rows[0];
 }
@@ -129,15 +130,20 @@ export function create(actor, input) {
   });
 }
 
-export function remove(ref, actor) {
+/**
+ * "ลบ" keeps the payout (soft delete, 18 Oct 2026): a pending one is first rejected with the reason (an API payout
+ * gets payout.failed), then it is hidden from the console (รายการที่ลบแล้ว shows / restores it). Paid money stays.
+ */
+export function remove(ref, actor, reason) {
   return withTransaction(async (client) => {
     const o = await lock(client, ref);
-    // Paid money stays on record.
     requireStatus(o, ['pending', 'rejected'], 'delete');
+    if (o.deleted_at) throw new ConflictError(`${ref} ถูกลบไปแล้ว`);
     const { rows } = await client.query('SELECT 1 FROM withdrawal_requests WHERE outflow_id = $1', [o.id]);
     if (rows[0]) throw new ConflictError(`Cannot delete ${ref}: it pays a withdrawal request`);
-    await client.query('DELETE FROM outflows WHERE id = $1', [o.id]);
-    await audit(client, actor, 'outflow.delete', ref, `ลบรายการ ${fmt(o.amount)} บาท`);
+    if (o.status === 'pending') await rejectOne(client, ref, actor, `ลบรายการ — ${reason}`);
+    await client.query(`UPDATE outflows SET ${MARK_DELETED} WHERE id = $1`, [o.id, actor, reason]);
+    await audit(client, actor, 'outflow.delete', ref, `ลบรายการ ${fmt(o.amount)} บาท — ${reason} (เก็บข้อมูลไว้ · กู้คืนได้ที่รายการที่ลบแล้ว)`);
   });
 }
 

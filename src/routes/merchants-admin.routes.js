@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import asyncHandler from '../middleware/asyncHandler.js';
+import { reasonOf } from '../shared/soft-delete.js';
 import * as s from '../merchants/merchant.service.js';
 import * as bd from '../merchants/breakdown.service.js';
 
@@ -13,7 +14,7 @@ const h = (fn) => asyncHandler(async (req, res) => res.json({ ok: true, ...((awa
 
 merchantsAdminRouter.post('/', h((req) => s.create(req.actor, s.createBodySchema.parse(req.body))));
 merchantsAdminRouter.post('/:id/update', h((req) => s.update(id(req), req.actor, s.updateBodySchema.parse(req.body))));
-merchantsAdminRouter.delete('/:id', h((req) => s.remove(id(req), req.actor)));
+merchantsAdminRouter.delete('/:id', h((req) => s.remove(id(req), req.actor, reasonOf(req.body))));
 
 merchantsAdminRouter.get('/:id/credits', h(async (req) => s.credits(id(req))));
 // แดชบอร์ดร้านค้า: every transaction behind the gross → net and net → balance cards.

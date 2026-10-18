@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import asyncHandler from '../middleware/asyncHandler.js';
+import { reasonOf } from '../shared/soft-delete.js';
 import { z } from 'zod';
 import * as s from '../config-admin/config.service.js';
 import { demoVerify } from '../merchant-api/slip-verify.js';
@@ -16,8 +17,8 @@ const demoSchema = z.object({ image: z.string().min(10).max(11_000_000), mime: z
 configAdminRouter.post('/slip/demo-verify', h(async (req) => ({ result: await demoVerify(demoSchema.parse(req.body)) })));
 configAdminRouter.post('/quota/check', h((req) => s.checkQuota(req.actor)));
 configAdminRouter.post('/assets/:kind', h((req) => s.uploadAsset(kind(req), req.actor, s.assetBodySchema.parse(req.body))));
-configAdminRouter.post('/assets/:kind/:id/delete', h((req) => s.removeAsset(kind(req), req.actor, String(req.params.id).replace(/[^a-f0-9]/g, ''))));
-configAdminRouter.post('/assets/:kind/delete', h((req) => s.removeAsset(kind(req), req.actor)));
+configAdminRouter.post('/assets/:kind/:id/delete', h((req) => s.removeAsset(kind(req), req.actor, String(req.params.id).replace(/[^a-f0-9]/g, ''), reasonOf(req.body))));
+configAdminRouter.post('/assets/:kind/delete', h((req) => s.removeAsset(kind(req), req.actor, undefined, reasonOf(req.body))));
 configAdminRouter.get('/asset/:id', asyncHandler(async (req, res) => {
   const a = await s.getAsset(String(req.params.id).replace(/[^a-f0-9]/g, ''));
   res.set({ 'content-type': a.mime, 'cache-control': 'private, max-age=300', 'x-content-type-options': 'nosniff' }).send(a.data);

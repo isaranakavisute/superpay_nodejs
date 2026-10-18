@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import asyncHandler from '../middleware/asyncHandler.js';
+import { reasonOf } from '../shared/soft-delete.js';
 import * as service from '../outflows/outflow.service.js';
 import {
   adminDoneBodySchema,
@@ -32,6 +33,6 @@ outflowsAdminRouter.get(
     res.set('content-type', slip.mime).set('cache-control', 'private, no-store').send(slip.data);
   }),
 );
-outflowsAdminRouter.delete('/:ref', asyncHandler(async (req, res) => done(res, await service.remove(ref(req), req.actor))));
+outflowsAdminRouter.delete('/:ref', asyncHandler(async (req, res) => done(res, await service.remove(ref(req), req.actor, reasonOf(req.body)))));
 
 export default outflowsAdminRouter;

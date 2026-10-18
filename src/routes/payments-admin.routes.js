@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import asyncHandler from '../middleware/asyncHandler.js';
+import { reasonOf } from '../shared/soft-delete.js';
 import * as service from '../payments/payment.service.js';
 import {
   amountBodySchema,
@@ -36,6 +37,6 @@ paymentsAdminRouter.get(
     res.set('content-type', slip.mime).set('cache-control', 'private, no-store').send(slip.data);
   }),
 );
-paymentsAdminRouter.delete('/:ref', asyncHandler(async (req, res) => done(res, await service.remove(ref(req), req.actor))));
+paymentsAdminRouter.delete('/:ref', asyncHandler(async (req, res) => done(res, await service.remove(ref(req), req.actor, reasonOf(req.body)))));
 
 export default paymentsAdminRouter;

@@ -5,6 +5,7 @@ import { query, withTransaction } from '../db/pool.js';
 import logger from '../logger.js';
 import { BadRequestError, NotFoundError } from '../errors.js';
 import { open, seal } from '../shared/secret-box.js';
+import { MARK_DELETED } from '../shared/soft-delete.js';
 import { BlockedUrlError, safeGet, safePost } from '../shared/safe-fetch.js';
 import { sendAlert } from '../alerts/alert.service.js';
 
@@ -161,7 +162,7 @@ export async function getAll() {
     const r = await raw(section);
     out[section] = { ...present(section, r.value), updatedAt: r.updatedAt, updatedBy: r.updatedBy };
   }
-  const { rows } = await query(`SELECT id, name, mime, octet_length(data) AS bytes, created_at AS "createdAt" FROM console_assets WHERE kind = 'sound' ORDER BY created_at`);
+  const { rows } = await query(`SELECT id, name, mime, octet_length(data) AS bytes, created_at AS "createdAt" FROM console_assets WHERE kind = 'sound' AND deleted_at IS NULL ORDER BY created_at`);
   out.customSounds = rows;
   return out;
 }
@@ -243,7 +244,8 @@ export function uploadAsset(kind, actor, { mime, data, name }) {
       // Logo / favicon: point brand at the new file and drop the old one.
       const field = `${kind}Asset`;
       const { value } = await raw('brand', client);
-      if (value[field]) await client.query('DELETE FROM console_assets WHERE id = $1', [value[field]]);
+      // The old file is kept (soft delete) and shows on รายการที่ลบแล้ว.
+      if (value[field]) await client.query(`UPDATE console_assets SET ${MARK_DELETED} WHERE id = $1 AND deleted_at IS NULL`, [value[field], actor ?? 'console', `แทนที่ด้วย${kind}ใหม่`]);
       await client.query(
         `INSERT INTO console_config (section, value, updated_by) VALUES ('brand', $1, $2)
          ON CONFLICT (section) DO UPDATE SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by, updated_at = now()`,
@@ -255,24 +257,25 @@ export function uploadAsset(kind, actor, { mime, data, name }) {
   });
 }
 
-export function removeAsset(kind, actor, id) {
+/** "ลบ" keeps the file (soft delete, 18 Oct 2026): it stops being used and shows on รายการที่ลบแล้ว. */
+export function removeAsset(kind, actor, id, reason) {
   return withTransaction(async (client) => {
     if (kind === 'sound') {
-      const { rowCount } = await client.query(`DELETE FROM console_assets WHERE id = $1 AND kind = 'sound'`, [id]);
+      const { rowCount } = await client.query(`UPDATE console_assets SET ${MARK_DELETED} WHERE id = $1 AND kind = 'sound' AND deleted_at IS NULL`, [id, actor ?? 'console', reason]);
       if (!rowCount) throw new NotFoundError('ไม่พบไฟล์เสียง');
       const { value } = await raw('sounds', client);
       await client.query(`UPDATE console_config SET value = $1, updated_by = $2, updated_at = now() WHERE section = 'sounds'`, [JSON.stringify({ ...value, sequence: value.sequence.filter((s) => s !== `custom:${id}`) }), actor]);
     } else {
       const field = `${kind}Asset`;
       const { value } = await raw('brand', client);
-      if (value[field]) await client.query('DELETE FROM console_assets WHERE id = $1', [value[field]]);
+      if (value[field]) await client.query(`UPDATE console_assets SET ${MARK_DELETED} WHERE id = $1 AND deleted_at IS NULL`, [value[field], actor ?? 'console', reason]);
       await client.query(
         `INSERT INTO console_config (section, value, updated_by) VALUES ('brand', $1, $2)
          ON CONFLICT (section) DO UPDATE SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by, updated_at = now()`,
         [JSON.stringify({ ...value, [field]: null }), actor],
       );
     }
-    await audit(client, actor, kind, `ลบ ${kind}`);
+    await audit(client, actor, kind, `ลบ ${kind} — ${reason} (เก็บไฟล์ไว้ · กู้คืนได้ที่รายการที่ลบแล้ว)`);
   });
 }
 

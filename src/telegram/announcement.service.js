@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { tgSend } from '../shared/telegram-send.js';
 import { query } from '../db/pool.js';
+import { MARK_DELETED } from '../shared/soft-delete.js';
 import { NotFoundError } from '../errors.js';
 import { internal as configOf } from '../config-admin/config.service.js';
 import logger from '../logger.js';
@@ -122,7 +123,7 @@ export async function postingStatus() {
 }
 
 export async function listAnnouncements() {
-  const { rows } = await query(`SELECT ${COLS} FROM announcements ORDER BY id`);
+  const { rows } = await query(`SELECT ${COLS} FROM announcements WHERE deleted_at IS NULL ORDER BY id`);
   return rows.map(present);
 }
 const fields = (b) => [b.title, b.message, b.mode, b.mode === 'times' ? [...new Set(b.times)].sort() : [], b.mode === 'interval' ? b.intervalSeconds : null,
@@ -140,15 +141,16 @@ export async function createAnnouncement(actor, b) {
   return { id: rows[0].id, ...(await postIfNow(rows[0].id, b)) };
 }
 export async function updateAnnouncement(actor, id, b) {
-  const { rowCount } = await query(`UPDATE announcements SET title = $2, message = $3, mode = $4, times = $5, interval_seconds = $6, start_at = $7, enabled = $8, on_date = $9, updated_by = $10, updated_at = now() WHERE id = $1`, [id, ...fields(b), actor]);
+  const { rowCount } = await query(`UPDATE announcements SET title = $2, message = $3, mode = $4, times = $5, interval_seconds = $6, start_at = $7, enabled = $8, on_date = $9, updated_by = $10, updated_at = now() WHERE id = $1 AND deleted_at IS NULL`, [id, ...fields(b), actor]);
   if (!rowCount) throw new NotFoundError('ไม่พบประชาสัมพันธ์นี้');
   await audit(actor, 'announcement.update', String(id), `แก้ไขประชาสัมพันธ์: ${b.title}`);
   return { success: true, ...(await postIfNow(id, b)) };
 }
-export async function deleteAnnouncement(actor, id) {
-  const { rows } = await query('DELETE FROM announcements WHERE id = $1 RETURNING title', [id]);
+/** "ลบ" keeps the announcement (soft delete, 18 Oct 2026): switched off and hidden; รายการที่ลบแล้ว shows / restores it. */
+export async function deleteAnnouncement(actor, id, reason) {
+  const { rows } = await query(`UPDATE announcements SET enabled = false, ${MARK_DELETED} WHERE id = $1 AND deleted_at IS NULL RETURNING title`, [id, actor ?? 'console', reason]);
   if (!rows[0]) throw new NotFoundError('ไม่พบประชาสัมพันธ์นี้');
-  await audit(actor, 'announcement.delete', String(id), `ลบประชาสัมพันธ์: ${rows[0].title}`);
+  await audit(actor, 'announcement.delete', String(id), `ลบประชาสัมพันธ์: ${rows[0].title} — ${reason} (เก็บข้อมูลไว้ · กู้คืนได้ที่รายการที่ลบแล้ว)`);
   return { success: true };
 }
 
@@ -181,7 +183,7 @@ export async function runDue(now = Date.now()) {
   // Posting needs only the bot token: switching off บอทตอบคำถาม (FAQ answers) does not stop ประชาสัมพันธ์.
   const cfg = await configOf('supportBot');
   if (!cfg.botToken) return;
-  const { rows } = await query(`SELECT *, to_char(on_date, 'YYYY-MM-DD') AS on_day FROM announcements WHERE enabled AND mode <> 'now'`);
+  const { rows } = await query(`SELECT *, to_char(on_date, 'YYYY-MM-DD') AS on_day FROM announcements WHERE enabled AND deleted_at IS NULL AND mode <> 'now'`);
   for (const a of rows) {
     const slot = latestSlot(a, now);
     if (slot !== null && now - slot <= CATCH_UP_MS) await post(a, slot, false).catch((err) => logger.warn({ err: err.message, id: a.id }, 'announcement post failed'));

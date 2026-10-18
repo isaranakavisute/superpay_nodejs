@@ -1,5 +1,6 @@
 import { query } from '../db/pool.js';
 import { COMMISSION_SQL } from '../shared/balance-sql.js';
+import { visible } from '../shared/private-records.js';
 
 // Tables from migrations/002_create_payment_tables.sql. Read-only here.
 // Window params are nullable: `$n::timestamptz IS NULL` means "unbounded".
@@ -14,7 +15,7 @@ export async function paymentStatusTotals(from, to) {
             sum(fee)       AS fee,
             sum(commission) AS commission
        FROM payments
-      WHERE ${IN_WINDOW('created_at')}
+      WHERE ${IN_WINDOW('created_at')} AND deleted_at IS NULL AND ${visible('payment', 'ref')}
       GROUP BY status`,
     [from, to],
   );
@@ -25,7 +26,7 @@ export async function outflowStatusTotals(from, to) {
   const { rows } = await query(
     `SELECT status, count(*)::int AS count, sum(amount) AS amount
        FROM outflows
-      WHERE ${IN_WINDOW('created_at')}
+      WHERE ${IN_WINDOW('created_at')} AND deleted_at IS NULL AND ${visible('outflow', 'ref')}
       GROUP BY status`,
     [from, to],
   );
@@ -35,8 +36,8 @@ export async function outflowStatusTotals(from, to) {
 /** Live queue sizes — deliberately not windowed. */
 export async function pendingCounts() {
   const { rows } = await query(
-    `SELECT (SELECT count(*)::int FROM payments WHERE status = 'pending') AS payments,
-            (SELECT count(*)::int FROM outflows WHERE status = 'pending' OR (status = 'approved' AND NOT admin_done)) AS outflows`,
+    `SELECT (SELECT count(*)::int FROM payments WHERE status = 'pending' AND ${visible('payment', 'ref')}) AS payments,
+            (SELECT count(*)::int FROM outflows WHERE (status = 'pending' OR (status = 'approved' AND NOT admin_done)) AND ${visible('outflow', 'ref')}) AS outflows`,
   );
   return rows[0];
 }
@@ -80,7 +81,7 @@ export async function recentPayments(from, to, limit) {
        LEFT JOIN banks b     ON b.code = p.payer_bank_code
        JOIN bank_accounts a  ON a.id = p.bank_account_id
        JOIN banks ab         ON ab.code = a.bank_code
-      WHERE ${IN_WINDOW('p.created_at')}
+      WHERE ${IN_WINDOW('p.created_at')} AND p.deleted_at IS NULL AND ${visible('payment', 'p.ref')}
       ORDER BY p.created_at DESC, p.id DESC
       LIMIT $3`,
     [from, to, limit],
@@ -107,7 +108,7 @@ export async function recentOutflows(from, to, limit) {
        LEFT JOIN bank_accounts a ON a.id = o.bank_account_id   -- approval needs no account: keep those payouts too
        LEFT JOIN merchants m ON m.id = o.merchant_id
        JOIN banks b         ON b.code = o.receiver_bank_code
-      WHERE ${IN_WINDOW('o.created_at')}
+      WHERE ${IN_WINDOW('o.created_at')} AND o.deleted_at IS NULL AND ${visible('outflow', 'o.ref')}
       ORDER BY o.created_at DESC, o.id DESC
       LIMIT $3`,
     [from, to, limit],
@@ -124,22 +125,22 @@ export async function merchantStats(from, to) {
     `WITH win_in AS (
        SELECT merchant_id, sum(amount) AS total, sum(fee) AS fee, count(*)::int AS n
          FROM payments
-        WHERE status = 'approved' AND ${IN_WINDOW('created_at')}
+        WHERE status = 'approved' AND ${IN_WINDOW('created_at')} AND ${visible('payment', 'ref')}
         GROUP BY merchant_id
      ), win_out AS (
        SELECT merchant_id, sum(amount) AS total, sum(fee) AS fee, count(*)::int AS n
          FROM outflows
-        WHERE status = 'approved' AND ${IN_WINDOW('created_at')}
+        WHERE status = 'approved' AND ${IN_WINDOW('created_at')} AND ${visible('outflow', 'ref')}
         GROUP BY merchant_id
      ), live_in AS (
        SELECT merchant_id, sum(amount - fee) AS net FROM payments
-        WHERE status = 'approved' GROUP BY merchant_id
+        WHERE status = 'approved' AND ${visible('payment', 'ref')} GROUP BY merchant_id
      ), live_out AS (
        SELECT merchant_id, sum(amount + fee) AS total FROM outflows
-        WHERE status = 'approved' GROUP BY merchant_id
+        WHERE status = 'approved' AND ${visible('outflow', 'ref')} GROUP BY merchant_id
      ), pending AS (
        SELECT merchant_id, count(*)::int AS n FROM payments
-        WHERE status = 'pending' GROUP BY merchant_id
+        WHERE status = 'pending' AND ${visible('payment', 'ref')} GROUP BY merchant_id
      )
      SELECT m.id,
             m.name,
@@ -175,7 +176,8 @@ export async function merchantStats(from, to) {
        LEFT JOIN live_in li  ON li.merchant_id = m.id
        LEFT JOIN live_out lo ON lo.merchant_id = m.id
        LEFT JOIN pending pe  ON pe.merchant_id = m.id
-       LEFT JOIN (SELECT merchant_id, sum(amount) AS total FROM merchant_credit_adjustments GROUP BY merchant_id) adj ON adj.merchant_id = m.id
+       LEFT JOIN (SELECT merchant_id, sum(amount) AS total FROM merchant_credit_adjustments WHERE ${visible('credit', 'id')} GROUP BY merchant_id) adj ON adj.merchant_id = m.id
+      WHERE m.deleted_at IS NULL
       ORDER BY coalesce(wi.total, 0) DESC, m.id`,
     [from, to],
   );
@@ -210,8 +212,8 @@ export async function dailyTrend(days, merchantId = null) {
 /** Live work queues for the console's menu badges and bell. */
 export async function queueCounts() {
   const { rows } = await query(
-    `SELECT (SELECT count(*)::int FROM payments WHERE status = 'pending')            AS payments,
-            (SELECT count(*)::int FROM outflows WHERE status = 'pending' OR (status = 'approved' AND NOT admin_done))            AS outflows,
+    `SELECT (SELECT count(*)::int FROM payments WHERE status = 'pending' AND ${visible('payment', 'ref')})            AS payments,
+            (SELECT count(*)::int FROM outflows WHERE (status = 'pending' OR (status = 'approved' AND NOT admin_done)) AND ${visible('outflow', 'ref')})            AS outflows,
             (SELECT count(*)::int FROM withdrawal_requests WHERE status = 'pending') AS withdrawals,
             (SELECT count(*)::int FROM double_credits WHERE status = 'open')         AS "doubleCredits",
             (SELECT count(*)::int FROM inbound_events WHERE status = 'new')          AS events`,

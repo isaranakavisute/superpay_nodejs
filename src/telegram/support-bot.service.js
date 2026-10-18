@@ -2,6 +2,7 @@ import { timingSafeEqual } from 'node:crypto';
 import { tgSend } from '../shared/telegram-send.js';
 import { z } from 'zod';
 import { query } from '../db/pool.js';
+import { MARK_DELETED } from '../shared/soft-delete.js';
 import { NotFoundError } from '../errors.js';
 import { internal as configOf } from '../config-admin/config.service.js';
 import logger from '../logger.js';
@@ -65,7 +66,7 @@ const audit = (actor, action, ref, detail) => query(
   `INSERT INTO audit_logs (actor, action, entity, entity_ref, detail) VALUES ($1, $2, 'setting', $3, $4)`, [actor ?? 'console', action, ref, detail]);
 
 export async function listFaqs() {
-  const { rows } = await query(`SELECT ${COLS} FROM support_faqs ORDER BY sort, id`);
+  const { rows } = await query(`SELECT ${COLS} FROM support_faqs WHERE deleted_at IS NULL ORDER BY sort, id`);
   return rows;
 }
 export async function createFaq(actor, b) {
@@ -76,15 +77,16 @@ export async function createFaq(actor, b) {
 }
 export async function updateFaq(actor, id, b) {
   const { rows } = await query(`UPDATE support_faqs SET question = $2, keywords = $3, answer = $4, enabled = $5, sort = $6, updated_by = $7, updated_at = now()
-     WHERE id = $1 RETURNING ${COLS}`, [id, b.question, b.keywords, b.answer, b.enabled, b.sort, actor]);
+     WHERE id = $1 AND deleted_at IS NULL RETURNING ${COLS}`, [id, b.question, b.keywords, b.answer, b.enabled, b.sort, actor]);
   if (!rows[0]) throw new NotFoundError('ไม่พบคำถามนี้');
   await audit(actor, 'supportbot.faq_update', String(id), `แก้ไขคำถาม: ${b.question}`);
   return { faq: rows[0] };
 }
-export async function deleteFaq(actor, id) {
-  const { rows } = await query('DELETE FROM support_faqs WHERE id = $1 RETURNING question', [id]);
+/** "ลบ" keeps the question (soft delete, 18 Oct 2026): switched off and hidden; รายการที่ลบแล้ว shows / restores it. */
+export async function deleteFaq(actor, id, reason) {
+  const { rows } = await query(`UPDATE support_faqs SET enabled = false, ${MARK_DELETED} WHERE id = $1 AND deleted_at IS NULL RETURNING question`, [id, actor ?? 'console', reason]);
   if (!rows[0]) throw new NotFoundError('ไม่พบคำถามนี้');
-  await audit(actor, 'supportbot.faq_delete', String(id), `ลบคำถาม: ${rows[0].question}`);
+  await audit(actor, 'supportbot.faq_delete', String(id), `ลบคำถาม: ${rows[0].question} — ${reason} (เก็บข้อมูลไว้ · กู้คืนได้ที่รายการที่ลบแล้ว)`);
   return { success: true };
 }
 /** Admin "test" box: which answer would this message get? */

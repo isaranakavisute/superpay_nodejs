@@ -5,7 +5,9 @@ import { query } from '../db/pool.js';
  * so the summary can count every status under the other filters (tab counts).
  */
 function buildWhere(res, params, { q, from, to, filters }, { skipStatus = false } = {}) {
-  const conditions = [];
+  // `live`: rows the resource always hides — soft-deleted ones (shown on รายการที่ลบแล้ว instead).
+  const conditions = res.live ? [res.live] : [];
+  if (res.hide) conditions.push(...[].concat(res.hide()));
   const add = (sql, value) => {
     params.push(value);
     conditions.push(sql.replaceAll('$?', `$${params.length}`));

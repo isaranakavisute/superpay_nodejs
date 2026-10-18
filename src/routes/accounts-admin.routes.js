@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import asyncHandler from '../middleware/asyncHandler.js';
+import { reasonOf } from '../shared/soft-delete.js';
 import * as s from '../accounts-admin/account.service.js';
 
 // Bank accounts page at /api/console/accounts-admin (behind the console key).
@@ -12,6 +13,6 @@ accountsAdminRouter.post('/reset', h((req) => s.reset(s.resetAllSchema.parse(req
 accountsAdminRouter.post('/:id/update', h((req) => s.update(id(req), req.actor, s.bodySchema.parse(req.body))));
 accountsAdminRouter.post('/:id/toggle', h((req) => s.toggle(id(req), req.actor)));
 accountsAdminRouter.post('/:id/reset', h((req) => s.reset([id(req)], req.actor)));
-accountsAdminRouter.post('/:id/delete', h((req) => s.remove(id(req), req.actor)));
+accountsAdminRouter.post('/:id/delete', h((req) => s.remove(id(req), req.actor, reasonOf(req.body))));
 
 export default accountsAdminRouter;

@@ -22,6 +22,7 @@ import { stopwatch, timingOf, withTiming } from '../shared/stopwatch.js';
 import { BALANCE_SQL } from '../shared/balance-sql.js';
 import { effectiveStatus, syncPaymentSplits, writeSplits } from '../merchants/tree.js';
 import { amountRule, linkCount, refuseUnlinkWithPending, syncPrimaryShop, uniqueAmount } from '../shared/account-links.js';
+import { visible } from '../shared/private-records.js';
 
 /**
  * Merchant REST API v1. Every function gets the authenticated merchant row
@@ -726,7 +727,8 @@ export async function transactions(m, q, { base }) {
   await expireDue();
   const st = statusFilter(q.status, STATUS);
   const args = [m.id, st, q.from ?? null, q.to ?? null];
-  const where = `p.merchant_id = $1 AND ($2::text[] IS NULL OR p.status = ANY ($2)) AND ($3::timestamptz IS NULL OR p.created_at >= $3) AND ($4::timestamptz IS NULL OR p.created_at < $4)`;
+  // Private test records never show in the portal lists (they stay reachable by ref through the API).
+  const where = `p.merchant_id = $1 AND ($2::text[] IS NULL OR p.status = ANY ($2)) AND ($3::timestamptz IS NULL OR p.created_at >= $3) AND ($4::timestamptz IS NULL OR p.created_at < $4) AND ${visible('payment', 'p.ref')}`;
   const [{ rows }, { rows: n }] = await Promise.all([
     query(`${PAY_SELECT} WHERE ${where} ORDER BY p.created_at DESC, p.id DESC LIMIT ${q.limit} OFFSET ${q.offset}`, args),
     query(`SELECT count(*)::int AS n FROM payments p WHERE ${where}`, args),
@@ -809,7 +811,7 @@ export async function payout(m, { id, merchantRef }) {
 export async function payouts(m, q) {
   const st = statusFilter(q.status, O_STATUS);
   const args = [m.id, st, q.from ?? null, q.to ?? null];
-  const where = `merchant_id = $1 AND ($2::text[] IS NULL OR status = ANY ($2)) AND ($3::timestamptz IS NULL OR created_at >= $3) AND ($4::timestamptz IS NULL OR created_at < $4)`;
+  const where = `merchant_id = $1 AND ($2::text[] IS NULL OR status = ANY ($2)) AND ($3::timestamptz IS NULL OR created_at >= $3) AND ($4::timestamptz IS NULL OR created_at < $4) AND ${visible('outflow', 'ref')}`;
   const [{ rows }, { rows: n }] = await Promise.all([
     query(`SELECT * FROM outflows WHERE ${where} ORDER BY created_at DESC, id DESC LIMIT ${q.limit} OFFSET ${q.offset}`, args),
     query(`SELECT count(*)::int AS n FROM outflows WHERE ${where}`, args),
@@ -900,7 +902,7 @@ export function addAccount(m, b) {
     // admin can share it (Admin → บัญชีธนาคาร → ผูกกับร้าน).
     const { rows: same } = await c.query(
       `SELECT a.id, EXISTS (SELECT 1 FROM bank_account_merchants l WHERE l.bank_account_id = a.id AND l.merchant_id = $3) AS mine
-         FROM bank_accounts a WHERE a.bank_code = $1 AND (a.account_no = $2 OR a.promptpay_id = $2) ORDER BY a.id LIMIT 1`,
+         FROM bank_accounts a WHERE a.bank_code = $1 AND (a.account_no = $2 OR a.promptpay_id = $2) AND a.deleted_at IS NULL ORDER BY a.id LIMIT 1`,
       [code, digits, m.id],
     );
     if (same[0] && !same[0].mine) throw new ApiError(409, 'ACCOUNT_EXISTS', 'บัญชีนี้มีอยู่ในระบบแล้ว — ติดต่อผู้ดูแลระบบเพื่อผูกบัญชีนี้กับร้านของคุณ (ใช้บัญชีร่วมกันได้)');

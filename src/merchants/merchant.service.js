@@ -5,7 +5,9 @@ import { query, withTransaction } from '../db/pool.js';
 import { BadRequestError, ConflictError, NotFoundError } from '../errors.js';
 import { seal } from '../shared/secret-box.js';
 import { BALANCE_SQL } from '../shared/balance-sql.js';
+import { MARK_DELETED } from '../shared/soft-delete.js';
 import { MAX_DEPTH, checkRatesAgainstChildren, checkRatesAgainstParent, inSubtree } from './tree.js';
+import { visible } from '../shared/private-records.js';
 
 const money = z.coerce.number().min(0).max(100_000_000).multipleOf(0.01);
 export const idParamSchema = z.object({ id: z.coerce.number().int().positive() });
@@ -143,10 +145,15 @@ export function update(id, actor, b) {
   });
 }
 
-export function remove(id, actor) {
+/**
+ * "ลบร้าน" keeps the shop (soft delete, 18 Oct 2026): only a shop with no transactions and no live sub-shops, as
+ * before. It is suspended (API keys and portal logins stop) and its webhook is disabled, then hidden from the console.
+ */
+export function remove(id, actor, reason) {
   return withTransaction(async (client) => {
     const m = await lock(client, id);
-    const { rows: kids } = await client.query('SELECT count(*)::int AS n FROM merchants WHERE parent_id = $1', [id]);
+    if (m.deleted_at) throw new ConflictError(`${m.name} ถูกลบไปแล้ว`);
+    const { rows: kids } = await client.query('SELECT count(*)::int AS n FROM merchants WHERE parent_id = $1 AND deleted_at IS NULL', [id]);
     if (kids[0].n > 0) throw new ConflictError(`${m.name} มีร้านย่อย ${kids[0].n} ร้าน — ย้ายหรือลบร้านย่อยก่อน`);
     const { rows } = await client.query(
       `SELECT (SELECT count(*) FROM payments WHERE merchant_id = $1) + (SELECT count(*) FROM outflows WHERE merchant_id = $1)
@@ -154,9 +161,9 @@ export function remove(id, actor) {
       [id],
     );
     if (Number(rows[0].n) > 0) throw new ConflictError(`${m.name} has transactions — suspend it instead of deleting`);
-    await client.query('DELETE FROM webhook_endpoints WHERE merchant_id = $1', [id]);
-    await client.query('DELETE FROM merchants WHERE id = $1', [id]);
-    await audit(client, actor, 'merchant.delete', m.slug, `ลบร้าน ${m.name}`);
+    await client.query(`UPDATE webhook_endpoints SET status = 'disabled' WHERE merchant_id = $1`, [id]);
+    await client.query(`UPDATE merchants SET status = 'suspended', ${MARK_DELETED} WHERE id = $1`, [id, actor, reason]);
+    await audit(client, actor, 'merchant.delete', m.slug, `ลบร้าน ${m.name} — ${reason} (ระงับร้าน + ปิด webhook · เก็บข้อมูลไว้ · กู้คืนได้ที่รายการที่ลบแล้ว)`);
   });
 }
 
@@ -176,7 +183,7 @@ export function adjustCredit(id, actor, { amount, reason }) {
 export async function credits(id) {
   const { rows } = await query(
     `SELECT id, amount, reason, balance_after AS "balanceAfter", created_by AS "createdBy", created_at AS "createdAt"
-       FROM merchant_credit_adjustments WHERE merchant_id = $1 ORDER BY created_at DESC LIMIT 50`,
+       FROM merchant_credit_adjustments WHERE merchant_id = $1 AND ${visible('credit', 'id')} ORDER BY created_at DESC LIMIT 50`,
     [id],
   );
   return { balance: (await balanceOf({ query }, id)).toFixed(2), items: rows };

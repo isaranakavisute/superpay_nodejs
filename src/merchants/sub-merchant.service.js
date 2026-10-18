@@ -55,10 +55,10 @@ export async function subtree(home) {
                LEFT JOIN payments p ON s.source_kind = 'payment' AND p.id = s.source_id
                LEFT JOIN outflows o ON s.source_kind = 'outflow' AND o.id = s.source_id
               WHERE s.merchant_id = $1 AND s.from_merchant_id = m.id AND (p.status = 'approved' OR o.status = 'approved')) AS "commissionToMe",
-            (SELECT count(*)::int FROM merchants k WHERE k.parent_id = m.id) AS "childCount",
+            (SELECT count(*)::int FROM merchants k WHERE k.parent_id = m.id AND k.deleted_at IS NULL) AS "childCount",
             (SELECT row_to_json(u) FROM (SELECT full_name AS "fullName", email, username FROM merchant_portal_users
                WHERE merchant_id = m.id AND tier = 'owner' AND NOT super_admin ORDER BY id LIMIT 1) u) AS owner
-       FROM merchants m WHERE $1 = ANY (m.path)
+       FROM merchants m WHERE $1 = ANY (m.path) AND m.deleted_at IS NULL
       ORDER BY m.path || m.id`,
     [home.id, (home.path ?? []).length],
   );
