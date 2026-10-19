@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { withTransaction } from '../db/pool.js';
 import { ConflictError, NotFoundError } from '../errors.js';
 import { moveWithdrawalSplits } from '../merchants/tree.js';
+import { lockRefNumbers } from '../shared/ref-lock.js';
 
 export const refParamSchema = z.object({ ref: z.string().regex(/^P2P\d{1,12}$/, 'invalid P2P ref') });
 
@@ -33,7 +34,7 @@ export function settle(ref, actor) {
     await client.query(`UPDATE payments SET status = 'approved', reviewed_by = $2, completed_at = now() WHERE id = $1 AND status <> 'approved'`, [pay[0].id, actor]);
     let outflowId = wd[0].outflow_id;
     if (!outflowId) {
-      await client.query('LOCK TABLE outflows IN SHARE ROW EXCLUSIVE MODE');
+      await lockRefNumbers(client, 'outflows');
       const { rows } = await client.query(`SELECT coalesce(max(substring(ref from 4)::bigint), 40100) AS n FROM outflows WHERE ref ~ '^OUT[0-9]+$'`);
       const { rows: out } = await client.query(
         `INSERT INTO outflows (ref, merchant_id, category, bank_account_id, receiver_name, receiver_bank_code, receiver_account, amount, status, source, description, completed_at, fee)

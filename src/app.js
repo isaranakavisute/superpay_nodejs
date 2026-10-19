@@ -31,12 +31,14 @@ import configAdminRouter from './routes/config-admin.routes.js';
 import v1Router from './routes/v1.routes.js';
 import { consoleActionLog } from './merchant-api/request-log.js';
 import asyncHandler from './middleware/asyncHandler.js';
+import { z } from 'zod';
 import { CALLBACK_CHECK_PATH, checkCallback } from './merchant-api/callback-check.js';
 import { viewerContext } from './shared/private-records.js';
 import telegramRouter from './routes/telegram.routes.js';
 import supportBotAdminRouter from './routes/support-bot.routes.js';
 import portalRouter from './routes/portal.routes.js';
 import accountsAdminRouter from './routes/accounts-admin.routes.js';
+import { addRecord, callbackLog, demoKey, demoSlip, listRecords, shopFees } from './demo/demo.service.js';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler.js';
 import requireConsoleKey from './middleware/consoleAuth.js';
 
@@ -107,6 +109,11 @@ export function createApp() {
   app.use('/api/console', consoleActionLog);
   // Test receiver for shop callbacks (same request as prismapays' endpoint; my-shop only) — before the merchant API's auth.
   const checkHits = new Map();
+  // It answers like prismapays (same shape and messages): 200 {"code":200,"message":"success"} the first time an order
+  // reaches a state, "acknowledged, no state change" when the same state arrives again, 401 "invalid signature".
+  // ?debug=1 returns the full check (key used, body, every check) — always printed to the backend log as well.
+  const seenState = new Map();
+  const PRISMA_MSG = { 400: 'bad request', 401: 'invalid signature', 403: 'forbidden', 404: 'order not found', 409: 'conflict', 429: 'too many requests' };
   app.post(CALLBACK_CHECK_PATH, asyncHandler(async (req, res) => {
     const ip = req.get('x-forwarded-for')?.split(',')[0].trim() || req.ip;
     const minute = Math.floor(Date.now() / 60_000);
@@ -114,11 +121,19 @@ export function createApp() {
     const n = hit?.minute === minute ? hit.n + 1 : 1;
     checkHits.set(ip, { minute, n });
     if (checkHits.size > 5000) checkHits.clear();
-    if (n > 120) return res.status(429).json({ valid: false, error: { code: 'RATE_LIMITED', message: 'เรียกถี่เกินไป (สูงสุด 120 ครั้ง/นาที)' } });
+    const ts = () => String(Math.floor(Date.now() / 1000));
+    if (n > 120) return res.status(429).json({ code: 429, message: PRISMA_MSG[429], timestamp: ts() });
     const r = await checkCallback({ headers: req.headers, raw: req.rawBody });
     // The result is also printed to the backend's console (docker logs superpayment_nodejs) for the operator to read.
     console.log(`[callback-check ${new Date().toISOString()}] HTTP ${r.status}\n${JSON.stringify(r.body, null, 2)}`);
-    res.status(r.status).json(r.body);
+    if (req.query.debug === '1') return res.status(r.status).json(r.body);
+    if (r.status !== 200) return res.status(r.status).json({ code: r.status, message: PRISMA_MSG[r.status] ?? 'error', timestamp: ts() });
+    const key = `${r.body.order?.kind}:${r.body.order?.ref}`;
+    const state = r.body.messageBodyJson?.status ?? r.body.event;
+    const changed = seenState.get(key) !== state;
+    seenState.set(key, state);
+    if (seenState.size > 20000) seenState.clear();
+    res.status(200).json({ code: 200, message: changed ? 'success' : 'acknowledged, no state change', timestamp: ts() });
   }));
   app.use('/api/v1', v1Router);
   // Telegram slip-check bot webhook (secret header checked inside).
@@ -126,6 +141,20 @@ export function createApp() {
   // Admin-console API: only the console's server holds the key.
   app.use('/api/auth', requireConsoleKey, authRouter);
   app.use('/api/dashboard', requireConsoleKey, dashboardRouter);
+  // Public demo page (optionpay.co/demo): the console's server signs real merchant API calls for my-shop with this key.
+  app.get('/api/console/demo/key', requireConsoleKey, asyncHandler(async (_req, res) => res.json({ ok: true, ...(await demoKey()) })));
+  app.get('/api/console/demo/slip/:ref', requireConsoleKey, asyncHandler(async (req, res) => {
+    const s = /^TXN\d+$/.test(req.params.ref) ? await demoSlip(req.params.ref) : null;
+    if (!s) return res.status(404).json({ ok: false });
+    res.set({ 'content-type': s.mime, 'cache-control': 'private, max-age=60' }).send(s.data);
+  }));
+  app.get('/api/console/demo/fees', requireConsoleKey, asyncHandler(async (_req, res) => res.json({ ok: true, ...(await shopFees()) })));
+  app.get('/api/console/demo/callbacks', requireConsoleKey, asyncHandler(async (_req, res) => res.json({ ok: true, ...(await callbackLog()) })));
+  app.get('/api/console/demo/records', requireConsoleKey, asyncHandler(async (_req, res) => res.json({ ok: true, ...(await listRecords()) })));
+  app.post('/api/console/demo/records', requireConsoleKey, asyncHandler(async (req, res) => {
+    const b = z.object({ kind: z.enum(['payment', 'payout']), ref: z.string().trim().regex(/^(TXN|OUT)\d+$/) }).parse(req.body);
+    res.json({ ok: true, ...(await addRecord(b)) });
+  }));
   app.use('/api/console/payments', requireConsoleKey, paymentsAdminRouter);
   app.use('/api/console/support-bot', requireConsoleKey, supportBotAdminRouter);
   app.use('/api/console/outflows', requireConsoleKey, outflowsAdminRouter);

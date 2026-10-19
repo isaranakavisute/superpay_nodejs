@@ -6,6 +6,7 @@ import { BALANCE_SQL } from '../shared/balance-sql.js';
 import { moveWithdrawalSplits } from '../merchants/tree.js';
 import logger from '../logger.js';
 import { deliverWithdrawalEvent } from '../webhooks/webhook.service.js';
+import { lockRefNumbers } from '../shared/ref-lock.js';
 
 /** Withdrawal webhook to the shop once the change has committed. */
 const notify = (client, ref, event) =>
@@ -53,7 +54,7 @@ export function approve(ref, actor) {
   return withTransaction(async (client) => {
     const w = await lock(client, ref);
     await refuseIfReserved(client, ref);
-    await client.query('LOCK TABLE outflows IN SHARE ROW EXCLUSIVE MODE');
+    await lockRefNumbers(client, 'outflows');
     await refuseBelowMinimum(client, w);
     const { rows } = await client.query(`SELECT coalesce(max(substring(ref from 4)::bigint), 40100) AS n FROM outflows WHERE ref ~ '^OUT[0-9]+$'`);
     const outRef = `OUT${Number(rows[0].n) + 1}`;

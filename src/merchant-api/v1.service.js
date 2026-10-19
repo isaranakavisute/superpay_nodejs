@@ -23,6 +23,8 @@ import { BALANCE_SQL } from '../shared/balance-sql.js';
 import { effectiveStatus, syncPaymentSplits, writeSplits } from '../merchants/tree.js';
 import { amountRule, linkCount, refuseUnlinkWithPending, syncPrimaryShop, uniqueAmount } from '../shared/account-links.js';
 import { visible } from '../shared/private-records.js';
+import { checkDemoSlip, isDemoSlip } from '../demo/demo.service.js';
+import { lockRefNumbers } from '../shared/ref-lock.js';
 
 /**
  * Merchant REST API v1. Every function gets the authenticated merchant row
@@ -276,7 +278,7 @@ export async function createPayment(m, b, { base, source = 'api', unique = true,
     const amount = !lo && unique && rule.unique ? await uniqueAmount(c, acct.id, b.amount, rule.maxSatang, rule.cooldown) : b.amount;
     const fee = round2((amount * Number(m.fee_percent)) / 100 + Number(m.fee_flat));
     const { rows: bank } = md.senderBankCode ? await c.query('SELECT code FROM banks WHERE code = $1', [md.senderBankCode]) : { rows: [] };
-    await c.query('LOCK TABLE payments IN SHARE ROW EXCLUSIVE MODE');
+    await lockRefNumbers(c, 'payments');
     const { rows: last } = await c.query(`SELECT coalesce(max(substring(ref from 4)::bigint), 172800) AS n FROM payments WHERE ref ~ '^TXN[0-9]+$'`);
     const ref = `TXN${Number(last[0].n) + 1}`;
     const token = randomBytes(16).toString('hex');
@@ -550,6 +552,7 @@ async function attachAndVerify(m, p, { image, mime }, base, { once = false, rech
   const fp = await slipFingerprint(buf, mime);
   time.lap('qr', 'อ่าน QR จากภาพ');
   if (isSampleSlip(fp)) throw new ApiError(400, 'SAMPLE_SLIP', SAMPLE_SLIP_MESSAGE);
+  if (isDemoSlip(fp)) return demoSlipApprove(m, p, buf, mime, fp, base, time);
   const v = await verifySlip(buf, mime, { pendingRetries: !recheck });
   time.lap('provider', `ตรวจกับธนาคาร (${v.provider})`);
   // Rule (17 Oct 2026): "not found" usually means a slip sent too soon after the transfer — re-check it a few times
@@ -651,6 +654,35 @@ async function attachAndVerify(m, p, { image, mime }, base, { once = false, rech
   });
   time.lap('db', 'บันทึกผล');
   logger.info({ ref: p.ref, via, result: out.result, ms: time.ms }, 'slip checked');
+  return withTiming(out, time);
+}
+
+/** A DEMO slip from optionpay.co/demo (demo/demo.service.js): approved at once when valid for this order, else refused. */
+async function demoSlipApprove(m, p, buf, mime, fp, base, time) {
+  const bad = await checkDemoSlip(m, p, fp.qr);
+  if (bad) throw new ApiError(400, 'INVALID_SLIP', bad);
+  const note = 'ตรวจสลิปผ่าน — สลิป DEMO (หน้า optionpay.co/demo) · อนุมัติอัตโนมัติ';
+  const out = await withTransaction(async (c) => {
+    await c.query('SELECT 1 FROM payments WHERE id = $1 FOR UPDATE', [p.id]);
+    await c.query(
+      `INSERT INTO payment_slips (payment_id, mime, data, uploaded_by, provider, trans_ref, verify_result, image_sha256, qr_payload) VALUES ($1, $2, $3, $4, 'demo', NULL, $5, $6, $7)
+       ON CONFLICT (payment_id) DO UPDATE SET mime = EXCLUDED.mime, data = EXCLUDED.data, uploaded_by = EXCLUDED.uploaded_by, uploaded_at = now(),
+         provider = EXCLUDED.provider, trans_ref = NULL, verify_result = EXCLUDED.verify_result, image_sha256 = EXCLUDED.image_sha256, qr_payload = EXCLUDED.qr_payload`,
+      [p.id, mime, buf, actorOf(m), JSON.stringify({ verified: true, amount: Number(p.amount), message: note, decision: 'approve', demo: true }), fp.sha256, fp.qr],
+    );
+    await c.query('UPDATE payments SET slip_received_at = now(), review_note = $2 WHERE id = $1', [p.id, note]);
+    await approveOne(c, p.ref, 'system', note);
+    await audit(c, m, 'payment.slip', 'payment', p.ref, `แนบสลิป · demo: ผ่าน — อนุมัติอัตโนมัติ (สลิป DEMO)`);
+    const { rows } = await c.query(`${PAY_SELECT} WHERE p.id = $1`, [p.id]);
+    return {
+      success: true, verified: true, result: 'PAID', message: 'สลิป DEMO ถูกต้อง — อนุมัติรายการอัตโนมัติ (เฉพาะหน้า demo)',
+      mismatches: [], warnings: [], carriedFrom: null, carryOver: null, leftover: null, autoCancelled: [],
+      slip: { provider: 'demo', amount: Number(p.amount) }, nextStep: nextStepFor('approve', { carryOver: null, autoCancelled: [] }),
+      transaction: present(rows[0], base),
+    };
+  });
+  time.lap('db', 'บันทึกผล');
+  logger.info({ ref: p.ref, via: 'demo', result: out.result, ms: time.ms }, 'slip checked');
   return withTiming(out, time);
 }
 
@@ -774,7 +806,7 @@ async function payoutOne(c, m, b, idem) {
   await requireBank(c, b.bankCode);
   const fee = outFeeFor(m, b.amount);
   await checkCanPay(c, m, b.amount, fee);
-  await c.query('LOCK TABLE outflows IN SHARE ROW EXCLUSIVE MODE');
+  await lockRefNumbers(c, 'outflows');
   const { rows: last } = await c.query(`SELECT coalesce(max(substring(ref from 4)::bigint), 40100) AS n FROM outflows WHERE ref ~ '^OUT[0-9]+$'`);
   const ref = `OUT${Number(last[0].n) + 1}`;
   const { rows } = await c.query(
@@ -835,7 +867,7 @@ export function createWithdrawal(m, b) {
     await requireBank(c, b.bankCode);
     const fee = outFeeFor(m, b.amount);
     await checkCanPay(c, m, b.amount, fee);
-    await c.query('LOCK TABLE withdrawal_requests IN SHARE ROW EXCLUSIVE MODE');
+    await lockRefNumbers(c, 'withdrawal_requests');
     const { rows: last } = await c.query(`SELECT coalesce(max(substring(ref from 4)::bigint), 90000) AS n FROM withdrawal_requests WHERE ref ~ '^WDR[0-9]+$'`);
     const ref = `WDR${Number(last[0].n) + 1}`;
     const { rows } = await c.query(

@@ -4,6 +4,7 @@ import { emitPaymentEvent } from '../payments/payment.service.js';
 import { query, withTransaction } from '../db/pool.js';
 import { BadRequestError, ConflictError, NotFoundError } from '../errors.js';
 import { syncPaymentSplits } from '../merchants/tree.js';
+import { lockRefNumbers } from '../shared/ref-lock.js';
 
 export const idParamSchema = z.object({ id: z.coerce.number().int().positive() });
 export const matchBodySchema = z.object({ paymentRef: z.string().regex(/^TXN\d{1,12}$/) });
@@ -97,7 +98,7 @@ export function createAndMatch(id, actor, { merchantId, bankAccountId, customerN
     const { rows: m } = merchantId ? await client.query('SELECT fee_percent, fee_flat FROM merchants WHERE id = $1', [merchantId]) : { rows: [] };
     if (merchantId && !m[0]) throw new BadRequestError('Unknown merchant');
     const fee = m[0] ? Math.round((Number(e.amount) * Number(m[0].fee_percent) / 100 + Number(m[0].fee_flat)) * 100) / 100 : 0;
-    await client.query('LOCK TABLE payments IN SHARE ROW EXCLUSIVE MODE');
+    await lockRefNumbers(client, 'payments');
     const { rows: last } = await client.query(`SELECT coalesce(max(substring(ref from 4)::bigint), 172800) AS n FROM payments WHERE ref ~ '^TXN[0-9]+$'`);
     const ref = `TXN${Number(last[0].n) + 1}`;
     await client.query(

@@ -3,6 +3,7 @@ import { BadRequestError, ConflictError, NotFoundError } from '../errors.js';
 import logger from '../logger.js';
 import { deliverPayoutEvent, deliverWithdrawalEvent } from '../webhooks/webhook.service.js';
 import { MARK_DELETED } from '../shared/soft-delete.js';
+import { lockRefNumbers } from '../shared/ref-lock.js';
 
 /** Operator actions on outflows: lock → check transition → update → audit. */
 
@@ -117,7 +118,7 @@ export function create(actor, input) {
   return withTransaction(async (client) => {
     if (input.bankAccountId != null) await requireSendAccount(client, input.bankAccountId);
     await requireBank(client, input.receiverBankCode);
-    await client.query('LOCK TABLE outflows IN SHARE ROW EXCLUSIVE MODE');
+    await lockRefNumbers(client, 'outflows');
     const { rows } = await client.query(`SELECT coalesce(max(substring(ref from 4)::bigint), 40100) AS n FROM outflows WHERE ref ~ '^OUT[0-9]+$'`);
     const ref = `OUT${Number(rows[0].n) + 1}`;
     await client.query(

@@ -8,6 +8,7 @@ import { syncPaymentSplits } from '../merchants/tree.js';
 import { amountRule, uniqueAmount } from '../shared/account-links.js';
 import { closeUsedUp, coverShortfall, fillTransRefs, recordUse } from '../merchant-api/slip-transfers.js';
 import { MARK_DELETED } from '../shared/soft-delete.js';
+import { lockRefNumbers } from '../shared/ref-lock.js';
 
 /**
  * Operator actions on payments. Each runs in one transaction: lock the row,
@@ -210,9 +211,8 @@ export function create(actor, input) {
     const rule = await amountRule(client, input.bankAccountId, await configOf('slip'));
     if (rule.unique && rule.shared) input = { ...input, amount: await uniqueAmount(client, input.bankAccountId, input.amount, rule.maxSatang, rule.cooldown) };
     const { fee, commission } = feeFor(merchant, input.amount);
-    // Running number after the highest existing TXN ref; the row lock on the
-    // table's newest ref keeps two creates from taking the same number.
-    await client.query('LOCK TABLE payments IN SHARE ROW EXCLUSIVE MODE');
+    // Running number after the highest existing TXN ref, under the ref-number lock (two creates never share a number).
+    await lockRefNumbers(client, 'payments');
     const { rows: last } = await client.query(`SELECT coalesce(max(substring(ref from 4)::bigint), 172800) AS n FROM payments WHERE ref ~ '^TXN[0-9]+$'`);
     const ref = `TXN${Number(last[0].n) + 1}`;
     await client.query(
