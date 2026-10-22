@@ -2,6 +2,7 @@ import { Router } from 'express';
 import asyncHandler from '../middleware/asyncHandler.js';
 import { reasonOf } from '../shared/soft-delete.js';
 import * as service from '../payments/payment.service.js';
+import { adminAttachSlip } from '../merchant-api/v1.service.js';
 import {
   amountBodySchema,
   assignBodySchema,
@@ -29,7 +30,16 @@ paymentsAdminRouter.post('/:ref/refund', asyncHandler(async (req, res) => done(r
 paymentsAdminRouter.post('/:ref/amount', asyncHandler(async (req, res) => done(res, await service.editAmount(ref(req), req.actor, amountBodySchema.parse(req.body).amount))));
 paymentsAdminRouter.post('/:ref/revive', asyncHandler(async (req, res) => done(res, await service.revive(ref(req), req.actor))));
 paymentsAdminRouter.post('/:ref/assign', asyncHandler(async (req, res) => done(res, await service.assignMerchant(ref(req), req.actor, assignBodySchema.parse(req.body)))));
-paymentsAdminRouter.post('/:ref/slip', asyncHandler(async (req, res) => done(res, await service.uploadSlip(ref(req), req.actor, slipBodySchema.parse(req.body)))));
+// Admin slip upload = the API's automatic check (bank, amount / account / time, reuse) — approves at once when it passes.
+// Orders already approved / rejected / refunded only store the image as evidence (no re-check), as before.
+paymentsAdminRouter.post('/:ref/slip', asyncHandler(async (req, res) => {
+  const b = slipBodySchema.parse(req.body);
+  const r = await adminAttachSlip(ref(req), req.actor, { image: b.data, mime: b.mime });
+  if (r.checked) return done(res, r);
+  await service.uploadSlip(ref(req), req.actor, b);
+  return done(res, { checked: false, message: `แนบสลิปแล้ว — รายการนี้สถานะ ${r.status} จึงไม่ตรวจสลิปซ้ำ` });
+}));
+paymentsAdminRouter.get('/:ref/relation', asyncHandler(async (req, res) => done(res, await service.orderRelation(ref(req)))));
 paymentsAdminRouter.get(
   '/:ref/slip',
   asyncHandler(async (req, res) => {

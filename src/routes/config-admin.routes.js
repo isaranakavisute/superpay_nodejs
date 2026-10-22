@@ -16,6 +16,7 @@ configAdminRouter.post('/slip/test', h((req) => s.testProvider(req.actor, s.test
 const demoSchema = z.object({ image: z.string().min(10).max(11_000_000), mime: z.enum(['image/png', 'image/jpeg', 'image/webp']), bankAccountId: z.coerce.number().int().positive().optional() });
 configAdminRouter.post('/slip/demo-verify', h(async (req) => ({ result: await demoVerify(demoSchema.parse(req.body)) })));
 configAdminRouter.post('/quota/check', h((req) => s.checkQuota(req.actor)));
+configAdminRouter.get('/quota/live', h(async () => ({ quota: await s.liveQuota() })));
 configAdminRouter.post('/assets/:kind', h((req) => s.uploadAsset(kind(req), req.actor, s.assetBodySchema.parse(req.body))));
 configAdminRouter.post('/assets/:kind/:id/delete', h((req) => s.removeAsset(kind(req), req.actor, String(req.params.id).replace(/[^a-f0-9]/g, ''), reasonOf(req.body))));
 configAdminRouter.post('/assets/:kind/delete', h((req) => s.removeAsset(kind(req), req.actor, undefined, reasonOf(req.body))));

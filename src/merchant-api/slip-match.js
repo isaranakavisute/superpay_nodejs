@@ -105,11 +105,13 @@ export function matchSlip(v, order) {
     check('AMOUNT', 'FAIL', `ยอดในสลิป ${baht(v.amount)} แต่ออเดอร์ต้องชำระ ${baht(order.amount)} (${Number(v.amount) > Number(order.amount) ? 'โอนเกิน' : 'โอนขาด'} ${baht(Math.abs(Number(v.amount) - Number(order.amount)))})`);
   } else check('AMOUNT', 'PASS', `ยอดในสลิป ${baht(v.amount)} ตรงกับยอดออเดอร์`);
 
-  // 2. Transfer time — not before the order existed (10 min clock tolerance).
-  if (v.date && new Date(v.date).getTime() < new Date(order.created_at).getTime() - 10 * 60_000) {
+  // 2. Transfer time — not before the order existed, beyond the allowance (ตั้งค่า → ตรวจสลิป: earlyTransferMinutes,
+  // default 15 — customers who pay first and open the order a few minutes later; was a fixed 10 until 20 Oct 2026).
+  const earlyMin = Number(v.cfg?.earlyTransferMinutes ?? 15);
+  if (v.date && new Date(v.date).getTime() < new Date(order.created_at).getTime() - earlyMin * 60_000) {
     early = `สลิปทำรายการเมื่อ ${at(v.date)} ก่อนสร้างรายการนี้ (${at(order.created_at)}) — ใช้สลิปเก่าไม่ได้`;
     problems.push(early);
-    check('TRANSFER_TIME', 'FAIL', `โอนเมื่อ ${at(v.date)} — ก่อนสร้างออเดอร์ (${at(order.created_at)})`);
+    check('TRANSFER_TIME', 'FAIL', `โอนเมื่อ ${at(v.date)} — ก่อนสร้างออเดอร์ (${at(order.created_at)}) เกิน ${earlyMin} นาที`);
   } else if (v.date) check('TRANSFER_TIME', 'PASS', `โอนเมื่อ ${at(v.date)} — หลังสร้างออเดอร์ (${at(order.created_at)})`);
   else check('TRANSFER_TIME', 'UNKNOWN', 'สลิปไม่มีเวลาโอน');
 

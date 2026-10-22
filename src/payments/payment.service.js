@@ -274,3 +274,42 @@ export async function getSlip(ref) {
   if (!rows[0]) throw new NotFoundError(`No slip for ${ref}`);
   return rows[0];
 }
+
+/**
+ * The order an order's สถานะ note points at, side by side for the "ดูความเกี่ยวข้อง" dialog:
+ *  - duplicate: closed by the 23:00 duplicate-order rule (jobs/duplicate-cancel.js, "ซ้ำกับ <order#1> ที่ชำระแล้ว …") → the paid order#1;
+ *  - reused: slip refused as "สลิปนี้ถูกใช้กับรายการอื่นแล้ว — ใช้ซ้ำไม่ได้" → the order that slip / transfer paid (slip_reused_ref;
+ *    the same order when the shop sent the same slip twice at once);
+ *  - carry: this order's transfer paid a newer order of the same customer instead (carry-over: "ลูกค้าชำระผ่าน X แทน",
+ *    "เงินโอนของออเดอร์นี้ใช้ชำระ X แล้ว", "สลิปเดียวกันใช้ชำระ X แทน") → that order.
+ */
+export const REUSED_NOTE = 'สลิปนี้ถูกใช้กับรายการอื่นแล้ว — ใช้ซ้ำไม่ได้';
+export async function orderRelation(ref) {
+  const { rows: [o] } = await query(`SELECT ref, review_note, slip_reused_ref FROM payments WHERE ref = $1`, [ref]);
+  if (!o) throw new NotFoundError('ไม่พบรายการ');
+  const note = o.review_note ?? '';
+  const dup = /^ซ้ำกับ (TXN\d+) ที่ชำระแล้ว/.exec(note);
+  const carry = /(?:ใช้ชำระ|ชำระผ่าน) (TXN\d+)/.exec(note);
+  const kind = dup ? 'duplicate' : note.includes(REUSED_NOTE) ? 'reused' : carry ? 'carry' : null;
+  if (!kind) throw new BadRequestError('รายการนี้ไม่มีรายการอื่นที่เกี่ยวข้อง');
+  const otherRef = dup ? dup[1] : kind === 'reused' ? (/^TXN\d+$/.test(o.slip_reused_ref ?? '') ? o.slip_reused_ref : null) : carry[1];
+  const { rows } = await query(
+    `SELECT p.ref, p.merchant_order_id AS "merchantOrderId", m.name AS "merchantName", p.customer_name AS "customerName",
+            p.metadata->>'senderBankCode' AS "senderBank", right(p.metadata->>'senderAccountNumber', 4) AS "senderLast4",
+            p.amount, p.status, b.bank_code AS "accountBank", right(b.account_no, 4) AS "accountLast4",
+            p.created_at AS "createdAt", p.completed_at AS "completedAt", p.reviewed_by AS "reviewedBy", p.review_note AS "reviewNote",
+            s.payment_id IS NOT NULL AS "hasSlip", s.uploaded_at AS "slipUploadedAt", s.verify_result->>'date' AS "transferredAt",
+            (s.verify_result->>'amount')::numeric AS "slipAmount", coalesce(s.trans_ref, s.verify_result->>'transRef') AS "transRef",
+            left(s.image_sha256, 12) AS "imageId", s.provider AS "slipProvider",
+            (SELECT coalesce(json_agg(json_build_object('event', w.event, 'statusCode', w.status_code, 'state', w.state, 'at', w.delivered_at) ORDER BY w.id), '[]')
+               FROM webhook_deliveries w WHERE w.payment_ref = p.ref) AS callbacks
+       FROM payments p
+       LEFT JOIN merchants m ON m.id = p.merchant_id
+       LEFT JOIN bank_accounts b ON b.id = p.bank_account_id
+       LEFT JOIN payment_slips s ON s.payment_id = p.id
+      WHERE p.ref = ANY($1)`,
+    [[ref, otherRef].filter(Boolean)],
+  );
+  const by = Object.fromEntries(rows.map((r) => [r.ref, r]));
+  return { kind, other: otherRef ? by[otherRef] ?? null : null, order: by[ref], sameOrder: otherRef === ref };
+}

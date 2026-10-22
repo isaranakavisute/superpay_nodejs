@@ -76,6 +76,8 @@ async function one(p, cfg) {
       detail: v.verified === true ? `ธนาคารยืนยันว่ามีการโอนจริง · เลขอ้างอิง ${v.transRef}` : (v.message ?? 'ตรวจกับธนาคารไม่ได้ในขณะนี้') },
     ...m.checks.map((c) => ({ ...c, detail: c.detail.replace(' — ต้องโอนตรงยอดทุกสตางค์', '') })),
     { check: 'DUPLICATE', status: dup ? 'FAIL' : 'PASS', detail: dup ? `เงินโอนนี้ถูกใช้กับ ${dup.ref} แล้ว` : 'เงินโอนนี้ไม่ได้ใช้ชำระรายการอื่น' }];
+  // Approved: a sender name that differs from the customer's is no warning, like a normal approval (user's rule, 22 Oct 2026).
+  if (item.decision === 'APPROVED') item.checks = item.checks.map((c) => (c.check === 'SENDER_NAME' && c.status === 'WARN' ? { ...c, status: 'PASS', detail: 'ผ่าน' } : c));
   const failed = item.checks.filter((c) => c.status === 'FAIL');
   const bv = item.bankVerification;
   if (item.decision === 'APPROVED' && bv.verified) {

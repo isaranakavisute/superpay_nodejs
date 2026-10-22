@@ -524,7 +524,9 @@ export async function decideSlip(c, p, v, fp, ocr) {
         const note = `ใช้ยอดคงเหลือของการโอน ${fmt(leftover.transferAmount)} บาท (ชำระ ${leftover.paid.map((x) => `${x.ref} ${fmt(x.amount)} บาท`).join(', ')} แล้ว) — ออเดอร์นี้ ${fmt(p.amount)} บาท คงเหลืออีก ${fmt(leftover.after)} บาท`;
         reason = decision === 'approve' ? note : `${reason} · ${note}`;
       }
-      if (warnings.length) reason = decision === 'approve' ? `${carried || leftover || combined ? reason : 'ตรวจสลิปผ่าน'} · ⚠️ ${warnings.join(' · ')}` : reason;   // waiting for an admin: the main reason only (warnings are in checks)
+      // Sender-name warnings stay in the checks, not in an approved order's note (user's rule, 22 Oct 2026).
+      const shown = warnings.filter((w) => !/ผู้โอน/.test(w));
+      if (shown.length) reason = decision === 'approve' ? `${carried || leftover || combined ? reason : 'ตรวจสลิปผ่าน'} · ⚠️ ${shown.join(' · ')}` : reason;   // waiting for an admin: the main reason only (warnings are in checks)
     }
   } else if (ocr) {
     // Pixels can be edited: numbers that clearly differ reject; a match still needs the admin.
@@ -543,7 +545,9 @@ export async function decideSlip(c, p, v, fp, ocr) {
  * `once`: refuse when an accepted / in-review slip is already attached (customer checkout page).
  * `recheck`: a background re-check of the stored slip (n = which one); the provider is asked once, without waiting.
  */
-async function attachAndVerify(m, p, { image, mime }, base, { once = false, recheck = 0 } = {}) {
+async function attachAndVerify(m, p, { image, mime }, base, { once = false, recheck = 0, actor = null } = {}) {
+  // Who attached it: the shop's API key, or an admin uploading in the console (same check, their name on the record).
+  const who = actor ?? actorOf(m);
   const buf = Buffer.from(image, 'base64');
   if (buf.length < 100 || buf.length > 8 << 20) throw new ApiError(400, 'INVALID_SLIP', 'ไฟล์สลิปต้องเป็นรูปขนาดไม่เกิน 8 MB');
   if (!['pending', 'expired'].includes(p.status)) throw new ApiError(409, 'ORDER_NOT_PENDING', orderNotPendingText(p.status));
@@ -552,28 +556,41 @@ async function attachAndVerify(m, p, { image, mime }, base, { once = false, rech
   const fp = await slipFingerprint(buf, mime);
   time.lap('qr', 'อ่าน QR จากภาพ');
   if (isSampleSlip(fp)) throw new ApiError(400, 'SAMPLE_SLIP', SAMPLE_SLIP_MESSAGE);
-  if (isDemoSlip(fp)) return demoSlipApprove(m, p, buf, mime, fp, base, time);
+  if (isDemoSlip(fp)) return demoSlipApprove(m, p, buf, mime, fp, base, time, who);
   const v = await verifySlip(buf, mime, { pendingRetries: !recheck });
   time.lap('provider', `ตรวจกับธนาคาร (${v.provider})`);
   // Rule (17 Oct 2026): "not found" usually means a slip sent too soon after the transfer — re-check it a few times
   // (like slip_pending) before it counts as a bad slip; only after the last re-check is it refused.
   const notFoundRetry = v.verified === false && v.notFound && recheck < RECHECK_AFTER_MIN.length;
   if (notFoundRetry) Object.assign(v, { verified: null, pending: true });
-  // No definite answer from a provider (none connected / down): read the slip image itself.
+  // Rule (21 Oct 2026, TXN177859 / TXN178099): the provider gave NO definite answer (error, timeout, quota) — ask it
+  // again after 1, 3 and 6 minutes before falling back to reading the image (OCR) and handing the slip to an admin.
+  const providerRetry = v.verified === null && !v.pending && v.provider && v.provider !== 'none' && recheck < RECHECK_AFTER_MIN.length;
+  if (providerRetry) Object.assign(v, { pending: true });
+  // No definite answer from a provider (none connected / down, or still none after the re-checks): read the slip image itself.
   // Not while the bank is still processing the transfer — the slip is re-checked with the provider instead.
   const ocr = v.verified === null && !v.pending ? await ocrCheckSlip(buf, p, v.cfg) : null;
   const nextRecheck = v.pending && recheck < RECHECK_AFTER_MIN.length ? RECHECK_AFTER_MIN[recheck] : null;
   if (v.pending) {
     v.message = notFoundRetry ? 'ธนาคารยังไม่พบรายการโอนนี้ (อาจเพิ่งโอน) — ระบบจะตรวจซ้ำอัตโนมัติ'
+      : providerRetry ? 'ยังตรวจสลิปกับธนาคารไม่สำเร็จ (ระบบตรวจสลิปไม่ตอบชั่วคราว) — ระบบจะตรวจซ้ำอัตโนมัติ'
       : nextRecheck ? PENDING_TEXT : 'ธนาคารยังประมวลผลรายการโอนนี้อยู่ (EasySlip: slip_pending) หลังตรวจซ้ำครบแล้ว — รอผู้ดูแลตรวจ';
   }
   if (ocr) time.lap('ocr', 'อ่านข้อความจากภาพ');
   const via = ocr ? 'ocr' : v.provider;
   const out = await withTransaction(async (c) => {
-    await c.query('SELECT 1 FROM payments WHERE id = $1 FOR UPDATE', [p.id]);
+    // Re-read under the lock: the same slip sent twice at once (TXN179275, 22 Oct 2026) — the first request approved the
+    // order while this one was checking; this one must not overwrite its slip and note with "ใช้ซ้ำไม่ได้".
+    const { rows: [cur] } = await c.query('SELECT status FROM payments WHERE id = $1 FOR UPDATE', [p.id]);
+    if (!['pending', 'expired'].includes(cur.status)) throw new ApiError(409, 'ORDER_NOT_PENDING', orderNotPendingText(cur.status));
     if (once && (await hasAcceptedSlip(c, p.id))) throw slipTaken();
     const d = await decideSlip(c, p, v, fp, ocr);
-    const { decision, reason, mismatches, warnings, checks, carried, leftover, combined, reusedOn, paidRequested } = d;
+    const { decision, reason, mismatches, carried, leftover, combined, reusedOn, paidRequested } = d;
+    // Auto-approved: exactly like a normal approval — a sender name that differs from the customer's (someone else may pay
+    // for them) is no warning in the note, the stored result or the API reply (user's rule, 22 Oct 2026).
+    const senderOk = (x) => decision === 'approve' && /ผู้โอน/.test(x);
+    const warnings = d.warnings.filter((w) => !senderOk(w));
+    const checks = d.checks.map((x) => (x.check === 'SENDER_NAME' && x.status === 'WARN' && decision === 'approve' ? { ...x, status: 'PASS', detail: 'ผ่าน' } : x));
     let carryOver = null; // what the caller is told about it
     const autoCancelled = [];   // other orders of this shop closed because this slip paid this order
     await c.query(
@@ -581,7 +598,7 @@ async function attachAndVerify(m, p, { image, mime }, base, { once = false, rech
        ON CONFLICT (payment_id) DO UPDATE SET mime = EXCLUDED.mime, data = EXCLUDED.data, uploaded_by = EXCLUDED.uploaded_by, uploaded_at = now(),
          provider = EXCLUDED.provider, trans_ref = EXCLUDED.trans_ref, verify_result = EXCLUDED.verify_result,
          image_sha256 = EXCLUDED.image_sha256, qr_payload = EXCLUDED.qr_payload`,
-      [p.id, mime, buf, actorOf(m), via, (decision === 'approve' || decision === 'review') && !leftover ? v.transRef ?? null : null,
+      [p.id, mime, buf, who, via, (decision === 'approve' || decision === 'review') && !leftover ? v.transRef ?? null : null,
         JSON.stringify({ verified: v.verified, amount: v.amount ?? null, date: v.date ?? null, transRef: v.transRef ?? null, message: reason, decision, mismatches, warnings, ocr, carriedFrom: carried && !reusedOn ? carried.ref : null, leftoverOf: leftover ? leftover.paid.map((x) => x.ref) : null, coverTransferId: combined && decision !== 'invalid' ? combined.cover.id : null }), fp.sha256, fp.qr],
     );
     await c.query('UPDATE payments SET slip_received_at = now(), review_note = coalesce($2, review_note), slip_reused_ref = $3 WHERE id = $1', [p.id, reason, reusedOn]);
@@ -610,7 +627,7 @@ async function attachAndVerify(m, p, { image, mime }, base, { once = false, rech
       };
       if (close && rowCount) autoCancelled.push({ ref: carried.ref, orderId: carried.merchant_order_id ?? null, amount: Number(carried.amount), reason: `ลูกค้าชำระผ่าน ${p.ref} แทน (ใช้เงินโอนเดียวกัน)` });
       await audit(c, m, 'payment.carry_over', 'payment', carried.ref,
-        `เงินโอน ${fmt(v.amount)} บาท ของ ${carried.ref} ใช้ชำระ ${p.ref}${close && rowCount ? ' — ยกเลิก ' + carried.ref + ' อัตโนมัติ' : ''}`);
+        `เงินโอน ${fmt(v.amount)} บาท ของ ${carried.ref} ใช้ชำระ ${p.ref}${close && rowCount ? ' — ยกเลิก ' + carried.ref + ' อัตโนมัติ' : ''}`, who);
     }
     // Unique satang were added but the customer paid the amount the shop asked for (bank-verified): the order is for that.
     if (decision === 'approve' && paidRequested) await setAmountByRef(c, p.ref, Number(v.amount), 'system', 'ลูกค้าโอนตามยอดที่ร้านสั่ง (ไม่รวมสตางค์ที่ระบบเติม) — ธนาคารยืนยันแล้ว');
@@ -622,12 +639,12 @@ async function attachAndVerify(m, p, { image, mime }, base, { once = false, rech
     if (decision === 'approve') {
       for (const s of await cancelSlipSiblings(c, p, fp)) {
         emitPaymentEvent(c, s.ref, 'payment.rejected');
-        await audit(c, m, 'payment.auto_cancel', 'payment', s.ref, `ยกเลิกอัตโนมัติ — สลิปเดียวกันใช้ชำระ ${p.ref} แทน`);
+        await audit(c, m, 'payment.auto_cancel', 'payment', s.ref, `ยกเลิกอัตโนมัติ — สลิปเดียวกันใช้ชำระ ${p.ref} แทน`, who);
         autoCancelled.push({ ref: s.ref, orderId: s.merchant_order_id ?? null, amount: Number(s.amount), reason: `สลิปเดียวกันเคยไม่ผ่านในออเดอร์นี้ และใช้ชำระ ${p.ref} แล้ว` });
       }
     }
     await audit(c, m, recheck ? 'payment.slip_recheck' : 'payment.slip', 'payment', p.ref,
-      `${recheck ? `ตรวจสลิปซ้ำอัตโนมัติ ครั้งที่ ${recheck}` : 'แนบสลิป'} · ${via}: ${decision === 'approve' ? `ผ่าน — อนุมัติอัตโนมัติ${warn}` : reason ?? decision}`);
+      `${recheck ? `ตรวจสลิปซ้ำอัตโนมัติ ครั้งที่ ${recheck}` : actor ? 'ผู้ดูแลแนบสลิป' : 'แนบสลิป'} · ${via}: ${decision === 'approve' ? `ผ่าน — อนุมัติอัตโนมัติ${warn}` : reason ?? decision}`, who);
     const { rows } = await c.query(`${PAY_SELECT} WHERE p.id = $1`, [p.id]);
     return {
       success: decision !== 'invalid',
@@ -658,7 +675,7 @@ async function attachAndVerify(m, p, { image, mime }, base, { once = false, rech
 }
 
 /** A DEMO slip from optionpay.co/demo (demo/demo.service.js): approved at once when valid for this order, else refused. */
-async function demoSlipApprove(m, p, buf, mime, fp, base, time) {
+async function demoSlipApprove(m, p, buf, mime, fp, base, time, who = actorOf(m)) {
   const bad = await checkDemoSlip(m, p, fp.qr);
   if (bad) throw new ApiError(400, 'INVALID_SLIP', bad);
   const note = 'ตรวจสลิปผ่าน — สลิป DEMO (หน้า optionpay.co/demo) · อนุมัติอัตโนมัติ';
@@ -668,11 +685,11 @@ async function demoSlipApprove(m, p, buf, mime, fp, base, time) {
       `INSERT INTO payment_slips (payment_id, mime, data, uploaded_by, provider, trans_ref, verify_result, image_sha256, qr_payload) VALUES ($1, $2, $3, $4, 'demo', NULL, $5, $6, $7)
        ON CONFLICT (payment_id) DO UPDATE SET mime = EXCLUDED.mime, data = EXCLUDED.data, uploaded_by = EXCLUDED.uploaded_by, uploaded_at = now(),
          provider = EXCLUDED.provider, trans_ref = NULL, verify_result = EXCLUDED.verify_result, image_sha256 = EXCLUDED.image_sha256, qr_payload = EXCLUDED.qr_payload`,
-      [p.id, mime, buf, actorOf(m), JSON.stringify({ verified: true, amount: Number(p.amount), message: note, decision: 'approve', demo: true }), fp.sha256, fp.qr],
+      [p.id, mime, buf, who, JSON.stringify({ verified: true, amount: Number(p.amount), message: note, decision: 'approve', demo: true }), fp.sha256, fp.qr],
     );
     await c.query('UPDATE payments SET slip_received_at = now(), review_note = $2 WHERE id = $1', [p.id, note]);
     await approveOne(c, p.ref, 'system', note);
-    await audit(c, m, 'payment.slip', 'payment', p.ref, `แนบสลิป · demo: ผ่าน — อนุมัติอัตโนมัติ (สลิป DEMO)`);
+    await audit(c, m, 'payment.slip', 'payment', p.ref, `แนบสลิป · demo: ผ่าน — อนุมัติอัตโนมัติ (สลิป DEMO)`, who);
     const { rows } = await c.query(`${PAY_SELECT} WHERE p.id = $1`, [p.id]);
     return {
       success: true, verified: true, result: 'PAID', message: 'สลิป DEMO ถูกต้อง — อนุมัติรายการอัตโนมัติ (เฉพาะหน้า demo)',
@@ -701,6 +718,22 @@ export async function verifyByOrder(m, b, { base }) {
   return attachAndVerify(m, rows[0], b, base);
 }
 
+/**
+ * Admin console: a slip uploaded on an order runs the SAME automatic check as the API (bank check, amount / account /
+ * time, reuse, carry-over) and is approved at once when it passes (20 Oct 2026) — recorded under the admin's name.
+ * Orders already approved / rejected / refunded just store the image (evidence; no re-check).
+ */
+export async function adminAttachSlip(ref, actor, { image, mime }) {
+  await expireDue();
+  const { rows: [p] } = await query(`${PAY_SELECT} WHERE p.ref = $1`, [ref]);
+  if (!p) throw new ApiError(404, 'TRANSACTION_NOT_FOUND', 'ไม่พบรายการ');
+  if (!['pending', 'expired'].includes(p.status)) return { checked: false, status: p.status };
+  const { rows: [m] } = p.merchant_id ? await query('SELECT * FROM merchants WHERE id = $1', [p.merchant_id]) : { rows: [{ id: null, slug: 'house' }] };
+  const r = await attachAndVerify(m, p, { image, mime }, null, { actor: actor ?? 'console' });
+  return { checked: true, result: r.result, verified: r.verified, message: r.message, mismatches: r.mismatches, warnings: r.warnings,
+    autoCancelled: r.autoCancelled, carriedFrom: r.carriedFrom, nextRecheck: r.result === 'PENDING_REVIEW' ? r.nextStep : null };
+}
+
 export async function attachByRef(m, ref, b, { base }) {
   await expireDue();
   return attachAndVerify(m, await payByToken({ query }, m, ref), b, base);
@@ -724,6 +757,8 @@ export async function checkout(token, { base }) {
   return {
     success: true,
     transaction: { id: t.id, orderId: t.orderId, amount: t.amount, status: t.status, description: t.description, qrExpiry: t.qrExpiry, createdAt: t.createdAt, paidAt: t.paidAt, copy: t.copy, paymentMethod: t.paymentMethod },
+    // Set only for orders made with POST /api/v2/payment/create + return_url: the checkout page sends the customer there.
+    ...(p.return_url ? { returnUrl: p.return_url, ref: p.ref } : {}),
     merchant: { name: p.merchant_name },
     account: { bankCode: p.acct_bank, bankName: p.acct_bank_name, accountName: p.account_name, accountNumber: p.account_no, promptPayId: p.promptpay_id },
     qrPayload: p.status === 'pending' && t.status === 'PENDING' ? promptPayPayload(p.promptpay_id, p.amount) : null,

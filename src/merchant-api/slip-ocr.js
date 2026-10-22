@@ -153,9 +153,9 @@ export function compareOcr(s, order, cfg = {}) {
 
   if (!s.date) flags.push('อ่านวันเวลาที่โอนในสลิปไม่ได้');
   else {
-    // Slips print minutes; allow 10 min of clock difference.
+    // Slips print minutes; a transfer up to `earlyTransferMinutes` (default 15) before the order still counts.
     const slipEnd = s.date.getTime() + 60_000;
-    if (slipEnd < new Date(order.created_at).getTime() - 10 * 60_000) {
+    if (slipEnd < new Date(order.created_at).getTime() - Number(cfg.earlyTransferMinutes ?? 15) * 60_000) {
       problems.push(`สลิปทำรายการเมื่อ ${at(s.date)} ก่อนสร้างรายการนี้ (${at(order.created_at)}) — ใช้สลิปเก่าไม่ได้`);
     } else if (cfg.slipAgeCheck && cfg.slipMaxAgeHours > 0 && Date.now() - s.date.getTime() > cfg.slipMaxAgeHours * 3_600_000) {
       problems.push(`สลิปเก่าเกิน ${cfg.slipMaxAgeHours} ชั่วโมง — ใช้สลิปเก่าไม่ได้`);

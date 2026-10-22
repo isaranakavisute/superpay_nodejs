@@ -29,6 +29,7 @@ import usersAdminRouter from './routes/users-admin.routes.js';
 import profileRouter from './routes/profile.routes.js';
 import configAdminRouter from './routes/config-admin.routes.js';
 import v1Router from './routes/v1.routes.js';
+import v2Router from './routes/v2.routes.js';
 import { consoleActionLog } from './merchant-api/request-log.js';
 import asyncHandler from './middleware/asyncHandler.js';
 import { z } from 'zod';
@@ -38,6 +39,7 @@ import telegramRouter from './routes/telegram.routes.js';
 import supportBotAdminRouter from './routes/support-bot.routes.js';
 import portalRouter from './routes/portal.routes.js';
 import accountsAdminRouter from './routes/accounts-admin.routes.js';
+import backupsAdminRouter from './routes/backups-admin.routes.js';
 import { addRecord, callbackLog, demoKey, demoSlip, listRecords, shopFees } from './demo/demo.service.js';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler.js';
 import requireConsoleKey from './middleware/consoleAuth.js';
@@ -89,6 +91,7 @@ export function createApp() {
         'PATCH /api/users/:id',
         'POST /api/auth/login',
         'GET|POST|PATCH|DELETE /api/v1/* (merchant API, X-API-Key)',
+        'POST /api/v2/payment/create (merchant API v2: + return_url)',
         'GET /api/dashboard/summary',
         'GET /api/dashboard/trend',
         'GET /api/dashboard/alerts',
@@ -136,6 +139,8 @@ export function createApp() {
     res.status(200).json({ code: 200, message: changed ? 'success' : 'acknowledged, no state change', timestamp: ts() });
   }));
   app.use('/api/v1', v1Router);
+  // Merchant API v2: POST /payment/create with return_url (v1 unchanged).
+  app.use('/api/v2', v2Router);
   // Telegram slip-check bot webhook (secret header checked inside).
   app.use('/api/telegram', telegramRouter);
   // Admin-console API: only the console's server holds the key.
@@ -155,6 +160,7 @@ export function createApp() {
     const b = z.object({ kind: z.enum(['payment', 'payout']), ref: z.string().trim().regex(/^(TXN|OUT)\d+$/) }).parse(req.body);
     res.json({ ok: true, ...(await addRecord(b)) });
   }));
+  app.use('/api/console/backups', requireConsoleKey, backupsAdminRouter);
   app.use('/api/console/payments', requireConsoleKey, paymentsAdminRouter);
   app.use('/api/console/support-bot', requireConsoleKey, supportBotAdminRouter);
   app.use('/api/console/outflows', requireConsoleKey, outflowsAdminRouter);

@@ -7,7 +7,7 @@
 export const MERCHANT_PERMISSIONS = [
   { code: 'view_dashboard', label: 'ดูภาพรวม ยอดเงิน และข้อมูลร้าน', endpoints: 'GET /dashboard, /balance, /balance/line-summary, /profile' },
   { code: 'view_transactions', label: 'ดูรายการชำระเงิน / payout / คำขอถอน', endpoints: 'GET /transactions, /payment/order, /payouts, /payout, /withdrawal/requests' },
-  { code: 'create_payment', label: 'สร้างรายการชำระเงิน และแนบ/ตรวจสลิป', endpoints: 'POST /payment/create, /payment/slip/*, /payment/:ref/slip, /collect' },
+  { code: 'create_payment', label: 'สร้างรายการชำระเงิน และแนบ/ตรวจสลิป', endpoints: 'POST /payment/create, /payment/slip/*, /payment/:ref/slip, /collect, /api/v2/payment/create' },
   { code: 'cancel_payment', label: 'ยกเลิกรายการชำระเงิน', endpoints: 'PATCH /transactions/:id/cancel' },
   { code: 'create_payout', label: 'สั่งจ่ายเงินออก (payout)', endpoints: 'POST /payout/create, /payout/bulk' },
   { code: 'request_withdrawal', label: 'ขอถอนเงิน', endpoints: 'POST /withdrawal/request/create · ถอนเงินใน Portal' },

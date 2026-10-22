@@ -57,6 +57,7 @@ export const SECTIONS = {
       requireApproval: z.boolean(),
       slipAgeCheck: z.boolean(),
       slipMaxAgeHours: int(0, 720),
+      earlyTransferMinutes: int(0, 360).default(15),   // a transfer up to this long BEFORE the order still counts (20 Oct 2026: 10 → 15)
       uniqueAmount: z.boolean(),
       uniqueAmountMaxSatang: int(0, 99),
       uniqueAmountCooldownMinutes: int(0, 1440).default(60),   // shared accounts: an amount isn't reused for this long
@@ -74,7 +75,7 @@ export const SECTIONS = {
     defaults: {
       provider: 'none', thunderAccessToken: '', slipOkApiKey: '', slipOkBranchId: '', easySlipApiKey: '', slip2goApiUrl: '', slip2goSecretKey: '',
       fallbackProvider: '', failoverAfter: 3, failoverMinutes: 5, failoverTrustNotFound: false, autoMatchAmount: true, autoMatchTimeWindow: 24,
-      requireApproval: false, slipAgeCheck: true, slipMaxAgeHours: 6, uniqueAmount: false, uniqueAmountMaxSatang: 99, uniqueAmountCooldownMinutes: 60, orderTtlMinutes: 15,
+      requireApproval: false, slipAgeCheck: true, slipMaxAgeHours: 6, earlyTransferMinutes: 15, uniqueAmount: false, uniqueAmountMaxSatang: 99, uniqueAmountCooldownMinutes: 60, orderTtlMinutes: 15,
       intentPurgeDays: 7, smsStrictAllChannels: false, centralReceiving: true, centralDistribution: 'auto', centralFixedAccountId: '',
       p2pMatching: false, p2pRepoolGraceMinutes: 5, p2pStaleAfterMinutes: 30, p2pAutoPayout: false,
     },
@@ -344,6 +345,21 @@ export async function checkQuota(actor) {
     );
   });
   return { status: out };
+}
+
+/**
+ * Live quota for the payments page header (GET /quota/live, polled every 30 s by each open console).
+ * Cached 30 s so several admins share one call; the provider's account endpoint does not use quota.
+ */
+let liveCache = null;
+export async function liveQuota() {
+  if (liveCache && Date.now() - liveCache.at < 30_000) return liveCache.value;
+  const cfg = await internal('slip');
+  const { value: q } = await raw('quota');
+  const p = cfg.provider && cfg.provider !== 'none' ? { provider: cfg.provider, ...(await probe(cfg.provider, cfg)) } : null;
+  const value = { checkedAt: new Date().toISOString(), threshold: q.threshold, provider: p?.provider ?? null, ok: p?.ok ?? false, message: p?.message ?? 'ไม่ได้เลือกผู้ให้บริการ', quota: p?.quota ?? null };
+  liveCache = { at: Date.now(), value };
+  return value;
 }
 
 // ---------- outbound webhooks (fired on payment approve) ----------
