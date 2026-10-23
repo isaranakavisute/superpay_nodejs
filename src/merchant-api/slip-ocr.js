@@ -4,7 +4,7 @@ import jpeg from 'jpeg-js';
 import { PNG } from 'pngjs';
 import { createWorker } from 'tesseract.js';
 import logger from '../logger.js';
-import { accountMatches } from './slip-match.js';
+import { accountMatches, earlyTransferText } from './slip-match.js';
 
 /**
  * Reads a slip image with OCR (Thai + English) when no slip provider is
@@ -156,7 +156,7 @@ export function compareOcr(s, order, cfg = {}) {
     // Slips print minutes; a transfer up to `earlyTransferMinutes` (default 15) before the order still counts.
     const slipEnd = s.date.getTime() + 60_000;
     if (slipEnd < new Date(order.created_at).getTime() - Number(cfg.earlyTransferMinutes ?? 15) * 60_000) {
-      problems.push(`สลิปทำรายการเมื่อ ${at(s.date)} ก่อนสร้างรายการนี้ (${at(order.created_at)}) — ใช้สลิปเก่าไม่ได้`);
+      problems.push(earlyTransferText(s.date, order.created_at, Number(cfg.earlyTransferMinutes ?? 15)));
     } else if (cfg.slipAgeCheck && cfg.slipMaxAgeHours > 0 && Date.now() - s.date.getTime() > cfg.slipMaxAgeHours * 3_600_000) {
       problems.push(`สลิปเก่าเกิน ${cfg.slipMaxAgeHours} ชั่วโมง — ใช้สลิปเก่าไม่ได้`);
     } else matched.push(`เวลาโอน ${at(s.date)}`);

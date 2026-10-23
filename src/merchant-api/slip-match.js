@@ -80,6 +80,19 @@ export function nameMatches(slipNames, expected) {
 
 const baht = (n) => `฿${Number(n).toLocaleString('th-TH', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 const at = (d) => new Date(d).toLocaleString('th-TH', { timeZone: 'Asia/Bangkok', dateStyle: 'medium', timeStyle: 'short' });
+/**
+ * สถานะ text for a transfer made too long before the order: the one real reason, straight to the point (user, 22 Oct
+ * 2026 — "ใช้สลิปเก่าไม่ได้" read like a reused slip). e.g. "โอนก่อนสร้างรายการ 3 ชม. 30 นาที (โอน 16:44 · สร้างรายการ 20:14) — เกินที่อนุญาต 15 นาที"
+ */
+export function earlyTransferText(transferAt, createdAt, allowedMin) {
+  const mins = Math.max(0, Math.round((new Date(createdAt).getTime() - new Date(transferAt).getTime()) / 60_000));
+  const d = Math.floor(mins / 1440), h = Math.floor((mins % 1440) / 60), m = mins % 60;
+  const gap = [d && `${d} วัน`, h && `${h} ชม.`, (m || !(d || h)) && `${m} นาที`].filter(Boolean).join(' ');
+  const day = (x) => new Date(x).toLocaleDateString('en-CA', { timeZone: 'Asia/Bangkok' });
+  const hm = (x) => new Date(x).toLocaleTimeString('th-TH', { timeZone: 'Asia/Bangkok', hour: '2-digit', minute: '2-digit' });
+  const when = (x) => (day(transferAt) === day(createdAt) ? hm(x) : at(x));
+  return `โอนก่อนสร้างรายการ ${gap} (โอน ${when(transferAt)} · สร้างรายการ ${when(createdAt)}) — เกินที่อนุญาต ${allowedMin} นาที`;
+}
 const hasCustomer = (n) => !!n && n.trim() !== '-' && n.trim() !== '';
 
 /** `order`: payment row joined with its receiving account (PAY_SELECT). `v`: verifySlip() result. */
@@ -109,7 +122,7 @@ export function matchSlip(v, order) {
   // default 15 — customers who pay first and open the order a few minutes later; was a fixed 10 until 20 Oct 2026).
   const earlyMin = Number(v.cfg?.earlyTransferMinutes ?? 15);
   if (v.date && new Date(v.date).getTime() < new Date(order.created_at).getTime() - earlyMin * 60_000) {
-    early = `สลิปทำรายการเมื่อ ${at(v.date)} ก่อนสร้างรายการนี้ (${at(order.created_at)}) — ใช้สลิปเก่าไม่ได้`;
+    early = earlyTransferText(v.date, order.created_at, earlyMin);
     problems.push(early);
     check('TRANSFER_TIME', 'FAIL', `โอนเมื่อ ${at(v.date)} — ก่อนสร้างออเดอร์ (${at(order.created_at)}) เกิน ${earlyMin} นาที`);
   } else if (v.date) check('TRANSFER_TIME', 'PASS', `โอนเมื่อ ${at(v.date)} — หลังสร้างออเดอร์ (${at(order.created_at)})`);
