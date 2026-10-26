@@ -10,7 +10,7 @@ import { lockRefNumbers } from '../shared/ref-lock.js';
 const fmt = (n) => Number(n).toLocaleString('th-TH', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
 async function lock(client, ref) {
-  const { rows } = await client.query('SELECT id, ref, status, amount, fee, bank_account_id, receiver_name, admin_done, source, deleted_at FROM outflows WHERE ref = $1 FOR UPDATE', [ref]);
+  const { rows } = await client.query('SELECT id, ref, status, amount, fee, bank_account_id, receiver_name, admin_done, source, deleted_at, api_version FROM outflows WHERE ref = $1 FOR UPDATE', [ref]);
   if (!rows[0]) throw new NotFoundError(`Outflow ${ref} does not exist`);
   return rows[0];
 }
@@ -84,6 +84,8 @@ export const setAdminDone = (ref, actor, done) => withTransaction(async (client)
     [o.id, done, actor ?? 'console']);
   // no → yes on an approved API payout: the team has made the transfer — the shop sees ถอนสำเร็จ and gets payout.completed.
   if (done && !o.admin_done && o.status === 'approved' && o.source === 'api') notifyPayout(client, ref, 'payout.completed');
+  // API v2 only: yes → no means the transfer was undone — the payout is pending again (payout.pending, reopened).
+  if (!done && o.admin_done && o.status === 'approved' && o.source === 'api' && o.api_version === 'v2') notifyPayout(client, ref, 'payout.pending');
   await audit(client, actor, 'outflow.admin_done', ref, `admin ดำเนินการ: ${done ? 'yes' : 'no'} (${o.receiver_name} ${fmt(o.amount)} บาท)`);
 });
 export const reject = (ref, actor, reason) => withTransaction((c) => rejectOne(c, ref, actor, reason));

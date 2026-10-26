@@ -741,7 +741,8 @@ export async function attachByRef(m, ref, b, { base }) {
 
 export async function byOrder(m, id, { base }) {
   await expireDue();
-  const { rows } = await query(`${PAY_SELECT} WHERE p.merchant_id = $1 AND p.merchant_order_id = $2`, [m.id, id]);
+  // Deleted orders are not shown to the shop (user, 25 Oct 2026).
+  const { rows } = await query(`${PAY_SELECT} WHERE p.merchant_id = $1 AND p.merchant_order_id = $2 AND p.deleted_at IS NULL`, [m.id, id]);
   if (!rows[0]) throw new ApiError(404, 'ORDER_NOT_FOUND', `ไม่พบ orderId ${id}`);
   return { success: true, transaction: present(rows[0], base) };
 }
@@ -750,7 +751,7 @@ export async function byOrder(m, id, { base }) {
 export async function checkout(token, { base }) {
   if (!/^[a-f0-9]{32}$/.test(token)) throw new ApiError(404, 'TRANSACTION_NOT_FOUND', 'ไม่พบรายการ');
   await expireDue();
-  const { rows } = await query(`${PAY_SELECT.replace('SELECT p.*', 'SELECT p.*, m.name AS merchant_name')} JOIN merchants m ON m.id = p.merchant_id WHERE p.checkout_token = $1`, [token]);
+  const { rows } = await query(`${PAY_SELECT.replace('SELECT p.*', 'SELECT p.*, m.name AS merchant_name')} JOIN merchants m ON m.id = p.merchant_id WHERE p.checkout_token = $1 AND p.deleted_at IS NULL`, [token]);
   const p = rows[0];
   if (!p) throw new ApiError(404, 'TRANSACTION_NOT_FOUND', 'ไม่พบรายการ');
   const t = present(p, base);
@@ -775,7 +776,7 @@ export async function checkout(token, { base }) {
 export async function checkoutSlip(token, b, { base }) {
   if (!/^[a-f0-9]{32}$/.test(token)) throw new ApiError(404, 'TRANSACTION_NOT_FOUND', 'ไม่พบรายการ');
   await expireDue();
-  const { rows } = await query(`${PAY_SELECT.replace('SELECT p.*', 'SELECT p.*, m.slug, m.id AS mid')} JOIN merchants m ON m.id = p.merchant_id WHERE p.checkout_token = $1`, [token]);
+  const { rows } = await query(`${PAY_SELECT.replace('SELECT p.*', 'SELECT p.*, m.slug, m.id AS mid')} JOIN merchants m ON m.id = p.merchant_id WHERE p.checkout_token = $1 AND p.deleted_at IS NULL`, [token]);
   if (!rows[0]) throw new ApiError(404, 'TRANSACTION_NOT_FOUND', 'ไม่พบรายการ');
   const r = await attachAndVerify({ id: rows[0].mid, slug: `${rows[0].slug}:checkout` }, rows[0], b, base, { once: true });
   return withTiming({ success: r.success, verified: r.verified, result: r.result, message: r.message, mismatches: r.mismatches, status: r.transaction.status }, timingOf(r));
@@ -795,7 +796,7 @@ export async function transactions(m, q, { base }) {
   const st = statusFilter(q.status, STATUS);
   const args = [m.id, st, q.from ?? null, q.to ?? null];
   // Private test records never show in the portal lists (they stay reachable by ref through the API).
-  const where = `p.merchant_id = $1 AND ($2::text[] IS NULL OR p.status = ANY ($2)) AND ($3::timestamptz IS NULL OR p.created_at >= $3) AND ($4::timestamptz IS NULL OR p.created_at < $4) AND ${visible('payment', 'p.ref')}`;
+  const where = `p.merchant_id = $1 AND p.deleted_at IS NULL AND ($2::text[] IS NULL OR p.status = ANY ($2)) AND ($3::timestamptz IS NULL OR p.created_at >= $3) AND ($4::timestamptz IS NULL OR p.created_at < $4) AND ${visible('payment', 'p.ref')}`;
   const [{ rows }, { rows: n }] = await Promise.all([
     query(`${PAY_SELECT} WHERE ${where} ORDER BY p.created_at DESC, p.id DESC LIMIT ${q.limit} OFFSET ${q.offset}`, args),
     query(`SELECT count(*)::int AS n FROM payments p WHERE ${where}`, args),
@@ -870,7 +871,7 @@ export async function bulkPayout(m, { payouts }) {
 }
 
 export async function payout(m, { id, merchantRef }) {
-  const { rows } = await query(`SELECT * FROM outflows WHERE merchant_id = $1 AND ${id ? 'ref' : 'merchant_ref'} = $2`, [m.id, id ?? merchantRef]);
+  const { rows } = await query(`SELECT * FROM outflows WHERE merchant_id = $1 AND deleted_at IS NULL AND ${id ? 'ref' : 'merchant_ref'} = $2`, [m.id, id ?? merchantRef]);
   if (!rows[0]) throw new ApiError(404, 'PAYOUT_NOT_FOUND', 'ไม่พบ payout');
   return { success: true, payout: presentPayout(rows[0]) };
 }
@@ -878,7 +879,7 @@ export async function payout(m, { id, merchantRef }) {
 export async function payouts(m, q) {
   const st = statusFilter(q.status, O_STATUS);
   const args = [m.id, st, q.from ?? null, q.to ?? null];
-  const where = `merchant_id = $1 AND ($2::text[] IS NULL OR status = ANY ($2)) AND ($3::timestamptz IS NULL OR created_at >= $3) AND ($4::timestamptz IS NULL OR created_at < $4) AND ${visible('outflow', 'ref')}`;
+  const where = `merchant_id = $1 AND deleted_at IS NULL AND ($2::text[] IS NULL OR status = ANY ($2)) AND ($3::timestamptz IS NULL OR created_at >= $3) AND ($4::timestamptz IS NULL OR created_at < $4) AND ${visible('outflow', 'ref')}`;
   const [{ rows }, { rows: n }] = await Promise.all([
     query(`SELECT * FROM outflows WHERE ${where} ORDER BY created_at DESC, id DESC LIMIT ${q.limit} OFFSET ${q.offset}`, args),
     query(`SELECT count(*)::int AS n FROM outflows WHERE ${where}`, args),

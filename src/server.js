@@ -7,6 +7,7 @@ import { startWebhookRetries, stopWebhookRetries } from './webhooks/webhook.serv
 import { startSlipRechecks, stopSlipRechecks } from './merchant-api/v1.service.js';
 import { startMidnightCancel } from './jobs/midnight-cancel.js';
 import { startDuplicateCancel } from './jobs/duplicate-cancel.js';
+import { startSummaryBot, stopSummaryBot } from './telegram/summary-bot.js';
 
 const app = createApp();
 const server = app.listen(config.port, () => {
@@ -32,6 +33,8 @@ if (config.isProduction) startSlipRechecks();
 if (config.isProduction) startMidnightCancel(logger);
 // 23:00 (Bangkok): a same-customer, same-amount order made after the earlier one was paid, with no new payment, is rejected.
 if (config.isProduction) startDuplicateCancel(logger);
+// @OptionPayTransactionBot: "สรุปยอด" in the group "Option Pay สรุปยอด" — polls Telegram, so production only (one poller per bot).
+if (config.isProduction) startSummaryBot();
 
 let shuttingDown = false;
 

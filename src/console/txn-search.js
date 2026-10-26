@@ -60,8 +60,9 @@ const WITHDRAWAL_SELECT = `
     LEFT JOIN banks rb ON rb.code = w.receiver_bank_code`;
 
 const SOURCES = [
-  { kind: 'payment', sql: PAYMENT_SELECT, ref: 'p.ref', extra: ['p.merchant_order_id'], hide: () => visible('payment', 'p.ref') },
-  { kind: 'outflow', sql: OUTFLOW_SELECT, ref: 'o.ref', extra: ['o.merchant_ref'], hide: () => visible('outflow', 'o.ref') },
+  // Deleted records are not searchable (user, 25 Oct 2026): they appear only on รายการที่ลบแล้ว, where they can be restored.
+  { kind: 'payment', sql: PAYMENT_SELECT, ref: 'p.ref', extra: ['p.merchant_order_id'], hide: () => `p.deleted_at IS NULL AND ${visible('payment', 'p.ref')}` },
+  { kind: 'outflow', sql: OUTFLOW_SELECT, ref: 'o.ref', extra: ['o.merchant_ref'], hide: () => `o.deleted_at IS NULL AND ${visible('outflow', 'o.ref')}` },
   { kind: 'withdrawal', sql: WITHDRAWAL_SELECT, ref: 'w.ref', extra: ['w.merchant_ref'], hide: () => 'true' },
 ];
 
@@ -88,6 +89,7 @@ export async function search({ q, limit = 20 }) {
             (array_agg(detail ORDER BY id) FILTER (WHERE action LIKE '%.create'))[1] AS "createDetail"
        FROM audit_logs
       WHERE entity_ref ILIKE $1 AND entity_ref ~ '^(TXN|OUT|WDR)[0-9]+$' AND ${visible(['payment', 'outflow'], 'entity_ref')}
+        AND NOT EXISTS (SELECT 1 FROM payments x WHERE x.ref = entity_ref) AND NOT EXISTS (SELECT 1 FROM outflows x WHERE x.ref = entity_ref)
       GROUP BY entity_ref HAVING bool_or(action LIKE '%.delete') ORDER BY max(id) DESC LIMIT $2`,
     [like, limit],
   );
@@ -112,6 +114,7 @@ export async function timeline(ref) {
   if (hidden[0].h) throw new NotFoundError(`ไม่พบรายการ ${ref}`);
   const { rows } = await query(`${src.sql} WHERE ${src.ref} = $1`, [ref]);
   const details = rows[0] ?? null;
+  if (details?.deletedAt) throw new NotFoundError(`ไม่พบรายการ ${ref} (ถูกลบแล้ว — ดูได้ที่หน้ารายการที่ลบแล้ว)`);
 
   const { rows: events } = await query(
     `SELECT id, created_at AS at, actor, action, entity, detail FROM audit_logs WHERE entity_ref = $1 ORDER BY created_at, id`, [ref]);

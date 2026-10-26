@@ -42,13 +42,37 @@ const WRITE_RULES = [
   [/^\/support-bot(\/|$)/, 'settings.manage'],
 ];
 
-// Reads that expose secrets or money history; the console sends the operator with these.
+// Reads: first match wins; a list of permissions means any one of them is enough. Every console screen's data needs its
+// *.view permission (สิทธิ์การเข้าถึง is enforced from 24 Oct 2026). The shop / bank-account LISTS also feed the filter
+// dropdowns of the money pages, so anyone who can view money may read them; shop secrets stay merchant.manage.
+const MONEY_VIEW = ['payment.view', 'outflow.view', 'withdrawal.view'];
 const READ_RULES = [
   [/^\/merchants\/[^/]+\/(api-keys|webhook|portal-users)$/, 'merchant.manage'],
   [/^\/merchants\/[^/]+\/credits$/, 'merchant.view'],
   [/^\/merchants\/[^/]+\/breakdown\//, 'merchant.view'],
+  [/^\/merchants\/?$/, ['merchant.view', ...MONEY_VIEW]],
+  [/^\/merchants(\/|$)/, 'merchant.view'],
+  [/^\/portal-users(\/|$)/, 'merchant.view'],
+  [/^\/config\/quota\/live$/, ['payment.view', 'settings.manage']],
   [/^\/config\/?$/, 'settings.manage'],
+  [/^\/config(\/|$)/, 'settings.manage'],
+  [/^\/(payments|txn-search|transfer-leftovers)(\/|$)/, 'payment.view'],
+  [/^\/double-credits(\/|$)/, ['payment.double_credit', 'payment.view']],
+  [/^\/outflows(\/|$)/, 'outflow.view'],
+  [/^\/(withdrawals|p2p)(\/|$)/, 'withdrawal.view'],
+  [/^\/accounts\/?$/, ['account.view', ...MONEY_VIEW]],
+  [/^\/(accounts|accounts-admin)(\/|$)/, 'account.view'],
+  [/^\/(webhooks|webhook-endpoints)(\/|$)/, 'webhook.view'],
+  [/^\/(channels|events|devices)(\/|$)/, 'channel.view'],
+  [/^\/(users|users-admin|roles|roles-admin)(\/|$)/, 'user.view'],
+  [/^\/(audit|apiLogs)(\/|$)/, 'audit.view'],
+  [/^\/(alerts|alert-bots)(\/|$)/, 'alerts.manage'],
+  [/^\/(settings|support-bot)(\/|$)/, 'settings.manage'],
 ];
+
+// The console's own server-side calls that are not made for a signed-in operator: no actor (branding, logins, the
+// merchant portal's lookups) or the public demo page. Only the Next server holds the console key, so these are trusted.
+const INTERNAL_ACTORS = new Set(['demo-page']);
 
 const OPEN = /^\/(portal(\/|$)|config\/(public|asset\/))/;
 const PROFILE = /^\/profile\/(\d+)(\/|$)/;
@@ -81,7 +105,7 @@ export async function resolveOperator(username, userId) {
   return { id: rows.length === 1 ? rows[0].id : null, roleCode: rows.length === 1 ? rows[0].roleCode : null, perms };
 }
 
-export const hasPerm = (op, perm) => !!op && (op.perms.has(SUPER) || (perm !== SUPER && op.perms.has(perm)));
+export const hasPerm = (op, perm) => !!op && (op.perms.has(SUPER) || (Array.isArray(perm) ? perm.some((p) => op.perms.has(p)) : perm !== SUPER && op.perms.has(perm)));
 
 export const requiredPermission = (method, path) => {
   const rules = method === 'GET' || method === 'HEAD' ? READ_RULES : WRITE_RULES;
@@ -103,10 +127,12 @@ export async function consolePerms(req, _res, next) {
     }
     const perm = requiredPermission(req.method, req.path);
     if (!perm) return next();
+    if (!req.actor || INTERNAL_ACTORS.has(req.actor)) return next();
     const op = await resolveOperator(req.actor, userId);
     if (!op) throw new ForbiddenError('ไม่พบผู้ใช้ที่ใช้งานอยู่ — กรุณาเข้าสู่ระบบใหม่');
     if (!hasPerm(op, perm)) {
-      throw new ForbiddenError(perm === SUPER ? 'ไม่มีสิทธิ์ทำรายการนี้ (เฉพาะ Super Admin)' : `ไม่มีสิทธิ์ทำรายการนี้ (ต้องมีสิทธิ์ ${perm})`, { permission: perm });
+      const need = Array.isArray(perm) ? perm.join(' หรือ ') : perm;
+      throw new ForbiddenError(perm === SUPER ? 'ไม่มีสิทธิ์ทำรายการนี้ (เฉพาะ Super Admin)' : `ไม่มีสิทธิ์ (ต้องมีสิทธิ์ ${need})`, { permission: perm });
     }
     req.operator = op;
     next();

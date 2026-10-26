@@ -19,8 +19,10 @@ const MAX_AGE_S = 300;
 export const FIELDS = {
   payment: ['event', 'ref', 'orderId', 'amount', 'status', 'createdAt', 'resentAt'],
   payout: ['event', 'ref', 'orderId', 'merchantRef', 'amount', 'status', 'failureReason', 'createdAt', 'completedAt'],
+  // API v2 (26 Oct 2026): payout.pending has one more key, reopened (true = the transfer was undone).
+  payoutV2: ['event', 'ref', 'orderId', 'merchantRef', 'amount', 'status', 'failureReason', 'createdAt', 'completedAt', 'reopened'],
 };
-export const EVENTS = { 'payment.approved': 'payment', 'payment.rejected': 'payment', 'payout.completed': 'payout', 'payout.failed': 'payout' };
+export const EVENTS = { 'payment.approved': 'payment', 'payment.rejected': 'payment', 'payout.completed': 'payout', 'payout.failed': 'payout', 'payout.pending': 'payoutV2' };
 
 const hmac = (key, msg) => createHmac('sha256', key).update(msg, 'utf8').digest('hex');
 const same = (a, b) => a.length === b.length && timingSafeEqual(Buffer.from(a), Buffer.from(b));

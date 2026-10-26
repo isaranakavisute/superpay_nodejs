@@ -43,6 +43,7 @@ import backupsAdminRouter from './routes/backups-admin.routes.js';
 import { addRecord, callbackLog, demoKey, demoSlip, listRecords, shopFees } from './demo/demo.service.js';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler.js';
 import requireConsoleKey from './middleware/consoleAuth.js';
+import consolePerms from './middleware/consolePerms.js';
 
 export function createApp() {
   const app = express();
@@ -160,6 +161,8 @@ export function createApp() {
     const b = z.object({ kind: z.enum(['payment', 'payout']), ref: z.string().trim().regex(/^(TXN|OUT)\d+$/) }).parse(req.body);
     res.json({ ok: true, ...(await addRecord(b)) });
   }));
+  // สิทธิ์การเข้าถึง: every console request made for a signed-in operator is checked against their role (24 Oct 2026).
+  app.use('/api/console', requireConsoleKey, consolePerms);
   app.use('/api/console/backups', requireConsoleKey, backupsAdminRouter);
   app.use('/api/console/payments', requireConsoleKey, paymentsAdminRouter);
   app.use('/api/console/support-bot', requireConsoleKey, supportBotAdminRouter);

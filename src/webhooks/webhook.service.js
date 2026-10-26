@@ -23,8 +23,13 @@ const PAYOUT_STATUS = { pending: 'pending', approved: 'completed', rejected: 'fa
  * completedAt: payout.completed = when the team made the transfer (admin ดำเนินการ → yes); payout.failed = when it was rejected.
  */
 export function payoutPayload(event, o) {
-  const status = event === 'payout.completed' ? 'completed' : PAYOUT_STATUS[o.status] ?? o.status;
   const iso = (t) => (t ? new Date(t).toISOString() : null);
+  // API v2 only (26 Oct 2026): the payout is accepted but not transferred yet — created, or transfer undone (reopened).
+  if (event === 'payout.pending') {
+    return { event, ref: o.ref, orderId: o.merchant_ref ?? null, merchantRef: o.merchant_ref ?? null, amount: Number(o.amount).toFixed(2), status: 'pending',
+      failureReason: null, createdAt: iso(o.created_at), completedAt: null, reopened: !!o.reopened };
+  }
+  const status = event === 'payout.completed' ? 'completed' : PAYOUT_STATUS[o.status] ?? o.status;
   return {
     event,
     ref: o.ref,
@@ -66,6 +71,11 @@ const WD_STATUS = { pending: 'pending', approved: 'approved', rejected: 'failed'
 export async function payloadFor(kind, ref, event) {
   if (kind === 'outflow') {
     const { rows } = await query('SELECT ref, merchant_ref, amount, status, review_note, created_at, completed_at, admin_done_at FROM outflows WHERE ref = $1', [ref]);
+    // payout.pending after a payout.completed was already sent = the transfer was undone (reopened).
+    if (rows[0] && event === 'payout.pending') {
+      const { rows: done } = await query(`SELECT 1 FROM webhook_deliveries WHERE outflow_ref = $1 AND event = 'payout.completed' LIMIT 1`, [ref]);
+      rows[0].reopened = done.length > 0;
+    }
     return rows[0] ? payoutPayload(event, rows[0]) : { event, ref };
   }
   if (kind === 'withdrawal') {
@@ -337,7 +347,7 @@ export async function bulkRetry(ids, actor) {
  * An event happened to a payment / payout / withdrawal: find the nearest shop up the tree (the record's own
  * shop first — a sub-shop acting through its parent's key reaches the parent's endpoint) whose active endpoints
  * post or alert this event, then post it (delivery + retries) and/or alert Telegram. Called after the change
- * has committed. payout.completed is sent once per payout.
+ * has committed. payout.completed is sent once per payout (API v2: once more after each reopen).
  */
 async function dispatch(kind, ref, event) {
   const { col, owner } = KINDS[kind];
@@ -379,7 +389,10 @@ async function dispatch(kind, ref, event) {
       `INSERT INTO webhook_deliveries (endpoint_id, event, ${col}, attempts, delivered_at, state)
        SELECT $3, $2, $1, 0, now(), 'pending'
         WHERE $2 <> 'payout.completed' OR NOT EXISTS (
-          SELECT 1 FROM webhook_deliveries x WHERE x.outflow_ref = $1 AND x.event = $2 AND x.state IN ('delivered', 'pending'))
+          SELECT 1 FROM webhook_deliveries x WHERE x.outflow_ref = $1 AND x.event = $2 AND x.state IN ('delivered', 'pending')
+             -- API v2: after a reopen (payout.pending sent after it), the next transfer is a new completion. v1 payouts
+             -- never get payout.pending, so for them this stays "once per payout".
+             AND x.id > coalesce((SELECT max(y.id) FROM webhook_deliveries y WHERE y.outflow_ref = $1 AND y.event = 'payout.pending'), 0))
        RETURNING id`,
       [ref, event, e.id],
     );

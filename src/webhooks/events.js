@@ -7,6 +7,7 @@ export const WEBHOOK_EVENTS = [
   { code: 'payment.rejected', group: 'เงินเข้า', label: 'ชำระเงินไม่สำเร็จ / ยกเลิก', when: 'ผู้ดูแลปฏิเสธ ร้านยกเลิกผ่าน API หรือระบบยกเลิกอัตโนมัติ (ลูกค้าชำระผ่านออเดอร์ใหม่ / สลิปเดียวกันใช้กับออเดอร์อื่น)' },
   { code: 'payment.expired', group: 'เงินเข้า', label: 'ออเดอร์หมดอายุ', when: 'ออเดอร์ที่ยังไม่ได้ชำระเลยเวลาหมดอายุ (ตรวจพบเมื่อมีการเรียก API ครั้งถัดไป)' },
   { code: 'payment.refunded', group: 'เงินเข้า', label: 'คืนเงินแล้ว', when: 'ผู้ดูแลคืนเงินออเดอร์ที่อนุมัติแล้ว' },
+  { code: 'payout.pending', group: 'โอนออก (payout API)', label: 'โอนออกรอดำเนินการ (เฉพาะ API v2)', when: 'สร้าง payout ผ่าน POST /api/v2/payout/create และเมื่อผู้ดูแลเปลี่ยน admin ดำเนินการ จาก yes กลับเป็น no (reopened) — เฉพาะ payout ที่สร้างผ่าน v2' },
   { code: 'payout.completed', group: 'โอนออก (payout API)', label: 'โอนออกสำเร็จ (ถอนสำเร็จ)', when: 'ผู้ดูแลตั้ง admin ดำเนินการ = yes (โอนเงินให้ผู้รับแล้ว) — ส่งครั้งเดียวต่อรายการ' },
   { code: 'payout.failed', group: 'โอนออก (payout API)', label: 'โอนออกไม่สำเร็จ', when: 'ผู้ดูแลปฏิเสธ payout (คืนยอดให้ร้าน)' },
   { code: 'withdrawal.approved', group: 'คำขอถอน', label: 'อนุมัติคำขอถอน', when: 'ผู้ดูแลอนุมัติคำขอถอน (สร้างรายการเงินออก รอโอน)' },
