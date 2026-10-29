@@ -43,7 +43,7 @@ import backupsAdminRouter from './routes/backups-admin.routes.js';
 import { addRecord, callbackLog, demoKey, demoSlip, listRecords, shopFees } from './demo/demo.service.js';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler.js';
 import requireConsoleKey from './middleware/consoleAuth.js';
-import consolePerms from './middleware/consolePerms.js';
+import consolePerms, { demoGate } from './middleware/consolePerms.js';
 
 export function createApp() {
   const app = express();
@@ -148,6 +148,8 @@ export function createApp() {
   app.use('/api/auth', requireConsoleKey, authRouter);
   app.use('/api/dashboard', requireConsoleKey, dashboardRouter);
   // Public demo page (optionpay.co/demo): the console's server signs real merchant API calls for my-shop with this key.
+  // Switched off in Settings (section 'demo') → every demo call is refused, so the page cannot work at all.
+  app.use('/api/console/demo', requireConsoleKey, demoGate);
   app.get('/api/console/demo/key', requireConsoleKey, asyncHandler(async (_req, res) => res.json({ ok: true, ...(await demoKey()) })));
   app.get('/api/console/demo/slip/:ref', requireConsoleKey, asyncHandler(async (req, res) => {
     const s = /^TXN\d+$/.test(req.params.ref) ? await demoSlip(req.params.ref) : null;

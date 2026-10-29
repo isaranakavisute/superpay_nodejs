@@ -173,7 +173,7 @@ async function checkAgainstOrder(buf, mime, fp, p) {
     const own = rows[0] && ['approved', 'refunded'].includes(p.status);
     return { result: 'invalid', reason: orderNotPendingText(p.status), problems: own ? ['สลิปนี้คือสลิปที่ใช้ชำระรายการนี้แล้ว'] : [], detail: await orderDetail(p.id), fp, order: p };
   }
-  const v = await verifySlip(buf, mime);
+  const v = await verifySlip(buf, mime, { purpose: 'telegram_bot' });
   // Same as the API: "not found" right after a transfer is re-checked first (rule 17 Oct 2026), not refused.
   if (v.verified === false && v.notFound) Object.assign(v, { verified: null, pending: true, notFoundRetry: true });
   // Same as the API: no answer from the bank → read the image; the bank still processing → "will be re-checked".
@@ -234,7 +234,7 @@ export async function checkSlip(buf, mime, expect = null, { recheck = false } = 
   const fp = await fingerprintOf(buf, mime);
   if (isSampleSlip(fp)) return { result: 'invalid', reason: SAMPLE_SLIP_MESSAGE, fp };
   if (expect?.kind === 'order') return checkAgainstOrder(buf, mime, fp, expect.order);
-  const v = await verifySlip(buf, mime);
+  const v = await verifySlip(buf, mime, { purpose: 'telegram_bot' });
   // "No QR" from the provider: say what the image actually has (a fake QR, or a QR that isn't a slip's).
   if (v.verified === false && v.notFound) return { result: 'review', reason: 'ธนาคารยังไม่พบรายการโอนนี้ (อาจเพิ่งโอน) — ระบบจะตรวจซ้ำอัตโนมัติ', fp };
   if (v.verified === false) return { result: 'invalid', reason: (/QR/.test(v.message ?? '') && qrReason(fp)) || v.message || 'สลิปไม่ถูกต้อง', fp };

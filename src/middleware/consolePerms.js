@@ -1,5 +1,6 @@
 import { query } from '../db/pool.js';
 import { AppError } from '../errors.js';
+import { demoEnabled } from '../config-admin/config.service.js';
 
 /**
  * Role permissions for the admin console (สิทธิ์การเข้าถึง). Runs after
@@ -13,6 +14,19 @@ export class ForbiddenError extends AppError {
   constructor(message = 'Forbidden', details) {
     super(message, { status: 403, code: 'forbidden', details });
   }
+}
+
+export class DemoDisabledError extends AppError {
+  constructor() {
+    super('หน้า demo ถูกปิดใช้งาน', { status: 404, code: 'DEMO_DISABLED' });
+  }
+}
+/** /api/console/demo/*: refused while the demo page is switched off. */
+export async function demoGate(_req, _res, next) {
+  try {
+    if (!(await demoEnabled())) throw new DemoDisabledError();
+    next();
+  } catch (e) { next(e); }
 }
 
 // First match wins. Writes not listed here need Super Admin.
@@ -53,7 +67,7 @@ const READ_RULES = [
   [/^\/merchants\/?$/, ['merchant.view', ...MONEY_VIEW]],
   [/^\/merchants(\/|$)/, 'merchant.view'],
   [/^\/portal-users(\/|$)/, 'merchant.view'],
-  [/^\/config\/quota\/live$/, ['payment.view', 'settings.manage']],
+  [/^\/config\/quota\/(live|daily)$/, ['payment.view', 'settings.manage']],
   [/^\/config\/?$/, 'settings.manage'],
   [/^\/config(\/|$)/, 'settings.manage'],
   [/^\/(payments|txn-search|transfer-leftovers)(\/|$)/, 'payment.view'],
@@ -116,6 +130,8 @@ export const requiredPermission = (method, path) => {
 
 export async function consolePerms(req, _res, next) {
   try {
+    // Demo page switched off in Settings: nothing done in its name goes through (admin calls of /demo included).
+    if (req.actor === 'demo-page' && !(await demoEnabled())) throw new DemoDisabledError();
     if (OPEN.test(req.path)) return next();
     const userId = Number(req.get('x-console-user-id')) || null;
     const profile = PROFILE.exec(req.path);

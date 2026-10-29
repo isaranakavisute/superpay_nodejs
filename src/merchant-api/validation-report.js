@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { query } from '../db/pool.js';
 import { internal as configOf } from '../config-admin/config.service.js';
 import { matchSlip, normalizeSlip } from './slip-match.js';
-import { verifySlip } from './slip-verify.js';
+import { logEasySlipCall, verifySlip } from './slip-verify.js';
 import { ApiError } from './v1.service.js';
 
 /**
@@ -41,9 +41,10 @@ async function bankRecord(p, cfg) {
       const r = await fetch(`https://developer.easyslip.com/api/v1/verify?payload=${encodeURIComponent(p.qr_payload)}`,
         { headers: { authorization: `Bearer ${cfg.easySlipApiKey}` }, signal: AbortSignal.timeout(20_000) });
       const j = await r.json().catch(() => ({}));
+      logEasySlipCall('validation_report', r.status, r.status === 200 && j.data ? 'found' : r.status === 400 || r.status === 404 ? 'not_found' : 'error');
       if (r.status === 200 && j.data) return { verified: true, provider: 'easyslip', amount: Number(j.data.amount?.amount), transRef: j.data.transRef ?? null, date: j.data.date ?? null, raw: j.data };
     }
-    return await verifySlip(p.data, p.mime);
+    return await verifySlip(p.data, p.mime, { purpose: 'validation_report' });
   } catch (e) {
     return { verified: null, message: e.message };
   }

@@ -5,6 +5,7 @@ import { query, withTransaction } from '../db/pool.js';
 import { AppError } from '../errors.js';
 import { internal as configOf, minBalanceFor } from '../config-admin/config.service.js';
 import { approveOne, emitPaymentEvent, setAmountByRef } from '../payments/payment.service.js';
+import { sendAlert } from '../alerts/alert.service.js';
 import { hashPassword, verifyPassword } from '../shared/password.js';
 import { normalizePromptPayId, promptPayPayload } from '../shared/promptpay.js';
 import { open as unseal, seal } from '../shared/secret-box.js';
@@ -46,6 +47,23 @@ const audit = (c, m, action, entity, ref, detail, actor = actorOf(m)) =>
 const STATUS = { pending: 'PENDING', approved: 'PAID', rejected: 'CANCELLED', refunded: 'REFUNDED', expired: 'EXPIRED' };
 /** Why a slip can't go on an order any more (API ORDER_NOT_PENDING; the slip checker bot says the same). */
 export const orderNotPendingText = (status) => `ออเดอร์นี้สถานะ ${STATUS[status]} แล้ว`;
+
+/**
+ * Rule "แนบสลิปหลังยกเลิกอัตโนมัติ" (user, 28 Oct 2026 — TXN195910): an order the SYSTEM cancelled only because no
+ * payment came in time — the midnight rule or the 23:00 duplicate rule — still takes a slip (admin portal, customer
+ * checkout page, API) for 24 h after it was created. The slip gets exactly the normal checks; only when they all pass is
+ * the order approved, with the normal payment.approved callback. Refused, or the bank cannot confirm it yet: nothing
+ * changes — the order stays cancelled and no slip is kept on it (it may be attached again). Admin rejections, shop
+ * cancellations and orders closed because they were paid through another order never take a slip.
+ */
+const LATE_SLIP_HOURS = 24;
+const LATE_SLIP_REASONS = [/^ยกเลิกเนื่องจากยังไม่ได้ดำเนินการภายในเที่ยงคืน/, /^ซ้ำกับ TXN\d+ ที่ชำระแล้ว — ไม่มีเงินโอนใหม่สำหรับออเดอร์นี้ภายใน 23:00/];
+export const lateSlipAllowed = (p) => !!p && p.status === 'rejected' && !p.deleted_at && !(Number(p.refunded_amount) > 0) && p.reviewed_by === 'system'
+  && LATE_SLIP_REASONS.some((r) => r.test(p.review_note ?? '')) && Date.now() - new Date(p.created_at).getTime() <= LATE_SLIP_HOURS * 3_600_000;
+/** Can a slip go on this order now? (open, or cancelled by the system for no payment — see lateSlipAllowed) */
+const openForSlip = (p) => ['pending', 'expired'].includes(p.status) || lateSlipAllowed(p);
+/** A late slip that did not pass: thrown inside the transaction so nothing is written. */
+class LateSlipRefused extends Error { constructor(d) { super('late slip refused'); this.d = d; } }
 const W_STATUS = { pending: 'PENDING', approved: 'APPROVED', rejected: 'REJECTED' };
 const O_STATUS = { pending: 'PENDING', approved: 'COMPLETED', rejected: 'FAILED' };
 
@@ -550,14 +568,17 @@ async function attachAndVerify(m, p, { image, mime }, base, { once = false, rech
   const who = actor ?? actorOf(m);
   const buf = Buffer.from(image, 'base64');
   if (buf.length < 100 || buf.length > 8 << 20) throw new ApiError(400, 'INVALID_SLIP', 'ไฟล์สลิปต้องเป็นรูปขนาดไม่เกิน 8 MB');
-  if (!['pending', 'expired'].includes(p.status)) throw new ApiError(409, 'ORDER_NOT_PENDING', orderNotPendingText(p.status));
+  if (!openForSlip(p)) throw new ApiError(409, 'ORDER_NOT_PENDING', orderNotPendingText(p.status));
+  const late = p.status === 'rejected';
   if (once && (await hasAcceptedSlip({ query }, p.id))) throw slipTaken();
   const time = stopwatch();
   const fp = await slipFingerprint(buf, mime);
   time.lap('qr', 'อ่าน QR จากภาพ');
   if (isSampleSlip(fp)) throw new ApiError(400, 'SAMPLE_SLIP', SAMPLE_SLIP_MESSAGE);
-  if (isDemoSlip(fp)) return demoSlipApprove(m, p, buf, mime, fp, base, time, who);
-  const v = await verifySlip(buf, mime, { pendingRetries: !recheck });
+  if (isDemoSlip(fp)) return demoSlipApprove(m, p, buf, mime, fp, base, time, who, late);
+  // Usage log purpose (EasySlip quota per day): background re-check · customer checkout page · admin upload · shop API.
+  const purpose = recheck ? 'slip_recheck' : /:checkout$/.test(m.slug ?? '') ? 'slip_checkout' : actor ? 'slip_admin' : 'slip_api';
+  const v = await verifySlip(buf, mime, { pendingRetries: !recheck, purpose });
   time.lap('provider', `ตรวจกับธนาคาร (${v.provider})`);
   // Rule (17 Oct 2026): "not found" usually means a slip sent too soon after the transfer — re-check it a few times
   // (like slip_pending) before it counts as a bad slip; only after the last re-check is it refused.
@@ -578,14 +599,18 @@ async function attachAndVerify(m, p, { image, mime }, base, { once = false, rech
   }
   if (ocr) time.lap('ocr', 'อ่านข้อความจากภาพ');
   const via = ocr ? 'ocr' : v.provider;
-  const out = await withTransaction(async (c) => {
+  let out;
+  try {
+  out = await withTransaction(async (c) => {
     // Re-read under the lock: the same slip sent twice at once (TXN179275, 22 Oct 2026) — the first request approved the
     // order while this one was checking; this one must not overwrite its slip and note with "ใช้ซ้ำไม่ได้".
-    const { rows: [cur] } = await c.query('SELECT status FROM payments WHERE id = $1 FOR UPDATE', [p.id]);
-    if (!['pending', 'expired'].includes(cur.status)) throw new ApiError(409, 'ORDER_NOT_PENDING', orderNotPendingText(cur.status));
+    const { rows: [cur] } = await c.query('SELECT status, review_note, reviewed_by, created_at, deleted_at, refunded_amount FROM payments WHERE id = $1 FOR UPDATE', [p.id]);
+    if (late ? !lateSlipAllowed(cur) : !['pending', 'expired'].includes(cur.status)) throw new ApiError(409, 'ORDER_NOT_PENDING', orderNotPendingText(cur.status));
     if (once && (await hasAcceptedSlip(c, p.id))) throw slipTaken();
     const d = await decideSlip(c, p, v, fp, ocr);
     const { decision, reason, mismatches, carried, leftover, combined, reusedOn, paidRequested } = d;
+    // Late slip (cancelled order): only a full pass changes anything — otherwise roll back, the order stays cancelled.
+    if (late && decision !== 'approve') throw new LateSlipRefused({ decision, reason, mismatches, checks: d.checks, warnings: d.warnings });
     // Auto-approved: exactly like a normal approval — a sender name that differs from the customer's (someone else may pay
     // for them) is no warning in the note, the stored result or the API reply (user's rule, 22 Oct 2026).
     const senderOk = (x) => decision === 'approve' && /ผู้โอน/.test(x);
@@ -632,8 +657,13 @@ async function attachAndVerify(m, p, { image, mime }, base, { once = false, rech
     // Unique satang were added but the customer paid the amount the shop asked for (bank-verified): the order is for that.
     if (decision === 'approve' && paidRequested) await setAmountByRef(c, p.ref, Number(v.amount), 'system', 'ลูกค้าโอนตามยอดที่ร้านสั่ง (ไม่รวมสตางค์ที่ระบบเติม) — ธนาคารยืนยันแล้ว');
     if (decision === 'approve') {
-      await approveOne(c, p.ref, 'system', (carried && !reusedOn) || leftover || combined ? `ตรวจสลิปผ่าน ${v.provider} · ${reason}` : `ตรวจสลิปผ่าน ${v.provider}${warn}`,
-        { cover: combined?.cover ?? null });
+      if (late) {
+        // The system had cancelled it for no payment; the slip now proves the payment (rule above): reopen and approve in one go.
+        await c.query(`UPDATE payments SET status = 'pending', completed_at = NULL WHERE id = $1 AND status = 'rejected'`, [p.id]);
+        await audit(c, m, 'payment.late_slip', 'payment', p.ref, `แนบสลิปหลังยกเลิกอัตโนมัติ (เดิม: ${cur.review_note}) — ตรวจผ่านทุกข้อ · อนุมัติ`, who);
+      }
+      const note = (carried && !reusedOn) || leftover || combined ? `ตรวจสลิปผ่าน ${v.provider} · ${reason}` : `ตรวจสลิปผ่าน ${v.provider}${warn}`;
+      await approveOne(c, p.ref, 'system', late ? `อนุมัติหลังยกเลิกอัตโนมัติ — ${note}` : note, { cover: combined?.cover ?? null });
     }
     // The same slip refused earlier on another still-open order of this shop: that order is closed now.
     if (decision === 'approve') {
@@ -669,13 +699,36 @@ async function attachAndVerify(m, p, { image, mime }, base, { once = false, rech
       transaction: present(rows[0], base),
     };
   });
+  } catch (err) {
+    if (!(err instanceof LateSlipRefused)) throw err;
+    // Late slip that did not pass: nothing was written — the order stays cancelled, no callback, no slip kept on it.
+    const { decision, reason, mismatches, checks } = err.d;
+    const unsure = decision === 'review';
+    const message = unsure
+      ? `ธนาคารยังยืนยันรายการโอนนี้ไม่ได้${v.message ? ` (${v.message})` : ''} — รายการยังคงถูกยกเลิก · แนบสลิปอีกครั้งได้ในอีก 2–3 นาที`
+      : `สลิปไม่ผ่าน — รายการยังคงถูกยกเลิก: ${reason ?? mismatches?.[0] ?? 'ข้อมูลไม่ตรงกับรายการ'}`;
+    await audit({ query }, m, 'payment.late_slip_refused', 'payment', p.ref, `แนบสลิปหลังยกเลิกอัตโนมัติ — ${unsure ? 'ธนาคารยังยืนยันไม่ได้' : 'ไม่ผ่าน'}: ${reason ?? '—'} · รายการยังคงถูกยกเลิก`, who);
+    if (unsure) {
+      sendAlert('payment.late_slip', `⚠️ สลิปหลังยกเลิกอัตโนมัติ — ${p.ref} (${fmt(p.amount)} บาท) ธนาคารยังยืนยันไม่ได้: ${reason ?? v.message ?? '—'} · รายการยังคงถูกยกเลิก (แนบใหม่ได้ / ผู้ดูแลตรวจเอง)`,
+        { merchantId: p.merchant_id }).catch(() => {});
+    }
+    time.lap('db', 'ไม่บันทึก (สลิปหลังยกเลิกไม่ผ่าน)');
+    logger.info({ ref: p.ref, via, result: unsure ? 'NOT_CONFIRMED' : 'INVALID_SLIP', late: true, ms: time.ms }, 'late slip refused');
+    return withTiming({
+      success: false, verified: false, result: unsure ? 'NOT_CONFIRMED' : 'INVALID_SLIP', message,
+      mismatches: unsure ? [message] : (mismatches?.length ? mismatches : [message]), warnings: [], carriedFrom: null, carryOver: null, leftover: null, autoCancelled: [],
+      checks, slip: slipDetails(v), nextStep: unsure ? 'แนบสลิปเดิมอีกครั้งในอีก 2–3 นาที (ธนาคารอาจยังประมวลผลรายการโอน)' : 'สลิปไม่ผ่าน — รายการยังคงถูกยกเลิก',
+      transaction: present(p, base),
+    }, time);
+  }
   time.lap('db', 'บันทึกผล');
-  logger.info({ ref: p.ref, via, result: out.result, ms: time.ms }, 'slip checked');
+  logger.info({ ref: p.ref, via, result: out.result, late, ms: time.ms }, 'slip checked');
+  if (late && out.result === 'PAID') sendAlert('payment.late_slip', `✅ สลิปหลังยกเลิกอัตโนมัติ — ${p.ref} (${fmt(p.amount)} บาท) ตรวจผ่านทุกข้อ · อนุมัติแล้ว และแจ้ง payment.approved ให้ร้าน`, { merchantId: p.merchant_id }).catch(() => {});
   return withTiming(out, time);
 }
 
 /** A DEMO slip from optionpay.co/demo (demo/demo.service.js): approved at once when valid for this order, else refused. */
-async function demoSlipApprove(m, p, buf, mime, fp, base, time, who = actorOf(m)) {
+async function demoSlipApprove(m, p, buf, mime, fp, base, time, who = actorOf(m), late = false) {
   const bad = await checkDemoSlip(m, p, fp.qr);
   if (bad) throw new ApiError(400, 'INVALID_SLIP', bad);
   const note = 'ตรวจสลิปผ่าน — สลิป DEMO (หน้า optionpay.co/demo) · อนุมัติอัตโนมัติ';
@@ -687,6 +740,7 @@ async function demoSlipApprove(m, p, buf, mime, fp, base, time, who = actorOf(m)
          provider = EXCLUDED.provider, trans_ref = NULL, verify_result = EXCLUDED.verify_result, image_sha256 = EXCLUDED.image_sha256, qr_payload = EXCLUDED.qr_payload`,
       [p.id, mime, buf, who, JSON.stringify({ verified: true, amount: Number(p.amount), message: note, decision: 'approve', demo: true }), fp.sha256, fp.qr],
     );
+    if (late) await c.query(`UPDATE payments SET status = 'pending', completed_at = NULL WHERE id = $1 AND status = 'rejected'`, [p.id]);
     await c.query('UPDATE payments SET slip_received_at = now(), review_note = $2 WHERE id = $1', [p.id, note]);
     await approveOne(c, p.ref, 'system', note);
     await audit(c, m, 'payment.slip', 'payment', p.ref, `แนบสลิป · demo: ผ่าน — อนุมัติอัตโนมัติ (สลิป DEMO)`, who);
@@ -727,7 +781,7 @@ export async function adminAttachSlip(ref, actor, { image, mime }) {
   await expireDue();
   const { rows: [p] } = await query(`${PAY_SELECT} WHERE p.ref = $1`, [ref]);
   if (!p) throw new ApiError(404, 'TRANSACTION_NOT_FOUND', 'ไม่พบรายการ');
-  if (!['pending', 'expired'].includes(p.status)) return { checked: false, status: p.status };
+  if (!openForSlip(p)) return { checked: false, status: p.status };
   const { rows: [m] } = p.merchant_id ? await query('SELECT * FROM merchants WHERE id = $1', [p.merchant_id]) : { rows: [{ id: null, slug: 'house' }] };
   const r = await attachAndVerify(m, p, { image, mime }, null, { actor: actor ?? 'console' });
   return { checked: true, result: r.result, verified: r.verified, message: r.message, mismatches: r.mismatches, warnings: r.warnings,
@@ -766,6 +820,8 @@ export async function checkout(token, { base }) {
     // What the slip must show (the payment page lists it).
     customerName: p.customer_name && p.customer_name !== '-' ? p.customer_name : null,
     hasSlip: !!p.slip_received_at,
+    // Cancelled by the system for no payment, still within 24 h: the page offers the slip upload (rule above).
+    lateSlip: lateSlipAllowed(p),
     slipLocked: await hasAcceptedSlip({ query }, p.id),
     // Why the last slip was refused, so the page can say what to fix.
     slipProblems: p.slip_received_at ? await lastSlipProblems(p.id) : null,

@@ -147,7 +147,7 @@ export async function fillTransRefs(q, refs) {
   );
   for (const s of rows) {
     try {
-      const v = await verifySlip(s.data, s.mime, { pendingRetries: false });
+      const v = await verifySlip(s.data, s.mime, { pendingRetries: false, purpose: 'transfer_backfill' });
       if (v.verified === true && v.transRef) {
         await q(`UPDATE payment_slips SET verify_result = verify_result || jsonb_build_object('transRef', $2::text) WHERE payment_id = $1`, [s.payment_id, v.transRef]);
       }

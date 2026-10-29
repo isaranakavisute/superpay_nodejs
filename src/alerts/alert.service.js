@@ -8,6 +8,7 @@ import { deleteBodySchema, MARK_DELETED } from '../shared/soft-delete.js';
 export const ALERT_KINDS = [
   'withdrawal.pending', 'outflow.pending', 'double_credit.detected', 'low_balance',
   'device.offline', 'channel.error', 'webhook.failed', 'slip.provider_down', 'webhook.delivery', 'midnight.cancel',
+  'payment.late_slip',
 ];
 
 const bot = z.object({

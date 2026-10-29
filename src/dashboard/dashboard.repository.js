@@ -120,6 +120,24 @@ export async function recentOutflows(from, to, limit) {
  * One row per merchant: windowed deposit/fee/withdraw totals, plus the live
  * (all-time) balance and pending count, which have no "per window" meaning.
  */
+/**
+ * "ทุกร้านค้า" bar chart (29 Oct 2026): per Bangkok day for the last `days` days, the fees of every (non-deleted) shop —
+ * in-fee of approved payments + out-fee of approved payouts, by created time — same filters as merchantStats.
+ */
+export async function feeTrend(days) {
+  const { rows } = await query(
+    `WITH d AS (SELECT generate_series((now() AT TIME ZONE 'Asia/Bangkok')::date - ($1::int - 1), (now() AT TIME ZONE 'Asia/Bangkok')::date, '1 day')::date AS day),
+     pin AS (SELECT (p.created_at AT TIME ZONE 'Asia/Bangkok')::date AS day, sum(p.fee) AS fee FROM payments p JOIN merchants m ON m.id = p.merchant_id AND m.deleted_at IS NULL
+              WHERE p.status = 'approved' AND p.created_at >= now() - make_interval(days => $1::int + 1) AND ${visible('payment', 'p.ref')} GROUP BY 1),
+     pout AS (SELECT (o.created_at AT TIME ZONE 'Asia/Bangkok')::date AS day, sum(o.fee) AS fee FROM outflows o JOIN merchants m ON m.id = o.merchant_id AND m.deleted_at IS NULL
+              WHERE o.status = 'approved' AND o.created_at >= now() - make_interval(days => $1::int + 1) AND ${visible('outflow', 'o.ref')} GROUP BY 1)
+     SELECT to_char(d.day, 'YYYY-MM-DD') AS day, coalesce(pin.fee, 0) AS "feeIn", coalesce(pout.fee, 0) AS "feeOut", coalesce(pin.fee, 0) + coalesce(pout.fee, 0) AS total
+       FROM d LEFT JOIN pin ON pin.day = d.day LEFT JOIN pout ON pout.day = d.day ORDER BY d.day`,
+    [days],
+  );
+  return rows;
+}
+
 export async function merchantStats(from, to) {
   const { rows } = await query(
     `WITH win_in AS (
@@ -161,6 +179,11 @@ export async function merchantStats(from, to) {
             coalesce(wo.fee, 0)                               AS "outFeeTotal",
             m.opening_balance + coalesce(li.net, 0) - coalesce(lo.total, 0) + coalesce(adj.total, 0) + ${COMMISSION_SQL} AS "currentBalance",
             ${COMMISSION_SQL}                                 AS "commissionEarned",
+            -- ค่าคอม from sub-shops in the selected window (approved payments / payouts created in it) — "ทุกร้านค้า" table.
+            coalesce((SELECT sum(s.amount) FROM fee_splits s JOIN payments p ON s.source_kind = 'payment' AND p.id = s.source_id
+                       WHERE s.merchant_id = m.id AND p.status = 'approved' AND ${IN_WINDOW('p.created_at')}), 0)
+            + coalesce((SELECT sum(s.amount) FROM fee_splits s JOIN outflows o ON s.source_kind = 'outflow' AND o.id = s.source_id
+                       WHERE s.merchant_id = m.id AND o.status = 'approved' AND ${IN_WINDOW('o.created_at')}), 0) AS "commissionPeriod",
             m.parent_id                                       AS "parentId",
             m.path,
             cardinality(m.path)                               AS depth,

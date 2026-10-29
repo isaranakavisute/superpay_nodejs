@@ -20,15 +20,21 @@ function queued(key, job) {
   return run;
 }
 
+// A FormData body (file uploads: sendPhoto / sendVideo / sendMediaGroup with attach://) goes as multipart; else JSON.
+const isForm = (body) => typeof FormData !== 'undefined' && body instanceof FormData;
 const call = (token, method, body, timeoutMs) => fetch(`https://api.telegram.org/bot${token}/${method}`, {
-  method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs),
+  method: 'POST', ...(isForm(body) ? { body } : { headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }), signal: AbortSignal.timeout(timeoutMs),
 }).then((r) => r.json());
 
-/** Telegram Bot API call; posts (send*, except sendChatAction) are paced per chat and retried on 429. Returns Telegram's JSON. */
+/**
+ * Telegram Bot API call; posts (send*, except sendChatAction — and pinChatMessage) are paced per chat and retried on 429.
+ * Returns Telegram's JSON. `body` may be a FormData (uploads) carrying chat_id.
+ */
 export function tgSend(token, method, body, { timeoutMs = 15_000 } = {}) {
-  const isPost = /^send/.test(method) && method !== 'sendChatAction' && body?.chat_id != null;
-  if (!isPost) return call(token, method, body, timeoutMs);
-  return queued(`${String(token).slice(-10)}:${body.chat_id}`, async () => {
+  const chatId = isForm(body) ? body.get('chat_id') : body?.chat_id;
+  const isPost = (/^send/.test(method) && method !== 'sendChatAction') || method === 'pinChatMessage' || method === 'unpinChatMessage';
+  if (!isPost || chatId == null) return call(token, method, body, timeoutMs);
+  return queued(`${String(token).slice(-10)}:${chatId}`, async () => {
     let last = { ok: false, description: 'ส่งไม่ได้' };
     for (let attempt = 1; attempt <= ATTEMPTS; attempt += 1) {
       try {

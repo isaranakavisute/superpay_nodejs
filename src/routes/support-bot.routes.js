@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import express, { Router } from 'express';
 import { z } from 'zod';
 import asyncHandler from '../middleware/asyncHandler.js';
 import { reasonOf } from '../shared/soft-delete.js';
@@ -20,6 +20,15 @@ supportBotAdminRouter.post('/settings', h((req) => cfg.save('supportBot', req.ac
 
 // ประชาสัมพันธ์ (announcements)
 supportBotAdminRouter.get('/announcements', h(async () => ({ announcements: await ann.listAnnouncements(), chats: await ann.listChats(), slots: ann.HOURLY_SLOTS, posting: await ann.postingStatus() })));
+// Picture / video for an announcement: the raw file as the body (content-type = its mime, x-file-name = encoded name).
+const mediaBody = express.raw({ type: () => true, limit: '52mb' });
+supportBotAdminRouter.post('/announcements/media', mediaBody, h((req) => ann.uploadMedia(req.actor, {
+  mime: String(req.get('content-type') ?? '').split(';')[0].trim(), name: decodeURIComponent(req.get('x-file-name') ?? ''), data: req.body,
+})));
+supportBotAdminRouter.get('/announcements/media/:id', asyncHandler(async (req, res) => {
+  const m = await ann.getMedia(id(req));
+  res.set({ 'content-type': m.mime, 'cache-control': 'private, max-age=600', 'x-content-type-options': 'nosniff' }).send(m.data);
+}));
 supportBotAdminRouter.post('/announcements', h((req) => ann.createAnnouncement(req.actor, ann.announcementSchema.parse(req.body))));
 supportBotAdminRouter.post('/announcements/:id', h((req) => ann.updateAnnouncement(req.actor, id(req), ann.announcementSchema.parse(req.body))));
 supportBotAdminRouter.post('/announcements/:id/delete', h((req) => ann.deleteAnnouncement(req.actor, id(req), reasonOf(req.body))));

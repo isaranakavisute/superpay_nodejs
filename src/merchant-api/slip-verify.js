@@ -24,12 +24,31 @@ const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 /** Waits before re-asking the provider about a slip the bank is still processing (inside one request). */
 const PENDING_WAITS_MS = [3000, 5000];
 
-async function easyslip(cfg, buf, mime) {
+/**
+ * Usage log (29 Oct 2026): every HTTP call to EasySlip's verify API is recorded with its purpose and outcome, so the
+ * admin portal's quota card can show usage per day. Never blocks or fails the check itself.
+ */
+export function logEasySlipCall(purpose, httpStatus, outcome) {
+  import('../db/pool.js')
+    .then(({ query }) => query('INSERT INTO easyslip_calls (purpose, http_status, outcome) VALUES ($1, $2, $3)', [purpose || 'other', httpStatus ?? null, outcome]))
+    .catch(() => {});
+}
+const outcomeOf = (status, j) => (status === 200 && j?.data ? 'found' : /pending/i.test(String(j?.message ?? '')) ? 'pending'
+  : status === 400 || status === 404 ? 'not_found' : 'error');
+
+async function easyslip(cfg, buf, mime, purpose) {
   if (!cfg.easySlipApiKey) return { verified: null, message: 'ยังไม่ได้ตั้ง EasySlip API Key' };
   const form = new FormData();
   form.append('file', new Blob([buf], { type: mime }), `slip.${EXT[mime] ?? 'jpg'}`);
-  const r = await safeRequest('https://developer.easyslip.com/api/v1/verify', { headers: { authorization: `Bearer ${cfg.easySlipApiKey}` }, body: form });
+  let r;
+  try {
+    r = await safeRequest('https://developer.easyslip.com/api/v1/verify', { headers: { authorization: `Bearer ${cfg.easySlipApiKey}` }, body: form });
+  } catch (err) {
+    logEasySlipCall(purpose, null, 'error');
+    throw err;
+  }
   const j = JSON.parse(r.body || '{}');
+  logEasySlipCall(purpose, r.status, outcomeOf(r.status, j));
   if (r.status === 200 && j.data) return { verified: true, amount: Number(j.data.amount?.amount), transRef: j.data.transRef ?? null, date: j.data.date ?? null, raw: j.data };
   // slip_pending: the bank hasn't finished the transfer yet — not a bad slip; check again shortly.
   if (/pending/i.test(String(j.message ?? ''))) return { verified: null, pending: true, message: PENDING_TEXT };
@@ -52,9 +71,9 @@ async function slipok(cfg, buf, mime) {
   return { verified: null, message: `SlipOK ตอบ HTTP ${r.status}: ${j.message ?? ''}`.trim() };
 }
 
-async function run(provider, cfg, buf, mime) {
+async function run(provider, cfg, buf, mime, purpose) {
   try {
-    if (provider === 'easyslip') return { provider, ...(await easyslip(cfg, buf, mime)) };
+    if (provider === 'easyslip') return { provider, ...(await easyslip(cfg, buf, mime, purpose)) };
     if (provider === 'slipok') return { provider, ...(await slipok(cfg, buf, mime)) };
     if (provider === 'none' || !provider) return { provider: 'none', verified: null, message: 'ไม่ได้เปิดการตรวจสลิป — รอผู้ดูแลตรวจ' };
     return { provider, verified: null, message: `ยังไม่รองรับการตรวจผ่าน ${provider} — รอผู้ดูแลตรวจ` };
@@ -67,16 +86,16 @@ async function run(provider, cfg, buf, mime) {
  * Primary first; the fallback only when the primary gave no definitive answer (or a "not found" we were told to trust it on).
  * `pendingRetries`: when the bank is still processing the transfer, ask again after 3 s and 5 s before answering.
  */
-export async function verifySlip(buf, mime, { pendingRetries = true } = {}) {
+export async function verifySlip(buf, mime, { pendingRetries = true, purpose = 'other' } = {}) {
   const cfg = await configOf('slip');
-  let first = await run(cfg.provider, cfg, buf, mime);
+  let first = await run(cfg.provider, cfg, buf, mime, purpose);
   for (const wait of pendingRetries ? PENDING_WAITS_MS : []) {
     if (!first.pending) break;
     await sleep(wait);
-    first = await run(cfg.provider, cfg, buf, mime);
+    first = await run(cfg.provider, cfg, buf, mime, purpose);
   }
   if (first.verified !== null || !cfg.fallbackProvider || cfg.provider === 'none') return { ...first, cfg };
-  const second = await run(cfg.fallbackProvider, cfg, buf, mime);
+  const second = await run(cfg.fallbackProvider, cfg, buf, mime, purpose);
   if (second.verified === false && !cfg.failoverTrustNotFound) return { ...first, message: `${first.message} · ตัวสำรอง: ${second.message} (รอตัวหลักตรวจซ้ำ)`, cfg };
   return { ...second, cfg };
 }
@@ -90,7 +109,7 @@ export async function demoVerify({ image, mime, bankAccountId }) {
   const { query } = await import('../db/pool.js');
   const buf = Buffer.from(image, 'base64');
   if (buf.length < 100 || buf.length > 8 << 20) return { verified: false, message: 'ไฟล์สลิปต้องเป็นรูปขนาดไม่เกิน 8 MB', matches: [] };
-  const { cfg, ...v } = await verifySlip(buf, mime);
+  const { cfg, ...v } = await verifySlip(buf, mime, { purpose: 'settings_test' });
   let matches = [];
   if (v.verified && Number.isFinite(v.amount)) {
     const { rows } = await query(

@@ -27,9 +27,11 @@ export const SECTIONS = {
       tagline: z.string().trim().max(60),
       loginHeadline: z.string().trim().max(120),
       loginSubtext: z.string().trim().max(240),
+      // Login page's left panel text (headline, description, feature list, footer): off = logo only (27 Oct 2026).
+      loginInfo: z.boolean().optional(),
       logoScale: int(50, 200),
     }),
-    defaults: { siteName: 'Option Pay', tagline: 'Payment Console', loginHeadline: '', loginSubtext: '', logoScale: 100, logoAsset: null, faviconAsset: null },
+    defaults: { siteName: 'Option Pay', tagline: 'Payment Console', loginHeadline: '', loginSubtext: '', loginInfo: false, logoScale: 100, logoAsset: null, faviconAsset: null },
   },
   theme: {
     schema: z.object({ default: z.enum(THEMES), allowUser: z.boolean(), enabled: z.array(z.enum(THEMES)).max(THEMES.length) }),
@@ -116,6 +118,8 @@ export const SECTIONS = {
     schema: z.object({ owner: z.array(z.enum(PERMISSION_CODES)).max(PERMISSION_CODES.length), staff: z.array(z.enum(PERMISSION_CODES)).max(PERMISSION_CODES.length), viewer: z.array(z.enum(PERMISSION_CODES)).max(PERMISSION_CODES.length) }),
     defaults: DEFAULT_MERCHANT_PERMS,
   },
+  // Public API demo page (optionpay.co/demo): off = the page and every demo call are refused (404).
+  demo: { schema: z.object({ enabled: z.boolean() }), defaults: { enabled: true } },
   outbound: {
     schema: z.object({
       destinations: z.array(z.object({
@@ -170,8 +174,17 @@ export async function getAll() {
 
 /** Non-secret sections read on every page (sidebar, login, favicon, theme, 2FA rule, payout sound). */
 export async function getPublic() {
-  const [b, t, sec, snd, mp] = await Promise.all([raw('brand'), raw('theme'), raw('security'), raw('sounds'), raw('merchantPerms')]);
-  return { brand: b.value, theme: t.value, security: sec.value, sounds: snd.value, merchantPerms: mp.value };
+  const [b, t, sec, snd, mp, demo] = await Promise.all([raw('brand'), raw('theme'), raw('security'), raw('sounds'), raw('merchantPerms'), raw('demo')]);
+  return { brand: b.value, theme: t.value, security: sec.value, sounds: snd.value, merchantPerms: mp.value, demo: { enabled: demo.value.enabled !== false } };
+}
+
+/** Is the public demo page switched on? Cached 5 s (every demo call asks); saving the setting clears it. */
+let demoCache = null;
+export async function demoEnabled() {
+  if (demoCache && Date.now() - demoCache.at < 5000) return demoCache.on;
+  const { value } = await raw('demo');
+  demoCache = { at: Date.now(), on: value.enabled !== false };
+  return demoCache.on;
 }
 
 const audit = (client, actor, section, detail) =>
@@ -204,7 +217,8 @@ export function save(section, actor, body) {
        ON CONFLICT (section) DO UPDATE SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by, updated_at = now()`,
       [section, JSON.stringify(next), actor],
     );
-    await audit(client, actor, section, `บันทึกการตั้งค่า: ${section}`);
+    await audit(client, actor, section, section === 'demo' ? `${next.enabled ? 'เปิด' : 'ปิด'}หน้า demo (optionpay.co/demo)` : `บันทึกการตั้งค่า: ${section}`);
+    if (section === 'demo') demoCache = null;
     return { value: present(section, next) };
   });
 }
@@ -315,6 +329,25 @@ async function probe(provider, cfg) {
     if (err instanceof BlockedUrlError) return { ok: false, message: err.message };
     return { ok: false, message: `เชื่อมต่อไม่ได้: ${err.name === 'TimeoutError' ? 'หมดเวลา' : err.message}` };
   }
+}
+
+/**
+ * EasySlip calls per day (Bangkok), from easyslip_calls (logged since 29 Oct 2026), for the quota card's breakdown —
+ * plus EasySlip's own "used" figure for the current package, to compare.
+ */
+export async function easySlipDaily(days = 35) {
+  const { rows } = await query(
+    `SELECT to_char(at AT TIME ZONE 'Asia/Bangkok', 'YYYY-MM-DD') AS day, count(*)::int AS calls,
+            count(*) FILTER (WHERE outcome = 'found')::int AS found, count(*) FILTER (WHERE outcome = 'not_found')::int AS "notFound",
+            count(*) FILTER (WHERE outcome = 'pending')::int AS pending, count(*) FILTER (WHERE outcome = 'error')::int AS errors,
+            jsonb_object_agg(purpose, n) AS "byPurpose"
+       FROM (SELECT at, outcome, purpose, count(*) OVER (PARTITION BY to_char(at AT TIME ZONE 'Asia/Bangkok', 'YYYY-MM-DD'), purpose)::int AS n FROM easyslip_calls
+              WHERE at > now() - make_interval(days => $1)) x
+      GROUP BY 1 ORDER BY 1 DESC`,
+    [days],
+  );
+  const { rows: [first] } = await query('SELECT min(at) AS since FROM easyslip_calls');
+  return { days: rows, loggingSince: first?.since ?? null, quota: await liveQuota().catch(() => null) };
 }
 
 export const testBodySchema = z.object({ which: z.enum(['primary', 'fallback']), form: z.record(z.string(), z.unknown()).optional() });
