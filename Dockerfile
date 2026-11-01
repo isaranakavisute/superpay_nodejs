@@ -27,6 +27,10 @@ COPY migrations ./migrations
 # OCR language data (Thai + English) for reading slips when no slip provider is connected.
 COPY assets ./assets
 
+# Slip image files (31 Oct 2026, src/shared/slip-store.js): a Docker volume is mounted here; created owned by `node`
+# so a new volume starts writable for the app.
+RUN mkdir -p /data/slips && chown node:node /data/slips
+
 # Run unprivileged; the node image already ships a non-root `node` user.
 USER node
 

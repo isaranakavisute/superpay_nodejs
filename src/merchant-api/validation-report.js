@@ -4,6 +4,7 @@ import { internal as configOf } from '../config-admin/config.service.js';
 import { matchSlip, normalizeSlip } from './slip-match.js';
 import { logEasySlipCall, verifySlip } from './slip-verify.js';
 import { ApiError } from './v1.service.js';
+import { slipImage } from '../shared/slip-store.js';
 
 /**
  * GET /payment/validation-report — why each order is (not) approved, with the bank's own record of every slip
@@ -44,7 +45,7 @@ async function bankRecord(p, cfg) {
       logEasySlipCall('validation_report', r.status, r.status === 200 && j.data ? 'found' : r.status === 400 || r.status === 404 ? 'not_found' : 'error');
       if (r.status === 200 && j.data) return { verified: true, provider: 'easyslip', amount: Number(j.data.amount?.amount), transRef: j.data.transRef ?? null, date: j.data.date ?? null, raw: j.data };
     }
-    return await verifySlip(p.data, p.mime, { purpose: 'validation_report' });
+    return await verifySlip(await slipImage('payment_slips', p.id, p.file_path), p.mime, { purpose: 'validation_report' });
   } catch (e) {
     return { verified: null, message: e.message };
   }
@@ -115,7 +116,7 @@ export async function validationReport(m, q) {
     params.push(at(t, q.date)); where += ` AND p.created_at < $${params.length}::timestamptz + interval '${step}'`;
   }
   const { rows } = await query(`SELECT p.*, a.promptpay_id, a.bank_code AS acct_bank, a.account_name, a.account_no,
-      s.payment_id IS NOT NULL AS has_slip, s.mime, s.data, s.uploaded_at, s.qr_payload
+      s.payment_id IS NOT NULL AS has_slip, s.mime, s.file_path, s.uploaded_at, s.qr_payload
     FROM payments p JOIN bank_accounts a ON a.id = p.bank_account_id LEFT JOIN payment_slips s ON s.payment_id = p.id
     WHERE ${where} ORDER BY p.created_at LIMIT 101`, params);
   if (rows.length > 100) {

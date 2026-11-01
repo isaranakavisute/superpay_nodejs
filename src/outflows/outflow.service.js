@@ -4,6 +4,7 @@ import logger from '../logger.js';
 import { deliverPayoutEvent, deliverWithdrawalEvent } from '../webhooks/webhook.service.js';
 import { MARK_DELETED } from '../shared/soft-delete.js';
 import { lockRefNumbers } from '../shared/ref-lock.js';
+import { dbCopyOf, saveSlipFile, slipImage } from '../shared/slip-store.js';
 
 /** Operator actions on outflows: lock → check transition → update → audit. */
 
@@ -150,22 +151,24 @@ export function remove(ref, actor, reason) {
   });
 }
 
-export function uploadSlip(ref, actor, { mime, data }) {
+export async function uploadSlip(ref, actor, { mime, data }) {
   const bytes = Buffer.from(data, 'base64');
   if (bytes.length > 5 * 1024 * 1024) throw new BadRequestError('Slip image must be 5 MB or smaller');
+  const file = await saveSlipFile('outflow', bytes, mime);
   return withTransaction(async (client) => {
     const o = await lock(client, ref);
     await client.query(
-      `INSERT INTO outflow_slips (outflow_id, mime, data, uploaded_by) VALUES ($1, $2, $3, $4)
-       ON CONFLICT (outflow_id) DO UPDATE SET mime = EXCLUDED.mime, data = EXCLUDED.data, uploaded_by = EXCLUDED.uploaded_by, uploaded_at = now()`,
-      [o.id, mime, bytes, actor],
+      `INSERT INTO outflow_slips (outflow_id, mime, data, uploaded_by, file_path) VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (outflow_id) DO UPDATE SET mime = EXCLUDED.mime, data = EXCLUDED.data, uploaded_by = EXCLUDED.uploaded_by, uploaded_at = now(),
+         file_path = EXCLUDED.file_path`,
+      [o.id, mime, await dbCopyOf(bytes, file), actor, file],
     );
     await audit(client, actor, 'outflow.slip', ref, 'แนบสลิปโอนออก');
   });
 }
 
 export async function getSlip(ref) {
-  const { rows } = await query('SELECT s.mime, s.data FROM outflow_slips s JOIN outflows o ON o.id = s.outflow_id WHERE o.ref = $1', [ref]);
+  const { rows } = await query('SELECT s.outflow_id, s.mime, s.file_path FROM outflow_slips s JOIN outflows o ON o.id = s.outflow_id WHERE o.ref = $1', [ref]);
   if (!rows[0]) throw new NotFoundError(`No slip for ${ref}`);
-  return rows[0];
+  return { mime: rows[0].mime, data: await slipImage('outflow_slips', rows[0].outflow_id, rows[0].file_path) };
 }

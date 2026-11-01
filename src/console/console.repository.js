@@ -21,6 +21,13 @@ function buildWhere(res, params, { q, from, to, filters }, { skipStatus = false 
     // "a,b,c" matches any of the values (used for grouped buckets).
     if (value.includes(',')) add(`${res.filters[name]} = ANY($?::text[])`, value.split(',').map((v) => v.trim()).filter(Boolean));
     else add(`${res.filters[name]} = $?`, value);
+    // Narrowing (31 Oct 2026): a plain condition the database can use to skip rows that can never match this filter
+    // value. The filter above still decides, so the result is the same — it is only found faster.
+    const narrow = res.narrow?.[name];
+    if (narrow) {
+      const values = value.split(',').map((v) => v.trim()).filter(Boolean);
+      if (values.length && values.every((v) => narrow[v])) conditions.push(values.length === 1 ? narrow[values[0]] : `(${values.map((v) => narrow[v]).join(' OR ')})`);
+    }
   }
   return conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
 }

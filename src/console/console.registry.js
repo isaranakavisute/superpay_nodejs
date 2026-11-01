@@ -60,6 +60,9 @@ export const RESOURCES = {
     status: 'p.status',
     amount: 'p.amount',
     sums: { fee: 'p.fee', commission: 'p.commission' },
+    // The work queues hold only open orders (every branch of the bucket CASE below needs pending / expired): picking those
+    // first made "รอตรวจ" 4–5 s → milliseconds — it was reading all 42k payments, every 10 s per open page (31 Oct 2026).
+    narrow: { bucket: { review: "p.status IN ('pending', 'expired')", waiting: "p.status IN ('pending', 'expired')", dup: "p.status IN ('pending', 'expired')" } },
     filters: {
       status: 'p.status',
       // "house" = payments not tied to a shop
@@ -205,7 +208,7 @@ export const RESOURCES = {
   roles: {
     from: `console_roles r
       LEFT JOIN LATERAL (SELECT count(*)::int AS n FROM console_user_profiles p WHERE p.role_code = r.code) mc ON true`,
-    columns: `r.code, r.name, r.description, r.permissions, mc.n AS "memberCount"`,
+    columns: `r.code, r.name, r.description, r.permissions, r.hidden_menus AS "hiddenMenus", mc.n AS "memberCount"`,
     order: 'r.sort_order',
   },
 

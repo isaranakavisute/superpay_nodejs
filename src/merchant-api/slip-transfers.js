@@ -1,6 +1,7 @@
 import { sameCustomer, WINDOW_HOURS } from './slip-carry-over.js';
 import { verifySlip } from './slip-verify.js';
 import logger from '../logger.js';
+import { slipImage } from '../shared/slip-store.js';
 
 /**
  * How much of each bank transfer has paid orders (slip_transfers / slip_transfer_uses, migration 052).
@@ -140,14 +141,16 @@ export async function closeUsedUp(c, use, paymentId) {
  */
 export async function fillTransRefs(q, refs) {
   const { rows } = await q(
-    `SELECT s.payment_id, s.mime, s.data FROM payment_slips s JOIN payments p ON p.id = s.payment_id
+    `SELECT s.payment_id, s.mime, s.file_path FROM payment_slips s JOIN payments p ON p.id = s.payment_id
       WHERE p.ref = ANY ($1::text[]) AND s.trans_ref IS NULL AND s.verify_result->>'verified' = 'true'
         AND coalesce(s.verify_result->>'transRef', '') = ''`,
     [refs],
   );
   for (const s of rows) {
     try {
-      const v = await verifySlip(s.data, s.mime, { pendingRetries: false, purpose: 'transfer_backfill' });
+      const img = await slipImage('payment_slips', s.payment_id, s.file_path);
+      if (!img) continue;
+      const v = await verifySlip(img, s.mime, { pendingRetries: false, purpose: 'transfer_backfill' });
       if (v.verified === true && v.transRef) {
         await q(`UPDATE payment_slips SET verify_result = verify_result || jsonb_build_object('transRef', $2::text) WHERE payment_id = $1`, [s.payment_id, v.transRef]);
       }

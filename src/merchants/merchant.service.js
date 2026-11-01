@@ -20,6 +20,9 @@ const fields = {
   outFeePercent: z.coerce.number().min(0).max(100).multipleOf(0.01).default(0),   // ค่าธรรมเนียมเงินออก, on top of withdrawals / payouts
   outFeeFlat: money.default(0),
   minBalance: money,
+  // Per-shop minimum deposit / withdrawal (1 Nov 2026): null = not set (nearest parent shop, else Settings); not sent = unchanged.
+  minDeposit: money.nullable().optional(),
+  minWithdraw: money.nullable().optional(),
   status: z.enum(['active', 'suspended', 'pending']),   // pending = sub-merchant waiting for approval
   allowSubMerchants: z.boolean().optional(),                               // not sent = unchanged (on for new shops)
   parentId: z.coerce.number().int().positive().nullable().optional(),       // ร้านแม่: null = top level, not sent = unchanged
@@ -130,6 +133,15 @@ export function update(id, actor, b) {
       await parentFor(client, m.parent_id, b);
     }
     await checkRatesAgainstChildren(client, id, b, (msg) => new BadRequestError(msg));
+    const limitChanges = [];
+    for (const [key, col, label] of [['minDeposit', 'min_deposit', 'ยอดฝากขั้นต่ำ'], ['minWithdraw', 'min_withdraw', 'ยอดถอนขั้นต่ำ']]) {
+      if (b[key] === undefined) continue;
+      const before = m[col] == null ? null : Number(m[col]);
+      if (before === b[key]) continue;
+      await client.query(`UPDATE merchants SET ${col} = $2 WHERE id = $1`, [id, b[key]]);
+      const show = (v) => (v == null ? 'ไม่ได้ตั้ง (ใช้ค่าร้านแม่/ค่ากลาง)' : `${fmt(v)} บาท`);
+      limitChanges.push(`${label}: ${show(before)} → ${show(b[key])}`);
+    }
     await client.query(
       `UPDATE merchants SET name = $2, fee_percent = $3, fee_flat = $4, min_balance = $5, status = $6, kyc_status = $7,
               contact_email = nullif($8, ''), contact_phone = nullif($9, ''), out_fee_percent = $10, out_fee_flat = $11, allow_sub_merchants = $12,
@@ -140,7 +152,8 @@ export function update(id, actor, b) {
       (b.parentId ?? null) !== (m.parent_id ?? null) && `ร้านแม่: ${m.parent_id ?? '—'} → ${b.parentId ?? '—'}`,
       m.allow_sub_merchants !== b.allowSubMerchants && `สร้างร้านย่อย: ${b.allowSubMerchants ? 'อนุญาต' : 'ไม่อนุญาต'}`,
       (Number(m.fee_percent) !== b.feePercent || Number(m.fee_flat) !== b.feeFlat) && `ค่าธรรมเนียมเงินเข้า ${Number(m.fee_percent)}% + ${fmt(m.fee_flat)} → ${b.feePercent}% + ${fmt(b.feeFlat)}`,
-      (Number(m.out_fee_percent) !== b.outFeePercent || Number(m.out_fee_flat) !== b.outFeeFlat) && `ค่าธรรมเนียมเงินออก ${Number(m.out_fee_percent)}% + ${fmt(m.out_fee_flat)} → ${b.outFeePercent}% + ${fmt(b.outFeeFlat)}`].filter(Boolean);
+      (Number(m.out_fee_percent) !== b.outFeePercent || Number(m.out_fee_flat) !== b.outFeeFlat) && `ค่าธรรมเนียมเงินออก ${Number(m.out_fee_percent)}% + ${fmt(m.out_fee_flat)} → ${b.outFeePercent}% + ${fmt(b.outFeeFlat)}`,
+      ...limitChanges].filter(Boolean);
     await audit(client, actor, 'merchant.update', m.slug, changes.join(' · ') || 'แก้ไขข้อมูลร้าน');
   });
 }

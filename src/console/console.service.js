@@ -1,6 +1,7 @@
 import { BadRequestError, NotFoundError } from '../errors.js';
 import { merchantStats } from '../dashboard/dashboard.repository.js';
 import { RESOURCES } from './console.registry.js';
+import { internal as configOf } from '../config-admin/config.service.js';
 import * as repo from './console.repository.js';
 
 export const resourceNames = () => [...Object.keys(RESOURCES), 'merchants'];
@@ -27,7 +28,15 @@ export async function listResource(name, { q, from, to, limit, offset, ...rest }
 
 async function listMerchants({ q, from, to, status, ...rest }) {
   if (Object.keys(rest).length) throw new BadRequestError(`Unsupported filter(s) for merchants: ${Object.keys(rest).join(', ')}`);
-  const all = await merchantStats(from ?? null, to ?? null);
+  const [stats, g] = await Promise.all([merchantStats(from ?? null, to ?? null), configOf('limits')]);
+  // Per-shop minimums (1 Nov 2026): what applies to each shop and where it comes from (own → nearest parent → Settings).
+  const eff = (own, up, global) => (own != null ? { v: Number(own), src: 'own' } : up != null ? { v: Number(up), src: 'parent' } : { v: Number(global) || 0, src: 'global' });
+  const all = stats.map((m) => {
+    const d = eff(m.minDeposit, m.parentMinDeposit, g.minDeposit), w = eff(m.minWithdraw, m.parentMinWithdraw, g.minWithdraw);
+    const di = eff(null, m.parentMinDeposit, g.minDeposit), wi = eff(null, m.parentMinWithdraw, g.minWithdraw);
+    return { ...m, effMinDeposit: d.v, effMinDepositSrc: d.src, effMinWithdraw: w.v, effMinWithdrawSrc: w.src,
+      inheritMinDeposit: di.v, inheritMinDepositSrc: di.src, inheritMinWithdraw: wi.v, inheritMinWithdrawSrc: wi.src };
+  });
   const needle = q?.toLowerCase();
   const matches = all.filter((m) => !needle || m.name.toLowerCase().includes(needle) || m.slug.includes(needle));
   const data = status ? matches.filter((m) => m.status === status) : matches;

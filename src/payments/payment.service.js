@@ -9,6 +9,7 @@ import { amountRule, uniqueAmount } from '../shared/account-links.js';
 import { closeUsedUp, coverShortfall, fillTransRefs, recordUse } from '../merchant-api/slip-transfers.js';
 import { MARK_DELETED } from '../shared/soft-delete.js';
 import { lockRefNumbers } from '../shared/ref-lock.js';
+import { dbCopyOf, saveSlipFile, slipImage } from '../shared/slip-store.js';
 
 /**
  * Operator actions on payments. Each runs in one transaction: lock the row,
@@ -250,16 +251,17 @@ export async function uploadSlip(ref, actor, { mime, data }) {
   if (bytes.length > 5 * 1024 * 1024) throw new BadRequestError('Slip image must be 5 MB or smaller');
   const fp = await slipFingerprint(bytes, mime);
   if (isSampleSlip(fp)) throw new BadRequestError(SAMPLE_SLIP_MESSAGE);
+  const file = await saveSlipFile('payment', bytes, mime, fp.sha256);
   return withTransaction(async (client) => {
     const p = await lock(client, ref);
     // One transfer pays one order, admin uploads included.
     const reusedOn = await findReusedSlip(client, p.id, fp);
     if (reusedOn) throw new ConflictError(`สลิปนี้ถูกใช้แล้วกับรายการ ${reusedOn} — ใช้ซ้ำกับรายการอื่นไม่ได้`, { code: 'SLIP_ALREADY_USED', reusedOn });
     await client.query(
-      `INSERT INTO payment_slips (payment_id, mime, data, uploaded_by, image_sha256, qr_payload) VALUES ($1, $2, $3, $4, $5, $6)
+      `INSERT INTO payment_slips (payment_id, mime, data, uploaded_by, image_sha256, qr_payload, file_path) VALUES ($1, $2, $3, $4, $5, $6, $7)
        ON CONFLICT (payment_id) DO UPDATE SET mime = EXCLUDED.mime, data = EXCLUDED.data, uploaded_by = EXCLUDED.uploaded_by, uploaded_at = now(),
-         image_sha256 = EXCLUDED.image_sha256, qr_payload = EXCLUDED.qr_payload, verify_result = NULL`,
-      [p.id, mime, bytes, actor, fp.sha256, fp.qr],
+         image_sha256 = EXCLUDED.image_sha256, qr_payload = EXCLUDED.qr_payload, verify_result = NULL, file_path = EXCLUDED.file_path`,
+      [p.id, mime, await dbCopyOf(bytes, file), actor, fp.sha256, fp.qr, file],
     );
     await client.query('UPDATE payments SET slip_received_at = coalesce(slip_received_at, now()) WHERE id = $1', [p.id]);
     await audit(client, actor, 'payment.slip', ref, 'แนบสลิป');
@@ -268,11 +270,11 @@ export async function uploadSlip(ref, actor, { mime, data }) {
 
 export async function getSlip(ref) {
   const { rows } = await query(
-    `SELECT s.mime, s.data FROM payment_slips s JOIN payments p ON p.id = s.payment_id WHERE p.ref = $1`,
+    `SELECT s.payment_id, s.mime, s.file_path FROM payment_slips s JOIN payments p ON p.id = s.payment_id WHERE p.ref = $1`,
     [ref],
   );
   if (!rows[0]) throw new NotFoundError(`No slip for ${ref}`);
-  return rows[0];
+  return { mime: rows[0].mime, data: await slipImage('payment_slips', rows[0].payment_id, rows[0].file_path) };
 }
 
 /**

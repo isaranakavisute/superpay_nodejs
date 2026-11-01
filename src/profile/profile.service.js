@@ -50,7 +50,10 @@ export async function get(id) {
       profile: {
         id, username: u.username, fullName: u.full_name, email: u.email, phone: u.phone, roleCode: u.role_code, status: u.status,
         createdAt: u.created_at, twoFactorEnabledAt: u.totp_enabled_at, passwordChangedAt: u.password_changed_at,
-        permissions: (await client.query('SELECT permissions FROM console_roles WHERE code = $1', [u.role_code])).rows[0]?.permissions ?? [],
+        ...(await (async () => {
+          const { rows: [r] } = await client.query('SELECT permissions, hidden_menus FROM console_roles WHERE code = $1', [u.role_code]);
+          return { permissions: r?.permissions ?? [], hiddenMenus: r?.hidden_menus ?? [] };
+        })()),
       },
     };
   });

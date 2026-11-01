@@ -170,6 +170,11 @@ export async function merchantStats(from, to) {
             m.status,
             m.kyc_status                                      AS "kycStatus",
             m.min_balance                                     AS "minBalance",
+            -- per-shop minimum deposit / withdrawal (1 Nov 2026): own (null = not set) + what the nearest parent shop has
+            m.min_deposit                                     AS "minDeposit",
+            m.min_withdraw                                    AS "minWithdraw",
+            (SELECT a.min_deposit FROM merchants a JOIN unnest(m.path) WITH ORDINALITY x(id, i) ON a.id = x.id WHERE a.min_deposit IS NOT NULL ORDER BY x.i DESC LIMIT 1) AS "parentMinDeposit",
+            (SELECT a.min_withdraw FROM merchants a JOIN unnest(m.path) WITH ORDINALITY x(id, i) ON a.id = x.id WHERE a.min_withdraw IS NOT NULL ORDER BY x.i DESC LIMIT 1) AS "parentMinWithdraw",
             m.created_at                                      AS "createdAt",
             coalesce(wi.total, 0)                             AS "depositTotal",
             coalesce(wi.n, 0)                                 AS "depositCount",

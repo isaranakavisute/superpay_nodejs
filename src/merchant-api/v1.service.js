@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { query, withTransaction } from '../db/pool.js';
 import { AppError } from '../errors.js';
 import { internal as configOf, minBalanceFor } from '../config-admin/config.service.js';
+import { limitsFor } from '../merchants/limits.js';
 import { approveOne, emitPaymentEvent, setAmountByRef } from '../payments/payment.service.js';
 import { sendAlert } from '../alerts/alert.service.js';
 import { hashPassword, verifyPassword } from '../shared/password.js';
@@ -26,6 +27,7 @@ import { amountRule, linkCount, refuseUnlinkWithPending, syncPrimaryShop, unique
 import { visible } from '../shared/private-records.js';
 import { checkDemoSlip, isDemoSlip } from '../demo/demo.service.js';
 import { lockRefNumbers } from '../shared/ref-lock.js';
+import { dbCopyOf, saveSlipFile, slipImage } from '../shared/slip-store.js';
 
 /**
  * Merchant REST API v1. Every function gets the authenticated merchant row
@@ -151,7 +153,7 @@ async function balances(c, m) {
 
 /** Money leaving the shop: per-transaction minimum, then balance and minimum balance (amount + outgoing fee). */
 async function checkCanPay(c, m, amount, fee = 0) {
-  const limits = await configOf('limits');
+  const limits = await limitsFor(c, m.id);   // this shop → nearest parent → admin setting (1 Nov 2026)
   if (Number(limits.minWithdraw) > 0 && amount < Number(limits.minWithdraw)) {
     throw new ApiError(400, 'below_min_amount', `ยอดต่ำกว่ายอดถอนขั้นต่ำ ${fmt(limits.minWithdraw)} บาท`, { minAmount: Number(limits.minWithdraw) });
   }
@@ -272,7 +274,7 @@ async function payByToken(c, m, idOrRef) {
 // ---------- payments ----------
 
 export async function createPayment(m, b, { base, source = 'api', unique = true, actor } = {}) {
-  const [limits, slip] = await Promise.all([configOf('limits'), configOf('slip')]);
+  const [limits, slip] = await Promise.all([limitsFor({ query }, m.id), configOf('slip')]);   // per shop (1 Nov 2026)
   if (Number(limits.minDeposit) > 0 && b.amount < Number(limits.minDeposit)) {
     throw new ApiError(400, 'PAYMENT_CONTRACT_POLICY_VIOLATION', `ยอดต่ำกว่ายอดฝากขั้นต่ำ ${fmt(limits.minDeposit)} บาท`, { error: 'below_min_amount', minAmount: Number(limits.minDeposit) });
   }
@@ -599,6 +601,8 @@ async function attachAndVerify(m, p, { image, mime }, base, { once = false, rech
   }
   if (ocr) time.lap('ocr', 'อ่านข้อความจากภาพ');
   const via = ocr ? 'ocr' : v.provider;
+  const file = await saveSlipFile('payment', buf, mime, fp.sha256);
+  const dbCopy = await dbCopyOf(buf, file);   // file only, unless the file could not be stored
   let out;
   try {
   out = await withTransaction(async (c) => {
@@ -619,12 +623,12 @@ async function attachAndVerify(m, p, { image, mime }, base, { once = false, rech
     let carryOver = null; // what the caller is told about it
     const autoCancelled = [];   // other orders of this shop closed because this slip paid this order
     await c.query(
-      `INSERT INTO payment_slips (payment_id, mime, data, uploaded_by, provider, trans_ref, verify_result, image_sha256, qr_payload) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      `INSERT INTO payment_slips (payment_id, mime, data, uploaded_by, provider, trans_ref, verify_result, image_sha256, qr_payload, file_path) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
        ON CONFLICT (payment_id) DO UPDATE SET mime = EXCLUDED.mime, data = EXCLUDED.data, uploaded_by = EXCLUDED.uploaded_by, uploaded_at = now(),
          provider = EXCLUDED.provider, trans_ref = EXCLUDED.trans_ref, verify_result = EXCLUDED.verify_result,
-         image_sha256 = EXCLUDED.image_sha256, qr_payload = EXCLUDED.qr_payload`,
-      [p.id, mime, buf, who, via, (decision === 'approve' || decision === 'review') && !leftover ? v.transRef ?? null : null,
-        JSON.stringify({ verified: v.verified, amount: v.amount ?? null, date: v.date ?? null, transRef: v.transRef ?? null, message: reason, decision, mismatches, warnings, ocr, carriedFrom: carried && !reusedOn ? carried.ref : null, leftoverOf: leftover ? leftover.paid.map((x) => x.ref) : null, coverTransferId: combined && decision !== 'invalid' ? combined.cover.id : null }), fp.sha256, fp.qr],
+         image_sha256 = EXCLUDED.image_sha256, qr_payload = EXCLUDED.qr_payload, file_path = EXCLUDED.file_path`,
+      [p.id, mime, dbCopy, who, via, (decision === 'approve' || decision === 'review') && !leftover ? v.transRef ?? null : null,
+        JSON.stringify({ verified: v.verified, amount: v.amount ?? null, date: v.date ?? null, transRef: v.transRef ?? null, message: reason, decision, mismatches, warnings, ocr, carriedFrom: carried && !reusedOn ? carried.ref : null, leftoverOf: leftover ? leftover.paid.map((x) => x.ref) : null, coverTransferId: combined && decision !== 'invalid' ? combined.cover.id : null }), fp.sha256, fp.qr, file],
     );
     await c.query('UPDATE payments SET slip_received_at = now(), review_note = coalesce($2, review_note), slip_reused_ref = $3 WHERE id = $1', [p.id, reason, reusedOn]);
     // Still being processed by the bank: schedule the next background check (none once the slip has an answer).
@@ -732,13 +736,15 @@ async function demoSlipApprove(m, p, buf, mime, fp, base, time, who = actorOf(m)
   const bad = await checkDemoSlip(m, p, fp.qr);
   if (bad) throw new ApiError(400, 'INVALID_SLIP', bad);
   const note = 'ตรวจสลิปผ่าน — สลิป DEMO (หน้า optionpay.co/demo) · อนุมัติอัตโนมัติ';
+  const file = await saveSlipFile('payment', buf, mime, fp.sha256);
   const out = await withTransaction(async (c) => {
     await c.query('SELECT 1 FROM payments WHERE id = $1 FOR UPDATE', [p.id]);
     await c.query(
-      `INSERT INTO payment_slips (payment_id, mime, data, uploaded_by, provider, trans_ref, verify_result, image_sha256, qr_payload) VALUES ($1, $2, $3, $4, 'demo', NULL, $5, $6, $7)
+      `INSERT INTO payment_slips (payment_id, mime, data, uploaded_by, provider, trans_ref, verify_result, image_sha256, qr_payload, file_path) VALUES ($1, $2, $3, $4, 'demo', NULL, $5, $6, $7, $8)
        ON CONFLICT (payment_id) DO UPDATE SET mime = EXCLUDED.mime, data = EXCLUDED.data, uploaded_by = EXCLUDED.uploaded_by, uploaded_at = now(),
-         provider = EXCLUDED.provider, trans_ref = NULL, verify_result = EXCLUDED.verify_result, image_sha256 = EXCLUDED.image_sha256, qr_payload = EXCLUDED.qr_payload`,
-      [p.id, mime, buf, who, JSON.stringify({ verified: true, amount: Number(p.amount), message: note, decision: 'approve', demo: true }), fp.sha256, fp.qr],
+         provider = EXCLUDED.provider, trans_ref = NULL, verify_result = EXCLUDED.verify_result, image_sha256 = EXCLUDED.image_sha256, qr_payload = EXCLUDED.qr_payload,
+         file_path = EXCLUDED.file_path`,
+      [p.id, mime, await dbCopyOf(buf, file), who, JSON.stringify({ verified: true, amount: Number(p.amount), message: note, decision: 'approve', demo: true }), fp.sha256, fp.qr, file],
     );
     if (late) await c.query(`UPDATE payments SET status = 'pending', completed_at = NULL WHERE id = $1 AND status = 'rejected'`, [p.id]);
     await c.query('UPDATE payments SET slip_received_at = now(), review_note = $2 WHERE id = $1', [p.id, note]);
@@ -1092,7 +1098,7 @@ export function addWebhook(m, b) {
 // ---------- balance / profile / dashboard ----------
 
 export async function balance(m) {
-  const [b, limits] = await Promise.all([balances({ query }, m), configOf('limits')]);
+  const [b, limits] = await Promise.all([balances({ query }, m), limitsFor({ query }, m.id)]);
   return {
     success: true,
     balance: b.balance, availableBalance: b.available, reserved: b.reserved, currency: 'THB',
@@ -1400,9 +1406,11 @@ export async function recheckDueSlips(limit = 5) {
       const { rows: ps } = await query(`${PAY_SELECT.replace('SELECT p.*', 'SELECT p.*, m.slug')} JOIN merchants m ON m.id = p.merchant_id WHERE p.id = $1`, [r.payment_id]);
       const p = ps[0];
       if (!p || !['pending', 'expired'].includes(p.status)) continue;
-      const { rows: sl } = await query('SELECT data, mime FROM payment_slips WHERE payment_id = $1', [r.payment_id]);
+      const { rows: sl } = await query('SELECT file_path, mime FROM payment_slips WHERE payment_id = $1', [r.payment_id]);
       if (!sl[0]) continue;
-      const out = await attachAndVerify({ id: p.merchant_id, slug: `${p.slug}:recheck` }, p, { image: sl[0].data.toString('base64'), mime: sl[0].mime },
+      const img = await slipImage('payment_slips', r.payment_id, sl[0].file_path);
+      if (!img) continue;
+      const out = await attachAndVerify({ id: p.merchant_id, slug: `${p.slug}:recheck` }, p, { image: img.toString('base64'), mime: sl[0].mime },
         process.env.PUBLIC_BASE_URL ?? 'https://optionpay.co', { recheck: r.recheck_attempts + 1 });
       logger.info({ ref: p.ref, attempt: r.recheck_attempts + 1, result: out.result }, 'slip re-checked');
       done += 1;

@@ -2,6 +2,7 @@ import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypt
 import { query } from '../db/pool.js';
 import { open as unseal, seal } from '../shared/secret-box.js';
 import { callbackHeaders, curlOf } from '../webhooks/webhook.service.js';
+import { slipImage } from '../shared/slip-store.js';
 
 /**
  * The public demo page (optionpay.co/demo) runs real merchant API calls for one shop only (my-shop).
@@ -100,9 +101,11 @@ export async function checkDemoSlip(m, p, qr) {
 /** The slip image of one of the demo page's orders (public on the demo page), or null. */
 export async function demoSlip(ref) {
   const { rows } = await query(
-    `SELECT s.mime, s.data FROM demo_records d JOIN payments p ON p.ref = d.ref JOIN payment_slips s ON s.payment_id = p.id
+    `SELECT s.payment_id, s.mime, s.file_path FROM demo_records d JOIN payments p ON p.ref = d.ref JOIN payment_slips s ON s.payment_id = p.id
       WHERE d.kind = 'payment' AND d.ref = $1`, [ref]);
-  return rows[0] ?? null;
+  if (!rows[0]) return null;
+  const data = await slipImage('payment_slips', rows[0].payment_id, rows[0].file_path);
+  return data ? { mime: rows[0].mime, data } : null;
 }
 
 /**

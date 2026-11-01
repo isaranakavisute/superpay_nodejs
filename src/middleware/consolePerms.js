@@ -128,8 +128,16 @@ export const requiredPermission = (method, path) => {
   return method === 'GET' || method === 'HEAD' ? null : SUPER;
 };
 
+/** The console's background page-timing check (frontend lib/page-probe.ts, 1 Nov 2026): a built-in identity with no
+ * password and no user account that may only READ — any change made in its name is refused. */
+export const PROBE_ACTOR = 'page-probe';
+
 export async function consolePerms(req, _res, next) {
   try {
+    if (req.actor === PROBE_ACTOR) {
+      if (req.method !== 'GET' && req.method !== 'HEAD') throw new ForbiddenError('บัญชีตรวจเวลาโหลดอัตโนมัติอ่านข้อมูลได้อย่างเดียว');
+      return next();
+    }
     // Demo page switched off in Settings: nothing done in its name goes through (admin calls of /demo included).
     if (req.actor === 'demo-page' && !(await demoEnabled())) throw new DemoDisabledError();
     if (OPEN.test(req.path)) return next();
