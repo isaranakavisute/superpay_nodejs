@@ -9,6 +9,8 @@ export const ALERT_KINDS = [
   'withdrawal.pending', 'outflow.pending', 'double_credit.detected', 'low_balance',
   'device.offline', 'channel.error', 'webhook.failed', 'slip.provider_down', 'webhook.delivery', 'midnight.cancel',
   'payment.late_slip',
+  // a slip attached to (or refused on) an approved / refunded / cancelled order — with both pictures (2 Nov 2026)
+  'payment.slip_change',
 ];
 
 const bot = z.object({
@@ -163,6 +165,55 @@ export async function sendAlert(kind, text, { merchantId = null } = {}) {
         }
       }
       if (ok) await query('UPDATE alert_channels SET last_sent_at = now() WHERE id = $1', [a.id]);
+    }
+  } catch { /* alerts are best effort */ }
+  return sent;
+}
+
+/**
+ * Like sendAlert, plus pictures: the text first, then the images (one photo, or an album of up to 10), each chat paced
+ * through tgSend. `photos` = [{ bytes, mime, caption }]. Never throws; returns how many chats received the text.
+ */
+export async function sendAlertMedia(kind, text, photos = [], { merchantId = null } = {}) {
+  let sent = 0;
+  try {
+    const { rows } = await query(
+      `SELECT a.id, a.name, a.chat_ids, a.mentions, a.bot_token_enc, c.secrets_enc->>'botToken' AS channel_token
+         FROM alert_channels a LEFT JOIN channels c ON c.id = a.bot_channel_id
+        WHERE a.enabled AND a.deleted_at IS NULL AND $1 = ANY (a.events)
+          AND (a.merchant_id IS NULL OR a.merchant_id IN (
+                WITH RECURSIVE up AS (
+                  SELECT id, parent_id, 0 AS depth FROM merchants WHERE id = $2::int
+                  UNION ALL SELECT m.id, m.parent_id, up.depth + 1 FROM up JOIN merchants m ON m.id = up.parent_id WHERE up.depth < 10)
+                SELECT id FROM up))`,
+      [kind, merchantId],
+    );
+    const pics = photos.filter((p) => p?.bytes?.length).slice(0, 10);
+    for (const a of rows) {
+      const sealed = a.bot_token_enc ?? a.channel_token;
+      if (!sealed) continue;
+      const token = open(sealed);
+      const tags = mentionHtml(a.mentions);
+      for (const chat of a.chat_ids.split(',').map((x) => x.trim()).filter(Boolean)) {
+        const r = await tgSend(token, 'sendMessage', { chat_id: chat, text: `${tags ? `${tags}\n` : ''}${esc(text.slice(0, 3800))}`, parse_mode: 'HTML', disable_web_page_preview: true });
+        if (r.ok) sent += 1;
+        else await query(`INSERT INTO audit_logs (actor, action, entity, entity_ref, detail) VALUES ('system', 'alerts.failed', 'setting', $1, $2)`,
+          [a.name, `ส่งแจ้งเตือน ${kind} ไม่สำเร็จ (chat ${chat}): ${r.description ?? 'error'}`]).catch(() => {});
+        if (!pics.length) continue;
+        const form = new FormData();
+        form.set('chat_id', chat);
+        const file = (p) => new Blob([p.bytes], { type: p.mime || 'image/jpeg' });
+        if (pics.length === 1) {
+          form.set('photo', file(pics[0]), 'slip.jpg');
+          if (pics[0].caption) form.set('caption', pics[0].caption.slice(0, 1000));
+          await tgSend(token, 'sendPhoto', form, { timeoutMs: 60_000 });
+        } else {
+          pics.forEach((p, i) => form.set(`p${i}`, file(p), `slip${i}.jpg`));
+          form.set('media', JSON.stringify(pics.map((p, i) => ({ type: 'photo', media: `attach://p${i}`, ...(p.caption ? { caption: p.caption.slice(0, 1000) } : {}) }))));
+          await tgSend(token, 'sendMediaGroup', form, { timeoutMs: 60_000 });
+        }
+      }
+      await query('UPDATE alert_channels SET last_sent_at = now() WHERE id = $1', [a.id]).catch(() => {});
     }
   } catch { /* alerts are best effort */ }
   return sent;

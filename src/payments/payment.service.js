@@ -3,13 +3,12 @@ import { internal as configOf, notifyPaymentApproved } from '../config-admin/con
 import logger from '../logger.js';
 import { deliverPaymentEvent } from '../webhooks/webhook.service.js';
 import { BadRequestError, ConflictError, NotFoundError } from '../errors.js';
-import { findReusedSlip, isSampleSlip, SAMPLE_SLIP_MESSAGE, slipFingerprint } from '../shared/slip-fingerprint.js';
 import { syncPaymentSplits } from '../merchants/tree.js';
 import { amountRule, uniqueAmount } from '../shared/account-links.js';
 import { closeUsedUp, coverShortfall, fillTransRefs, recordUse } from '../merchant-api/slip-transfers.js';
 import { MARK_DELETED } from '../shared/soft-delete.js';
 import { lockRefNumbers } from '../shared/ref-lock.js';
-import { dbCopyOf, saveSlipFile, slipImage } from '../shared/slip-store.js';
+import { slipImage } from '../shared/slip-store.js';
 
 /**
  * Operator actions on payments. Each runs in one transaction: lock the row,
@@ -246,26 +245,10 @@ export function assignMerchant(ref, actor, { merchantId, merchantOrderId }) {
   });
 }
 
-export async function uploadSlip(ref, actor, { mime, data }) {
-  const bytes = Buffer.from(data, 'base64');
-  if (bytes.length > 5 * 1024 * 1024) throw new BadRequestError('Slip image must be 5 MB or smaller');
-  const fp = await slipFingerprint(bytes, mime);
-  if (isSampleSlip(fp)) throw new BadRequestError(SAMPLE_SLIP_MESSAGE);
-  const file = await saveSlipFile('payment', bytes, mime, fp.sha256);
-  return withTransaction(async (client) => {
-    const p = await lock(client, ref);
-    // One transfer pays one order, admin uploads included.
-    const reusedOn = await findReusedSlip(client, p.id, fp);
-    if (reusedOn) throw new ConflictError(`สลิปนี้ถูกใช้แล้วกับรายการ ${reusedOn} — ใช้ซ้ำกับรายการอื่นไม่ได้`, { code: 'SLIP_ALREADY_USED', reusedOn });
-    await client.query(
-      `INSERT INTO payment_slips (payment_id, mime, data, uploaded_by, image_sha256, qr_payload, file_path) VALUES ($1, $2, $3, $4, $5, $6, $7)
-       ON CONFLICT (payment_id) DO UPDATE SET mime = EXCLUDED.mime, data = EXCLUDED.data, uploaded_by = EXCLUDED.uploaded_by, uploaded_at = now(),
-         image_sha256 = EXCLUDED.image_sha256, qr_payload = EXCLUDED.qr_payload, verify_result = NULL, file_path = EXCLUDED.file_path`,
-      [p.id, mime, await dbCopyOf(bytes, file), actor, fp.sha256, fp.qr, file],
-    );
-    await client.query('UPDATE payments SET slip_received_at = coalesce(slip_received_at, now()) WHERE id = $1', [p.id]);
-    await audit(client, actor, 'payment.slip', ref, 'แนบสลิป');
-  });
+/** Plain admin upload — kept for callers; finished orders go through the guard (lock / bank check / history / alert). */
+export async function uploadSlip(ref, actor, b) {
+  const { attachEvidenceSlip } = await import('./slip-evidence.js');
+  return attachEvidenceSlip(ref, actor, b);
 }
 
 export async function getSlip(ref) {

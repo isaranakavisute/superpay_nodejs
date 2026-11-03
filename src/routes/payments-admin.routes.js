@@ -3,6 +3,7 @@ import asyncHandler from '../middleware/asyncHandler.js';
 import { reasonOf } from '../shared/soft-delete.js';
 import * as service from '../payments/payment.service.js';
 import { adminAttachSlip } from '../merchant-api/v1.service.js';
+import { attachEvidenceSlip, slipHistory, slipHistoryImage } from '../payments/slip-evidence.js';
 import {
   amountBodySchema,
   assignBodySchema,
@@ -31,13 +32,20 @@ paymentsAdminRouter.post('/:ref/amount', asyncHandler(async (req, res) => done(r
 paymentsAdminRouter.post('/:ref/revive', asyncHandler(async (req, res) => done(res, await service.revive(ref(req), req.actor))));
 paymentsAdminRouter.post('/:ref/assign', asyncHandler(async (req, res) => done(res, await service.assignMerchant(ref(req), req.actor, assignBodySchema.parse(req.body)))));
 // Admin slip upload = the API's automatic check (bank, amount / account / time, reuse) — approves at once when it passes.
-// Orders already approved / rejected / refunded only store the image as evidence (no re-check), as before.
+// Orders already approved / rejected / refunded (2 Nov 2026, TXN222101): an accepted slip is locked; any other slip is
+// checked with the bank and must be this order's transfer — kept as evidence, or refused (payments/slip-evidence.js).
 paymentsAdminRouter.post('/:ref/slip', asyncHandler(async (req, res) => {
   const b = slipBodySchema.parse(req.body);
   const r = await adminAttachSlip(ref(req), req.actor, { image: b.data, mime: b.mime });
   if (r.checked) return done(res, r);
-  await service.uploadSlip(ref(req), req.actor, b);
-  return done(res, { checked: false, message: `แนบสลิปแล้ว — รายการนี้สถานะ ${r.status} จึงไม่ตรวจสลิปซ้ำ` });
+  const e = await attachEvidenceSlip(ref(req), req.actor, b);
+  return done(res, { checked: false, evidence: true, message: e.message });
+}));
+// Every slip ever attached to the order (history) and each one's image.
+paymentsAdminRouter.get('/:ref/slips', asyncHandler(async (req, res) => done(res, await slipHistory(ref(req)))));
+paymentsAdminRouter.get('/:ref/slips/:id', asyncHandler(async (req, res) => {
+  const img = await slipHistoryImage(ref(req), Number(req.params.id) || 0);
+  res.set('content-type', img.mime).set('cache-control', 'private, no-store').send(img.data);
 }));
 paymentsAdminRouter.get('/:ref/relation', asyncHandler(async (req, res) => done(res, await service.orderRelation(ref(req)))));
 paymentsAdminRouter.get(

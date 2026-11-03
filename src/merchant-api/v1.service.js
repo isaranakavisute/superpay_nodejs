@@ -13,6 +13,7 @@ import { open as unseal, seal } from '../shared/secret-box.js';
 import { findReusedSlip, isSampleSlip, qrReason, SAMPLE_SLIP_MESSAGE, slipFingerprint } from '../shared/slip-fingerprint.js';
 import { MERCHANT_PERMISSIONS } from './permission-catalog.js';
 import { matchSlip, normalizeSlip } from './slip-match.js';
+import { recordSlipHistory } from '../payments/slip-evidence.js';
 import { cancelSlipSiblings, carryOverFrom } from './slip-carry-over.js';
 import { closeUsedUp, leftOf, leftoverChecks, leftoverFor, lockTransfer, openLeftoverFor, paidBy, useLeftover } from './slip-transfers.js';
 import { outFeeFor } from '../shared/out-fee.js';
@@ -631,6 +632,10 @@ async function attachAndVerify(m, p, { image, mime }, base, { once = false, rech
         JSON.stringify({ verified: v.verified, amount: v.amount ?? null, date: v.date ?? null, transRef: v.transRef ?? null, message: reason, decision, mismatches, warnings, ocr, carriedFrom: carried && !reusedOn ? carried.ref : null, leftoverOf: leftover ? leftover.paid.map((x) => x.ref) : null, coverTransferId: combined && decision !== 'invalid' ? combined.cover.id : null }), fp.sha256, fp.qr, file],
     );
     await c.query('UPDATE payments SET slip_received_at = now(), review_note = coalesce($2, review_note), slip_reused_ref = $3 WHERE id = $1', [p.id, reason, reusedOn]);
+    // Every slip is kept in the order's history (2 Nov 2026), whatever replaces it later.
+    await recordSlipHistory(c, { paymentId: p.id, by: who, outcome: 'checked', reason: `${decision === 'approve' ? 'ผ่าน — อนุมัติ' : decision === 'review' ? 'รอตรวจ' : 'ไม่ผ่าน'}${reason ? ` · ${reason}` : ''}`,
+      mime, file, sha256: fp.sha256, qr: fp.qr, amount: v.verified ? Number(v.amount) : null, date: v.verified ? v.date : null, transRef: v.transRef ?? null,
+      sender: v.verified ? normalizeSlip(v.provider, v.raw)?.senderNames?.[0] ?? null : null });
     // Still being processed by the bank: schedule the next background check (none once the slip has an answer).
     await c.query(`UPDATE payment_slips SET recheck_at = CASE WHEN $2::int IS NULL THEN NULL ELSE now() + make_interval(mins => $2::int) END,
                           recheck_attempts = $3 WHERE payment_id = $1`, [p.id, decision === 'review' ? nextRecheck : null, recheck]);

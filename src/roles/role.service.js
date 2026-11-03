@@ -4,7 +4,7 @@ import { BadRequestError } from '../errors.js';
 
 // Permission catalogue, grouped as on the roles page. super_admin always holds '*'.
 export const PERMISSIONS = [
-  ['เงินเข้า', ['payment.view', 'payment.create', 'payment.approve', 'payment.refund', 'payment.double_credit']],
+  ['เงินเข้า', ['payment.view', 'payment.totals', 'payment.create', 'payment.approve', 'payment.refund', 'payment.double_credit']],
   ['เงินออก & ถอน', ['outflow.view', 'outflow.approve', 'withdrawal.view', 'withdrawal.approve', 'p2p.manage']],
   ['ร้านค้า', ['merchant.view', 'merchant.manage', 'merchant.credit', 'webhook.view', 'webhook.retry']],
   ['บัญชี & ช่องทาง', ['account.view', 'account.edit', 'channel.view', 'channel.edit', 'event.match', 'device.manage']],
