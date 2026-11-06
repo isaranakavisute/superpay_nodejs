@@ -3,7 +3,7 @@
  * after TXN222101: an admin replaced the verified slip of an approved order with another customer's 300-baht slip; the
  * image was stored without any check, and that customer's own order (TXN222010) could then no longer take its slip.
  *
- *   1. LOCK — an approved / refunded order whose slip was accepted (checked and passed) keeps that slip: refused.
+ *   1. LOCK — an approved / refunded order that has a slip keeps it (any slip, since 3 Nov 2026): refused.
  *   2. CHECK — any other slip on a finished order is checked with the bank first: the amount must be the order's, the
  *      transfer must not be older than the order or already have paid another order, and the image must not be another
  *      order's slip (the sender's name is shown, not compared — Thai vs English names, someone else may pay). A refusal names the open / cancelled order it most likely
@@ -120,9 +120,9 @@ export async function attachEvidenceSlip(ref, actor, { mime, data }) {
     throw new ConflictError(text, { code, owners: owners.map((o) => o.ref) });
   };
 
-  // 1. The accepted slip of an approved / refunded order stays.
-  if (['approved', 'refunded'].includes(p.status) && p.has_slip && isAcceptedSlip(p)) {
-    return refuse('SLIP_LOCKED', `รายการ ${ref} ${STATUS_TH[p.status]}ด้วยสลิปที่ตรวจผ่านแล้ว — เปลี่ยนหรือแนบสลิปใหม่ไม่ได้ · ถ้าสลิปนี้เป็นของลูกค้าคนอื่น ให้แนบที่รายการของลูกค้าคนนั้น`);
+  // 1. An approved / refunded order keeps its slip (3 Nov 2026: any slip — also one an admin approved by hand).
+  if (['approved', 'refunded'].includes(p.status) && p.has_slip) {
+    return refuse('SLIP_LOCKED', `รายการ ${ref} ${STATUS_TH[p.status]}${isAcceptedSlip(p) ? 'ด้วยสลิปที่ตรวจผ่านแล้ว' : 'และมีสลิปแล้ว'} — เปลี่ยนหรือแนบสลิปใหม่ไม่ได้ · ถ้าสลิปนี้เป็นของลูกค้าคนอื่น ให้แนบที่รายการของลูกค้าคนนั้น`);
   }
 
   // 2. Checked with the bank: it has to be THIS order's transfer.
@@ -156,7 +156,7 @@ export async function attachEvidenceSlip(ref, actor, { mime, data }) {
   await withTransaction(async (c) => {
     const { rows: [cur] } = await c.query(
       `SELECT p.status, s.verify_result, s.trans_ref, (s.payment_id IS NOT NULL) AS has_slip FROM payments p LEFT JOIN payment_slips s ON s.payment_id = p.id WHERE p.id = $1 FOR UPDATE OF p`, [p.id]);
-    if (['approved', 'refunded'].includes(cur.status) && cur.has_slip && isAcceptedSlip(cur)) { reusedOn = 'LOCKED'; return; }
+    if (['approved', 'refunded'].includes(cur.status) && cur.has_slip) { reusedOn = 'LOCKED'; return; }
     reusedOn = await findReusedSlip(c, p.id, fp);
     if (reusedOn) return;
     await c.query(
